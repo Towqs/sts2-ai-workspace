@@ -109,6 +109,7 @@ namespace STS2_MCP
         private static string _aiMacroDir => Path.Combine(_baseDir, "AI", "Macro");
         private static string _debugLogPath => Path.Combine(_baseDir, "rl_monitor.log");
         private static string _sessionPath => Path.Combine(_baseDir, "active_run_session.json");
+        private static string _controlPath => Path.Combine(Directory.GetParent(_baseDir)?.FullName ?? _baseDir, "AI_Training", "control_state.json");
         private static readonly List<Dictionary<string, object>> _lastShopSnapshot = new();
 
         // 文件句柄（保持打开避免频繁创建）
@@ -184,6 +185,13 @@ namespace STS2_MCP
             Initialize();
             GetCurrentProgress(out int act, out int floor);
 
+            if (ConsumeNewRunRequest())
+            {
+                Debug.Log("RunState", "[NEW RUN REQUEST] control_state requested a fresh run");
+                StartNewRun();
+                return false;
+            }
+
             if (TryResumeActiveRun(act, floor))
             {
                 _inCombat = false;
@@ -245,12 +253,6 @@ namespace STS2_MCP
                 }
 
                 _currentRunId = runElem.GetString();
-                if (root.TryGetProperty("source", out var sourceElem)
-                    && string.Equals(sourceElem.GetString(), "ai", StringComparison.OrdinalIgnoreCase))
-                    _currentDataSource = DataSource.AI;
-                else
-                    _currentDataSource = DataSource.Human;
-
                 return !string.IsNullOrWhiteSpace(_currentRunId);
             }
             catch (Exception ex)
@@ -269,7 +271,7 @@ namespace STS2_MCP
                 var session = new Dictionary<string, object?>
                 {
                     ["run_id"] = _currentRunId,
-                    ["source"] = _currentDataSource == DataSource.AI ? "ai" : "human",
+                    ["source"] = _currentRunId.StartsWith("ai_", StringComparison.OrdinalIgnoreCase) ? "ai" : "human",
                     ["act"] = act,
                     ["floor"] = floor,
                     ["ended"] = ended,
@@ -280,6 +282,32 @@ namespace STS2_MCP
             catch (Exception ex)
             {
                 Debug.Log("RunState", $"[SESSION] Persist failed: {ex.Message}");
+            }
+        }
+
+        private static bool ConsumeNewRunRequest()
+        {
+            try
+            {
+                if (!File.Exists(_controlPath)) return false;
+                string json = File.ReadAllText(_controlPath);
+                using var doc = System.Text.Json.JsonDocument.Parse(json);
+                var root = doc.RootElement;
+                if (!root.TryGetProperty("next_run_mode", out var modeElem)) return false;
+                if (!string.Equals(modeElem.GetString(), "new", StringComparison.OrdinalIgnoreCase)) return false;
+
+                string updated = System.Text.RegularExpressions.Regex.Replace(
+                    json,
+                    "\"next_run_mode\"\\s*:\\s*\"new\"",
+                    "\"next_run_mode\": \"continue\""
+                );
+                File.WriteAllText(_controlPath, updated);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Debug.Log("RunState", $"[NEW RUN REQUEST] Failed to read control_state: {ex.Message}");
+                return false;
             }
         }
 

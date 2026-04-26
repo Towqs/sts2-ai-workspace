@@ -67,9 +67,19 @@ def request_json(url, method="GET", body=None, headers=None, timeout=20):
     req = Request(url, data=data, method=method, headers=headers or {})
     if body is not None:
         req.add_header("Content-Type", "application/json")
-    with urlopen(req, timeout=timeout) as resp:
-        raw = resp.read().decode("utf-8")
-    return json.loads(raw) if raw else {}
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+    except HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"HTTP {exc.code} from {url}: {raw[:500]}")
+    if not raw.strip():
+        return {}
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        preview = raw[:500].replace("\n", " ")
+        raise RuntimeError(f"Non-JSON response from {url}: {preview}") from exc
 
 
 def get_game_state():

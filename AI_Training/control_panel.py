@@ -5,11 +5,12 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 import zipfile
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 WORKSPACE = Path(__file__).resolve().parents[1]
@@ -52,6 +53,8 @@ DEFAULT_LLM_CONFIG = {
     "execute_combat": False,
     "confirm_shop": True,
     "max_actions_per_turn": 12,
+    "profiles": [],
+    "active_profile_id": "",
 }
 QUALITY_LABELS = {
     "failed_run": "失败",
@@ -129,6 +132,8 @@ def read_llm_config(mask_key=True):
     if data.get("mode") not in ("advisor", "combat_auto"):
         data["mode"] = "advisor"
     data["provider"] = "openai_compatible"
+    profiles = data.get("profiles") if isinstance(data.get("profiles"), list) else []
+    data["profiles"] = [_public_llm_profile(p) for p in profiles]
     if mask_key and data.get("api_key"):
         data["api_key"] = "********"
         data["has_api_key"] = True
@@ -137,13 +142,65 @@ def read_llm_config(mask_key=True):
     return data
 
 
+def _api_key_tail(api_key):
+    key = str(api_key or "")
+    return key[-4:] if key else ""
+
+
+def _public_llm_profile(profile):
+    api_key = profile.get("api_key", "")
+    return {
+        "id": profile.get("id", ""),
+        "name": profile.get("name") or profile.get("model") or profile.get("base_url") or "Unnamed",
+        "provider": profile.get("provider", "openai_compatible"),
+        "base_url": profile.get("base_url", ""),
+        "model": profile.get("model", ""),
+        "has_api_key": bool(api_key),
+        "key_tail": _api_key_tail(api_key),
+        "updated_at": profile.get("updated_at", ""),
+    }
+
+
+def _upsert_current_llm_profile(data, profile_name=""):
+    if not data.get("api_key"):
+        return data
+    profiles = data.get("profiles")
+    if not isinstance(profiles, list):
+        profiles = []
+
+    active_id = data.get("active_profile_id") or ""
+    profile = None
+    for item in profiles:
+        if item.get("id") == active_id:
+            profile = item
+            break
+    if profile is None:
+        profile = {"id": uuid.uuid4().hex[:10], "created_at": datetime.now().isoformat(timespec="seconds")}
+        profiles.append(profile)
+
+    profile.update({
+        "name": profile_name or data.get("model") or data.get("base_url") or "OpenAI Compatible",
+        "provider": "openai_compatible",
+        "base_url": data.get("base_url", ""),
+        "api_key": data.get("api_key", ""),
+        "model": data.get("model", ""),
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    })
+    data["profiles"] = profiles
+    data["active_profile_id"] = profile["id"]
+    return data
+
+
 def update_llm_config(patch):
     old = read_json(LLM_CONFIG_PATH, {})
     data = DEFAULT_LLM_CONFIG.copy()
     data.update(old)
+    save_profile = bool(patch.get("save_profile"))
 
     for key in DEFAULT_LLM_CONFIG:
         if key not in patch:
+            continue
+        if key in ("profiles", "active_profile_id"):
             continue
         if key == "api_key" and patch[key] == "********":
             continue
@@ -164,8 +221,91 @@ def update_llm_config(patch):
         else:
             data[key] = str(patch[key] or "").strip()
 
+    if save_profile or ("api_key" in patch and data.get("api_key")):
+        data = _upsert_current_llm_profile(data, str(patch.get("profile_name") or ""))
+
     write_json(LLM_CONFIG_PATH, data)
     return read_llm_config(mask_key=True)
+
+
+def use_llm_profile(profile_id):
+    data = DEFAULT_LLM_CONFIG.copy()
+    data.update(read_json(LLM_CONFIG_PATH, {}))
+    profiles = data.get("profiles") if isinstance(data.get("profiles"), list) else []
+    for profile in profiles:
+        if profile.get("id") == profile_id:
+            data.update({
+                "provider": "openai_compatible",
+                "base_url": profile.get("base_url", ""),
+                "api_key": profile.get("api_key", ""),
+                "model": profile.get("model", ""),
+                "active_profile_id": profile_id,
+            })
+            write_json(LLM_CONFIG_PATH, data)
+            return read_llm_config(mask_key=True)
+    raise ValueError("profile not found")
+
+
+def delete_llm_profile(profile_id):
+    data = DEFAULT_LLM_CONFIG.copy()
+    data.update(read_json(LLM_CONFIG_PATH, {}))
+    profiles = data.get("profiles") if isinstance(data.get("profiles"), list) else []
+    data["profiles"] = [p for p in profiles if p.get("id") != profile_id]
+    if data.get("active_profile_id") == profile_id:
+        data["active_profile_id"] = ""
+    write_json(LLM_CONFIG_PATH, data)
+    return read_llm_config(mask_key=True)
+
+
+def _llm_chat_url(base_url):
+    base = str(base_url or "").rstrip("/")
+    return base if base.endswith("/chat/completions") else base + "/chat/completions"
+
+
+def test_llm_connection():
+    data = DEFAULT_LLM_CONFIG.copy()
+    data.update(read_json(LLM_CONFIG_PATH, {}))
+    if not data.get("api_key"):
+        return {"status": "error", "message": "Missing API key."}
+    if not data.get("model"):
+        return {"status": "error", "message": "Missing model name."}
+
+    body = {
+        "model": data["model"],
+        "messages": [
+            {"role": "system", "content": "Return only JSON."},
+            {"role": "user", "content": "{\"ok\": true}"},
+        ],
+        "temperature": 0,
+        "max_tokens": 32,
+    }
+    req = Request(
+        _llm_chat_url(data.get("base_url")),
+        data=json.dumps(body).encode("utf-8"),
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {data['api_key']}",
+        },
+    )
+    try:
+        with urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+        json.loads(raw)
+        return {"status": "ok", "message": "Model connection OK."}
+    except HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        return {"status": "error", "message": f"HTTP {exc.code}: {raw[:500]}"}
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)}
+
+
+def ensure_llm_profiles_initialized():
+    data = DEFAULT_LLM_CONFIG.copy()
+    data.update(read_json(LLM_CONFIG_PATH, {}))
+    profiles = data.get("profiles") if isinstance(data.get("profiles"), list) else []
+    if data.get("api_key") and not profiles:
+        write_json(LLM_CONFIG_PATH, _upsert_current_llm_profile(data))
 
 
 def read_run_labels():
@@ -979,8 +1119,17 @@ INDEX_HTML = r"""<!doctype html>
         </div>
         <div class="row" style="margin-top:12px">
           <button class="primary" onclick="saveLLMConfig()">保存模型配置</button>
+          <button onclick="saveLLMProfile()">保存为 API 配置</button>
+          <button onclick="testLLM()">测试连接</button>
         </div>
+        <div id="llmTestResult" class="fine" style="margin-top:8px">未测试</div>
         <div class="fine" style="margin-top:10px">API Key 只保存在本机 <code>AI_Training/model_config.json</code>，不会进入 Git。</div>
+        <div class="table-wrap" style="margin-top:10px">
+          <table>
+            <thead><tr><th>名称</th><th>Base URL</th><th>Model</th><th>Key</th><th>操作</th></tr></thead>
+            <tbody id="llmProfiles"></tbody>
+          </table>
+        </div>
       </section>
 
       <section>
@@ -1161,6 +1310,7 @@ async function refresh() {
   if (!isLLMFormEditing()) {
     applyLLMConfigToForm(llmCfg);
   }
+  renderLLMProfiles(llmCfg.profiles || [], llmCfg.active_profile_id || "");
 
   document.getElementById("gamePhase").textContent = phase.label;
   document.getElementById("gamePhase").className = `status-main ${phase.cls}`;
@@ -1302,6 +1452,20 @@ function renderLLMLogic(logic, cfg) {
     <div class="kv"><span>手牌</span><span>${(logic.hand_summary || []).join(", ") || "-"}</span></div>
     <div class="kv"><span>理由</span><span>${d.reason || "-"}</span></div>`;
 }
+function renderLLMProfiles(profiles, activeId) {
+  const rows = (profiles || []).map(p => `
+    <tr>
+      <td>${p.id === activeId ? '<span class="pill on">当前</span> ' : ''}${p.name || "-"}</td>
+      <td><code>${p.base_url || "-"}</code></td>
+      <td>${p.model || "-"}</td>
+      <td>${p.has_api_key ? `••••${p.key_tail || ""}` : "-"}</td>
+      <td class="row">
+        <button onclick="useLLMProfile('${p.id}')">使用</button>
+        <button onclick="deleteLLMProfile('${p.id}')">删除</button>
+      </td>
+    </tr>`).join("");
+  document.getElementById("llmProfiles").innerHTML = rows || "<tr><td colspan=5>暂无保存的 API 配置</td></tr>";
+}
 async function saveControl() {
   await api("/api/control", {
     ai_enabled: document.getElementById("ai_enabled").checked,
@@ -1327,6 +1491,38 @@ async function saveLLMConfig() {
   document.getElementById("llm_api_key").value = "";
   if (result.config) applyLLMConfigToForm(result.config);
   await refresh();
+}
+async function saveLLMProfile() {
+  const apiKey = document.getElementById("llm_api_key").value.trim();
+  const body = {
+    enabled: document.getElementById("llm_enabled").checked,
+    mode: document.getElementById("llm_mode").value,
+    execute_combat: document.getElementById("llm_execute_combat").checked,
+    base_url: document.getElementById("llm_base_url").value.trim(),
+    model: document.getElementById("llm_model").value.trim(),
+    save_profile: true
+  };
+  if (apiKey) body.api_key = apiKey;
+  const result = await api("/api/llm/config", body);
+  llmFormDirty = false;
+  document.getElementById("llm_api_key").value = "";
+  if (result.config) applyLLMConfigToForm(result.config);
+  await refresh();
+}
+async function useLLMProfile(profileId) {
+  await api("/api/llm/profile/use", {profile_id: profileId});
+  llmFormDirty = false;
+  await refresh();
+}
+async function deleteLLMProfile(profileId) {
+  await api("/api/llm/profile/delete", {profile_id: profileId});
+  await refresh();
+}
+async function testLLM() {
+  await saveLLMConfig();
+  document.getElementById("llmTestResult").textContent = "正在测试...";
+  const result = await api("/api/llm/test", {});
+  document.getElementById("llmTestResult").textContent = result.message || result.status || "测试完成";
 }
 async function setRunMode(mode) { await api("/api/control", {next_run_mode: mode}); refresh(); }
 async function startAI(){ await api("/api/ai/start", {}); refresh(); }
@@ -1404,6 +1600,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, {"control": update_control(body)})
             elif self.path == "/api/llm/config":
                 self._json(200, {"config": update_llm_config(body)})
+            elif self.path == "/api/llm/profile/use":
+                self._json(200, {"config": use_llm_profile(body["profile_id"])})
+            elif self.path == "/api/llm/profile/delete":
+                self._json(200, {"config": delete_llm_profile(body["profile_id"])})
+            elif self.path == "/api/llm/test":
+                self._json(200, test_llm_connection())
             elif self.path == "/api/llm/start":
                 self._json(200, start_llm())
             elif self.path == "/api/llm/stop":
@@ -1440,6 +1642,7 @@ def main():
         write_json(CONTROL_PATH, DEFAULT_CONTROL)
     if not LLM_CONFIG_PATH.exists():
         write_json(LLM_CONFIG_PATH, DEFAULT_LLM_CONFIG)
+    ensure_llm_profiles_initialized()
     if not DISCARDED_PATH.exists():
         write_json(DISCARDED_PATH, {"discarded": []})
     server = ThreadingHTTPServer(("127.0.0.1", 8765), Handler)
