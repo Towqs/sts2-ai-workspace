@@ -21,7 +21,9 @@ AI_Training/ProcessedParams/
 # Runtime control state
 AI_Training/control_state.json
 AI_Training/ai_logic_state.json
+AI_Training/llm_logic_state.json
 AI_Training/control_panel_state.json
+AI_Training/model_config.json
 
 # Legacy local copy; active mod source is under 训练脚本/STS2MCP
 RL_Training/

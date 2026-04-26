@@ -18,11 +18,15 @@ DATA_DIR = WORKSPACE / "RL_Datasets"
 EXPORT_DIR = WORKSPACE / "Data_Packages"
 CONTROL_PATH = AI_DIR / "control_state.json"
 AI_LOGIC_PATH = AI_DIR / "ai_logic_state.json"
+LLM_CONFIG_PATH = AI_DIR / "model_config.json"
+LLM_LOGIC_PATH = AI_DIR / "llm_logic_state.json"
 DISCARDED_PATH = DATA_DIR / "discarded_runs.json"
 RUN_LABELS_PATH = DATA_DIR / "run_labels.json"
 SERVER_STATE_PATH = AI_DIR / "control_panel_state.json"
-PYTHON_EXE = WORKSPACE / ".venv" / "Scripts" / "python.exe"
+DEFAULT_PYTHON_EXE = WORKSPACE / ".venv" / "Scripts" / "python.exe"
+PYTHON_EXE = Path(os.environ.get("STS2_AI_PYTHON") or (DEFAULT_PYTHON_EXE if DEFAULT_PYTHON_EXE.exists() else sys.executable))
 AGENT_PATH = AI_DIR / "ai_agent.py"
+LLM_AGENT_PATH = AI_DIR / "llm_agent.py"
 API_URL = "http://localhost:15526/api/v1/singleplayer"
 
 DEFAULT_CONTROL = {
@@ -34,6 +38,20 @@ DEFAULT_CONTROL = {
     "collection_disabled_since": None,
     "collection_disabled_ranges": [],
     "min_training_quality": "unknown",
+}
+DEFAULT_LLM_CONFIG = {
+    "enabled": False,
+    "mode": "advisor",
+    "provider": "openai_compatible",
+    "base_url": "https://api.openai.com/v1",
+    "api_key": "",
+    "model": "",
+    "temperature": 0.2,
+    "max_tokens": 700,
+    "decision_interval_sec": 3.0,
+    "execute_combat": False,
+    "confirm_shop": True,
+    "max_actions_per_turn": 12,
 }
 QUALITY_LABELS = {
     "failed_run": "失败",
@@ -103,6 +121,51 @@ def update_control(patch):
                 data[key] = bool(patch[key])
     write_json(CONTROL_PATH, data)
     return data
+
+
+def read_llm_config(mask_key=True):
+    data = DEFAULT_LLM_CONFIG.copy()
+    data.update(read_json(LLM_CONFIG_PATH, {}))
+    if data.get("mode") not in ("advisor", "combat_auto"):
+        data["mode"] = "advisor"
+    data["provider"] = "openai_compatible"
+    if mask_key and data.get("api_key"):
+        data["api_key"] = "********"
+        data["has_api_key"] = True
+    else:
+        data["has_api_key"] = bool(data.get("api_key"))
+    return data
+
+
+def update_llm_config(patch):
+    old = read_json(LLM_CONFIG_PATH, {})
+    data = DEFAULT_LLM_CONFIG.copy()
+    data.update(old)
+
+    for key in DEFAULT_LLM_CONFIG:
+        if key not in patch:
+            continue
+        if key == "api_key" and patch[key] == "********":
+            continue
+        if key in ("enabled", "execute_combat", "confirm_shop"):
+            data[key] = bool(patch[key])
+        elif key == "mode":
+            data[key] = patch[key] if patch[key] in ("advisor", "combat_auto") else "advisor"
+        elif key in ("temperature", "decision_interval_sec"):
+            try:
+                data[key] = float(patch[key])
+            except (TypeError, ValueError):
+                pass
+        elif key in ("max_tokens", "max_actions_per_turn"):
+            try:
+                data[key] = int(patch[key])
+            except (TypeError, ValueError):
+                pass
+        else:
+            data[key] = str(patch[key] or "").strip()
+
+    write_json(LLM_CONFIG_PATH, data)
+    return read_llm_config(mask_key=True)
 
 
 def read_run_labels():
@@ -210,6 +273,12 @@ def get_ai_pid():
     return int(pid) if pid and pid_is_running(pid) else None
 
 
+def get_llm_pid():
+    state = read_json(SERVER_STATE_PATH, {})
+    pid = state.get("llm_pid")
+    return int(pid) if pid and pid_is_running(pid) else None
+
+
 def start_ai():
     pid = get_ai_pid()
     if pid:
@@ -246,6 +315,58 @@ def stop_ai():
     state.pop("ai_pid", None)
     write_json(SERVER_STATE_PATH, state)
     return {"status": "ok", "message": "AI stopped/disabled."}
+
+
+def start_llm():
+    pid = get_llm_pid()
+    if pid:
+        return {"status": "ok", "message": f"LLM already running, pid={pid}", "pid": pid}
+    proc = subprocess.Popen(
+        [str(PYTHON_EXE), str(LLM_AGENT_PATH)],
+        cwd=str(WORKSPACE),
+        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+    )
+    state = read_json(SERVER_STATE_PATH, {})
+    state["llm_pid"] = proc.pid
+    state["llm_started_at"] = datetime.now().isoformat(timespec="seconds")
+    write_json(SERVER_STATE_PATH, state)
+    update_llm_config({"enabled": True})
+    return {"status": "ok", "message": f"LLM agent started, pid={proc.pid}", "pid": proc.pid}
+
+
+def stop_llm():
+    pid = get_llm_pid()
+    update_llm_config({"enabled": False})
+    if not pid:
+        return {"status": "ok", "message": "LLM disabled. No managed LLM process is running."}
+    try:
+        os.kill(pid, signal.CTRL_BREAK_EVENT)
+        time.sleep(0.5)
+    except Exception:
+        pass
+    if pid_is_running(pid):
+        try:
+            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, text=True, timeout=5)
+        except Exception:
+            pass
+    state = read_json(SERVER_STATE_PATH, {})
+    state.pop("llm_pid", None)
+    write_json(SERVER_STATE_PATH, state)
+    return {"status": "ok", "message": "LLM agent stopped/disabled."}
+
+
+def llm_logic_snapshot():
+    data = read_json(LLM_LOGIC_PATH, {})
+    ts = int(data.get("timestamp") or 0)
+    if ts:
+        data["time"] = datetime.fromtimestamp(ts / 1000).strftime("%H:%M:%S")
+    compact = data.get("compact_state")
+    if isinstance(compact, dict):
+        player = compact.get("player", {})
+        hand = player.get("hand", [])
+        data["hand_summary"] = [c.get("id") for c in hand]
+        data.pop("compact_state", None)
+    return data
 
 
 def latest_runs(limit=12):
@@ -354,7 +475,7 @@ def latest_runs(limit=12):
 
 
 def iter_recent_records(max_files=8):
-    roots = ["Human/Combat", "Human/Macro", "Combat", "Macro", "AI_Combat"]
+    roots = ["Human/Combat", "Human/Macro", "Combat", "Macro", "AI_Combat", "LLM_Actions"]
     files = []
     for sub in roots:
         root = DATA_DIR / sub
@@ -386,7 +507,7 @@ def recent_records(limit=30):
             "run_id": rec.get("run_id"),
             "type": rec.get("type"),
             "source": rec.get("source"),
-            "action_type": rec.get("action_type"),
+            "action_type": rec.get("action_type") or (rec.get("decision") or {}).get("action"),
             "result": rec.get("result"),
             "round": rec.get("round") or (rec.get("state") or {}).get("round"),
             "file": rec.get("_file"),
@@ -552,6 +673,11 @@ def status_payload():
         "current_data": current_data_summary(),
         "recent_records": recent_records(),
         "ai_logic": ai_logic_snapshot(),
+        "llm": {
+            "config": read_llm_config(mask_key=True),
+            "pid": get_llm_pid(),
+            "logic": llm_logic_snapshot(),
+        },
         "training": LAST_TRAIN,
         "export": LAST_EXPORT,
     }
@@ -662,7 +788,7 @@ INDEX_HTML = r"""<!doctype html>
     .muted { color:var(--muted); }
     .fine { color:var(--muted); font-size:12px; }
     .strong { font-weight:700; }
-    button, select {
+    button, select, input[type=text], input[type=password], input[type=number] {
       border:1px solid var(--line);
       background:#fff;
       border-radius:6px;
@@ -670,6 +796,7 @@ INDEX_HTML = r"""<!doctype html>
       min-height:36px;
       font:inherit;
     }
+    input[type=text], input[type=password], input[type=number] { width:100%; }
     button { cursor:pointer; font-weight:600; }
     button:hover { border-color:#b8c0cc; background:#f9fafb; }
     button.primary { background:var(--blue); color:#fff; border-color:var(--blue); }
@@ -816,6 +943,48 @@ INDEX_HTML = r"""<!doctype html>
 
       <section>
         <div class="section-head">
+          <h2>LLM 模型接入</h2>
+          <span id="llmProcessBadge" class="pill">-</span>
+        </div>
+        <div class="button-row">
+          <button class="good" onclick="startLLM()">启动 LLM</button>
+          <button class="bad" onclick="stopLLM()">停止 LLM</button>
+        </div>
+        <div class="switch">
+          <div><div class="switch-title">启用模型决策</div><div class="switch-note">关闭后 LLM 进程待机，不请求模型</div></div>
+          <input id="llm_enabled" type="checkbox" onchange="saveLLMConfig()">
+        </div>
+        <div class="field">
+          <span>模式</span>
+          <select id="llm_mode" onchange="saveLLMConfig()">
+            <option value="advisor">Advisor：只给建议</option>
+            <option value="combat_auto">Combat Auto：战斗可执行</option>
+          </select>
+        </div>
+        <div class="switch">
+          <div><div class="switch-title">允许 LLM 自动战斗</div><div class="switch-note">只执行战斗出牌/结束回合；宏观仍只建议</div></div>
+          <input id="llm_execute_combat" type="checkbox" onchange="saveLLMConfig()">
+        </div>
+        <div class="field">
+          <span>Base URL</span>
+          <input id="llm_base_url" type="text" placeholder="https://api.openai.com/v1">
+        </div>
+        <div class="field">
+          <span>API Key</span>
+          <input id="llm_api_key" type="password" placeholder="留空表示不修改已保存 key">
+        </div>
+        <div class="field">
+          <span>Model</span>
+          <input id="llm_model" type="text" placeholder="例如 gpt-4.1-mini">
+        </div>
+        <div class="row" style="margin-top:12px">
+          <button class="primary" onclick="saveLLMConfig()">保存模型配置</button>
+        </div>
+        <div class="fine" style="margin-top:10px">API Key 只保存在本机 <code>AI_Training/model_config.json</code>，不会进入 Git。</div>
+      </section>
+
+      <section>
+        <div class="section-head">
           <h2>采集与训练</h2>
           <span id="collectBadge" class="pill">-</span>
         </div>
@@ -883,6 +1052,14 @@ INDEX_HTML = r"""<!doctype html>
             <tbody id="aiTopActions"></tbody>
           </table>
         </div>
+      </section>
+
+      <section>
+        <div class="section-head">
+          <h2>LLM 决策</h2>
+          <span id="llmDecisionBadge" class="pill">-</span>
+        </div>
+        <div id="llmLogic" class="muted">暂无 LLM 决策</div>
       </section>
 
       <section>
@@ -964,6 +1141,13 @@ async function refresh() {
   document.getElementById("record_ai_actions").checked = !!s.control.record_ai_actions;
   document.getElementById("include_ai_in_training").checked = !!s.control.include_ai_in_training;
   document.getElementById("min_training_quality").value = s.control.min_training_quality || "unknown";
+  const llmCfg = (s.llm && s.llm.config) || {};
+  document.getElementById("llm_enabled").checked = !!llmCfg.enabled;
+  document.getElementById("llm_mode").value = llmCfg.mode || "advisor";
+  document.getElementById("llm_execute_combat").checked = !!llmCfg.execute_combat;
+  document.getElementById("llm_base_url").value = llmCfg.base_url || "";
+  document.getElementById("llm_model").value = llmCfg.model || "";
+  document.getElementById("llm_api_key").placeholder = llmCfg.has_api_key ? "已保存，留空不修改" : "未配置 API Key";
 
   document.getElementById("gamePhase").textContent = phase.label;
   document.getElementById("gamePhase").className = `status-main ${phase.cls}`;
@@ -980,6 +1164,7 @@ async function refresh() {
 
   setPill("lastRefresh", `已刷新 ${new Date().toLocaleTimeString()}`, "info");
   setPill("aiProcessBadge", s.ai_pid ? "运行中" : "未启动", s.ai_pid ? "on" : "warn");
+  setPill("llmProcessBadge", s.llm && s.llm.pid ? "运行中" : "未启动", s.llm && s.llm.pid ? "on" : "warn");
   setPill("collectBadge", s.control.collection_enabled ? "启用" : "暂停", s.control.collection_enabled ? "on" : "off");
   setPill("nextRunBadge", s.control.next_run_mode === "continue" ? "继续游戏" : "新游戏", "info");
   document.getElementById("modeNew").className = s.control.next_run_mode === "new" ? "active" : "";
@@ -990,6 +1175,7 @@ async function refresh() {
   renderRuns(s.runs || []);
   renderRecentRecords(s.recent_records || []);
   renderAiLogic(s.ai_logic);
+  renderLLMLogic(s.llm && s.llm.logic, llmCfg);
 
   setPill("trainStatus", s.training.running ? `训练中 ${s.training.started || ""}` : (s.training.finished ? `完成 ${s.training.finished}` : "未运行"), s.training.running ? "warn" : "info");
   document.getElementById("trainOutput").textContent = s.training.output || "暂无输出";
@@ -1074,6 +1260,35 @@ function renderAiLogic(logic) {
     <tr><td>${a.action}</td><td>${a.confidence}%</td><td>${a.marker || ""}</td></tr>
   `).join("") || "<tr><td colspan=3>暂无概率</td></tr>";
 }
+function renderLLMLogic(logic, cfg) {
+  if (!logic || !logic.timestamp) {
+    setPill("llmDecisionBadge", cfg && cfg.enabled ? "等待决策" : "未启用", cfg && cfg.enabled ? "warn" : "info");
+    document.getElementById("llmLogic").innerHTML = '<div class="muted">暂无 LLM 决策。配置模型并启动 LLM 后，这里会显示建议、校验结果和执行结果。</div>';
+    return;
+  }
+  if (logic.status === "error") {
+    setPill("llmDecisionBadge", "错误", "off");
+    document.getElementById("llmLogic").innerHTML = `
+      <div class="kv"><span>时间</span><span>${logic.time || "-"}</span></div>
+      <div class="kv"><span>错误</span><span>${logic.error || "-"}</span></div>`;
+    return;
+  }
+  const d = logic.decision || {};
+  const payload = logic.payload ? JSON.stringify(logic.payload) : "-";
+  setPill("llmDecisionBadge", logic.executed ? "已执行" : "建议", logic.executed ? "on" : "info");
+  document.getElementById("llmLogic").innerHTML = `
+    <div class="kv"><span>时间</span><span>${logic.time || "-"}</span></div>
+    <div class="kv"><span>模式</span><span>${logic.mode || "-"}</span></div>
+    <div class="kv"><span>模型</span><span>${logic.model || "-"}</span></div>
+    <div class="kv"><span>场景</span><span>${logic.state_type || "-"}</span></div>
+    <div class="kv"><span>建议</span><span class="strong">${d.action || "-"}</span></div>
+    <div class="kv"><span>参数</span><code>${JSON.stringify(d.args || {})}</code></div>
+    <div class="kv"><span>校验</span><span>${logic.validation || "-"}</span></div>
+    <div class="kv"><span>执行</span><span>${logic.executed ? "是" : "否"} ${logic.ok === false ? "(失败)" : ""}</span></div>
+    <div class="kv"><span>Payload</span><code>${payload}</code></div>
+    <div class="kv"><span>手牌</span><span>${(logic.hand_summary || []).join(", ") || "-"}</span></div>
+    <div class="kv"><span>理由</span><span>${d.reason || "-"}</span></div>`;
+}
 async function saveControl() {
   await api("/api/control", {
     ai_enabled: document.getElementById("ai_enabled").checked,
@@ -1084,9 +1299,25 @@ async function saveControl() {
   });
   refresh();
 }
+async function saveLLMConfig() {
+  const apiKey = document.getElementById("llm_api_key").value.trim();
+  const body = {
+    enabled: document.getElementById("llm_enabled").checked,
+    mode: document.getElementById("llm_mode").value,
+    execute_combat: document.getElementById("llm_execute_combat").checked,
+    base_url: document.getElementById("llm_base_url").value.trim(),
+    model: document.getElementById("llm_model").value.trim()
+  };
+  if (apiKey) body.api_key = apiKey;
+  await api("/api/llm/config", body);
+  document.getElementById("llm_api_key").value = "";
+  refresh();
+}
 async function setRunMode(mode) { await api("/api/control", {next_run_mode: mode}); refresh(); }
 async function startAI(){ await api("/api/ai/start", {}); refresh(); }
 async function stopAI(){ await api("/api/ai/stop", {}); refresh(); }
+async function startLLM(){ await saveLLMConfig(); await api("/api/llm/start", {}); refresh(); }
+async function stopLLM(){ await api("/api/llm/stop", {}); refresh(); }
 async function train(){ await api("/api/train", {}); refresh(); }
 async function proceed(){ await api("/api/proceed", {}); refresh(); }
 async function markRun(run_id, discarded){ await api("/api/run", {run_id, discarded}); refresh(); }
@@ -1156,6 +1387,12 @@ class Handler(BaseHTTPRequestHandler):
             body = self._body()
             if self.path == "/api/control":
                 self._json(200, {"control": update_control(body)})
+            elif self.path == "/api/llm/config":
+                self._json(200, {"config": update_llm_config(body)})
+            elif self.path == "/api/llm/start":
+                self._json(200, start_llm())
+            elif self.path == "/api/llm/stop":
+                self._json(200, stop_llm())
             elif self.path == "/api/ai/start":
                 self._json(200, start_ai())
             elif self.path == "/api/ai/stop":
@@ -1186,6 +1423,8 @@ def main():
     CONTROL_PATH.parent.mkdir(parents=True, exist_ok=True)
     if not CONTROL_PATH.exists():
         write_json(CONTROL_PATH, DEFAULT_CONTROL)
+    if not LLM_CONFIG_PATH.exists():
+        write_json(LLM_CONFIG_PATH, DEFAULT_LLM_CONFIG)
     if not DISCARDED_PATH.exists():
         write_json(DISCARDED_PATH, {"discarded": []})
     server = ThreadingHTTPServer(("127.0.0.1", 8765), Handler)
