@@ -1,0 +1,18 @@
+bin/
+obj/
+out/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+mcp/.venv/
+
+# Claude Code
+# .claude/
+.mcp.json
+CLAUDE.md
+GUIDE.md
+
+# Qoder
+.qoder.json

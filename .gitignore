@@ -1,0 +1,48 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE / OS
+.idea/
+.vscode/
+.claude/
+.DS_Store
+Thumbs.db
+
+# Generated data and packages
+RL_Datasets/
+Data_Packages/
+AI_Training/ProcessedParams/
+
+# Runtime control state
+AI_Training/control_state.json
+AI_Training/ai_logic_state.json
+AI_Training/control_panel_state.json
+
+# Legacy local copy; active mod source is under 训练脚本/STS2MCP
+RL_Training/
+
+# Build outputs
+**/bin/
+**/obj/
+**/out/
+*.dll
+*.pdb
+*.zip
+
+# Runtime logs / temporary files
+*.log
+*.tmp
+*.bak
+*.bak_*
+*.jsonl
+
+# Local scratch / copied reference files
+**/.git_nested_backup/
+训练脚本/find_*.cs
+训练脚本/STS2MCP/diff.txt
+训练脚本/STS2MCP/original_mcpmod.cs
