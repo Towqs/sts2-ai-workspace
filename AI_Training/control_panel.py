@@ -1584,6 +1584,21 @@ function renderLLMLogic(logic, cfg) {
       <div class="kv"><span>错误</span><span>${logic.error || "-"}</span></div>`;
     return;
   }
+  if (logic.status === "cooldown") {
+    setPill("llmDecisionBadge", "冷却", "warn");
+    document.getElementById("llmLogic").innerHTML = `
+      <div class="kv"><span>重试</span><span>${logic.retry_after_sec || "-"} 秒</span></div>
+      <div class="kv"><span>原因</span><span>${logic.error || logic.message || "-"}</span></div>`;
+    return;
+  }
+  if (logic.status === "waiting") {
+    setPill("llmDecisionBadge", "等待战斗", "info");
+    document.getElementById("llmLogic").innerHTML = `
+      <div class="kv"><span>模式</span><span>${logic.mode || "-"}</span></div>
+      <div class="kv"><span>场景</span><span>${logic.state_type || "-"}</span></div>
+      <div class="kv"><span>状态</span><span>${logic.message || "等待玩家战斗行动阶段，不请求模型。"}</span></div>`;
+    return;
+  }
   const d = logic.decision || {};
   const payload = logic.payload ? JSON.stringify(logic.payload) : "-";
   setPill("llmDecisionBadge", logic.executed ? "已执行" : "建议", logic.executed ? "on" : "info");

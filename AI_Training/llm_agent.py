@@ -429,6 +429,12 @@ def state_signature(compact):
     }, sort_keys=True, ensure_ascii=False)
 
 
+def is_combat_action_phase(compact):
+    state_type = str(compact.get("state_type") or "").lower()
+    battle = compact.get("battle", {})
+    return state_type in COMBAT_TYPES and battle.get("turn") == "player" and bool(battle.get("is_play_phase"))
+
+
 def run_agent():
     session_id = f"llm_{datetime.now():%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:8]}"
     last_decision_key = None
@@ -466,6 +472,21 @@ def run_agent():
 
             state = get_game_state()
             compact = compact_state(state)
+            if cfg.get("mode") == "combat_auto" and not is_combat_action_phase(compact):
+                write_json(LOGIC_PATH, {
+                    "timestamp": int(time.time() * 1000),
+                    "status": "waiting",
+                    "session_id": session_id,
+                    "mode": cfg.get("mode"),
+                    "provider": cfg.get("provider"),
+                    "model": cfg.get("model"),
+                    "state_type": state.get("state_type"),
+                    "message": "Combat Auto waits without model calls outside the player's combat action phase.",
+                    "compact_state": compact,
+                })
+                time.sleep(load_config().get("decision_interval_sec", 3.0))
+                continue
+
             turn_id = state_signature(compact)
             if turn_id != last_turn_id:
                 actions_this_turn = 0
