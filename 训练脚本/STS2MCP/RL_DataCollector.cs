@@ -709,6 +709,11 @@ namespace STS2_MCP
         {
             try
             {
+                if (!IsCollectionEnabled())
+                {
+                    Debug.Log("Data", "[Collection] disabled by control_state; skipped combat record");
+                    return;
+                }
                 var writer = GetCombatWriter();
                 lock (writer)
                 {
@@ -727,6 +732,11 @@ namespace STS2_MCP
         {
             try
             {
+                if (!IsCollectionEnabled())
+                {
+                    Debug.Log("Data", "[Collection] disabled by control_state; skipped macro record");
+                    return;
+                }
                 var writer = GetMacroWriter();
                 lock (writer)
                 {
@@ -739,6 +749,23 @@ namespace STS2_MCP
             {
                 Debug.Log($"[ERROR] WriteMacroRecord: {ex.Message}");
             }
+        }
+
+        private static bool IsCollectionEnabled()
+        {
+            try
+            {
+                if (!File.Exists(_controlPath)) return true;
+                using var doc = System.Text.Json.JsonDocument.Parse(File.ReadAllText(_controlPath));
+                var root = doc.RootElement;
+                if (root.TryGetProperty("collection_enabled", out var elem) && elem.ValueKind == System.Text.Json.JsonValueKind.False)
+                    return false;
+            }
+            catch (Exception ex)
+            {
+                Debug.Log("Data", $"[Collection] failed to read control_state, defaulting enabled: {ex.Message}");
+            }
+            return true;
         }
 
         // ========== 回合快照 ==========

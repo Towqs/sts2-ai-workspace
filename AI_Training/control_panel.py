@@ -637,9 +637,23 @@ def latest_runs(limit=12):
                     "human": 0,
                     "wins": 0,
                     "losses": 0,
+                    "game_start": 0,
+                    "game_resume": 0,
+                    "battle_start": 0,
+                    "battle_end": 0,
+                    "turn_start": 0,
+                    "turn_end": 0,
+                    "macro_actions": 0,
                     "play_card": 0,
                     "end_turn": 0,
                     "use_potion": 0,
+                    "select_map_node": 0,
+                    "claim_reward": 0,
+                    "choose_card": 0,
+                    "skip_reward": 0,
+                    "choose_event_option": 0,
+                    "choose_rest_option": 0,
+                    "buy_item": 0,
                     "max_act": 0,
                     "max_floor": 0,
                     "run_victory": False,
@@ -657,15 +671,31 @@ def latest_runs(limit=12):
                 item["ai"] += 1
             if rec.get("source") == "human":
                 item["human"] += 1
-            if rec.get("type") == "battle_end":
+            rec_type = rec.get("type")
+            if rec_type in ("game_start", "game_resume", "battle_start", "battle_end", "turn_start", "turn_end"):
+                item[rec_type] += 1
+            if rec_type == "macro_action":
+                item["macro_actions"] += 1
+            if rec_type == "battle_end":
                 if rec.get("result") == "win":
                     item["wins"] += 1
                 if rec.get("result") == "lose":
                     item["losses"] += 1
-            if rec.get("type") in ("run_end", "game_end", "victory") and rec.get("result") in ("win", "victory", "complete", True):
+            if rec_type in ("run_end", "game_end", "victory") and rec.get("result") in ("win", "victory", "complete", True):
                 item["run_victory"] = True
             action_type = rec.get("action_type")
-            if action_type in ("play_card", "end_turn", "use_potion"):
+            if action_type in (
+                "play_card",
+                "end_turn",
+                "use_potion",
+                "select_map_node",
+                "claim_reward",
+                "choose_card",
+                "skip_reward",
+                "choose_event_option",
+                "choose_rest_option",
+                "buy_item",
+            ):
                 item[action_type] += 1
             for state in iter_record_states(rec):
                 item["max_act"] = max(item["max_act"], safe_int(state.get("act")))
@@ -694,6 +724,20 @@ def latest_runs(limit=12):
         item["inferred_quality"] = inferred_quality
         item["inferred_quality_label"] = QUALITY_LABELS.get(inferred_quality, inferred_quality)
         item["files"] = sorted(item["files"])
+        checks = run_data_checks(item)
+        item["data_checks"] = checks
+        missing = [c for c in checks if c["status"] == "missing"]
+        warnings = [c for c in checks if c["status"] == "warn"]
+        item["missing_data"] = [c["label"] for c in missing]
+        if missing:
+            item["data_health"] = "missing"
+            item["data_health_label"] = f"缺 {len(missing)} 项"
+        elif warnings:
+            item["data_health"] = "warn"
+            item["data_health_label"] = f"需确认 {len(warnings)} 项"
+        else:
+            item["data_health"] = "ok"
+            item["data_health_label"] = "完整"
         item["last_time"] = (
             datetime.fromtimestamp(item["last_ts"] / 1000).strftime("%Y-%m-%d %H:%M:%S")
             if item["last_ts"]
@@ -702,6 +746,57 @@ def latest_runs(limit=12):
         result.append(item)
     result.sort(key=lambda x: x["last_ts"], reverse=True)
     return result[:limit]
+
+
+def run_data_checks(run):
+    checks = []
+
+    def add(label, status, detail, count=None):
+        checks.append({
+            "label": label,
+            "status": status,
+            "detail": detail,
+            "count": count,
+        })
+
+    records = run.get("records", 0)
+    combat = run.get("combat", 0)
+    macro = run.get("macro", 0)
+    battle_count = run.get("battle_start", 0)
+    win_or_loss = run.get("wins", 0) + run.get("losses", 0)
+    reward_actions = run.get("claim_reward", 0) + run.get("choose_card", 0) + run.get("skip_reward", 0)
+
+    add("Run 记录", "ok" if records else "missing", f"{records} 条总记录", records)
+    add("宏观记录", "ok" if macro else "missing", f"{macro} 条；包含开局、地图、奖励、事件等非战斗动作", macro)
+    add("战斗记录", "ok" if combat else "missing", f"{combat} 条；包含战斗开始、回合、动作和结算", combat)
+
+    if run.get("game_start", 0) or run.get("game_resume", 0):
+        add("开局/续局", "ok", f"新游戏 {run.get('game_start', 0)}，继续游戏 {run.get('game_resume', 0)}")
+    else:
+        add("开局/续局", "warn", "未检测到 game_start / game_resume；如果是半路接入可忽略")
+
+    if combat:
+        add("战斗开始", "ok" if battle_count else "missing", f"battle_start {battle_count} 次", battle_count)
+        add("回合快照", "ok" if run.get("turn_start", 0) and run.get("turn_end", 0) else "warn", f"turn_start {run.get('turn_start', 0)}，turn_end {run.get('turn_end', 0)}")
+        add("出牌样本", "ok" if run.get("play_card", 0) else "missing", f"play_card {run.get('play_card', 0)} 次", run.get("play_card", 0))
+        add("结束回合", "ok" if run.get("end_turn", 0) or run.get("turn_end", 0) else "missing", f"end_turn {run.get('end_turn', 0)}，turn_end {run.get('turn_end', 0)}")
+        add("战斗结算", "ok" if win_or_loss else "warn", f"胜 {run.get('wins', 0)}，败 {run.get('losses', 0)}；未结束的战斗可忽略")
+
+    if run.get("max_floor", 0) > 0 or macro:
+        add("地图选择", "ok" if run.get("select_map_node", 0) else "warn", f"select_map_node {run.get('select_map_node', 0)} 次；如果刚开局/未点地图可忽略")
+    if win_or_loss or reward_actions:
+        add("奖励处理", "ok" if reward_actions else "warn", f"领奖 {run.get('claim_reward', 0)}，选卡 {run.get('choose_card', 0)}，跳过 {run.get('skip_reward', 0)}")
+
+    optional = []
+    if run.get("choose_event_option", 0):
+        optional.append(f"事件 {run.get('choose_event_option', 0)}")
+    if run.get("choose_rest_option", 0):
+        optional.append(f"营火 {run.get('choose_rest_option', 0)}")
+    if run.get("buy_item", 0):
+        optional.append(f"商店 {run.get('buy_item', 0)}")
+    add("可选宏观", "ok" if optional else "info", "，".join(optional) if optional else "本 run 暂未出现事件/营火/商店")
+
+    return checks
 
 
 def iter_recent_records(max_files=8):
@@ -748,15 +843,17 @@ def recent_records(limit=30):
 def current_data_summary():
     runs = latest_runs(limit=1)
     if not runs:
-        return {"active_run": None, "warning": "暂无 run 数据"}
+        return {"active_run": None, "warning": "暂无 run 数据。确认采集总开关已打开，并进入一局游戏。"}
     run = runs[0].copy()
     warnings = []
-    if run.get("combat", 0) > 0 and run.get("play_card", 0) == 0:
-        warnings.append("当前/最近 run 没采到 play_card，只采到 end_turn/宏观动作。C# 出牌 Hook 需要修。")
+    for check in run.get("data_checks", []):
+        if check.get("status") == "missing":
+            warnings.append(f"未检测到{check.get('label')}：{check.get('detail')}")
+    for check in run.get("data_checks", []):
+        if check.get("status") == "warn":
+            warnings.append(f"需要确认{check.get('label')}：{check.get('detail')}")
     if run.get("losses", 0) > 0:
         warnings.append("这个 run 有失败记录，BC 训练前建议确认是否保留。")
-    if run.get("wins", 0) == 0 and run.get("losses", 0) == 0:
-        warnings.append("暂未看到 battle_end 胜负记录；如果已经通关，可能是胜利/终局 Hook 没捕获。")
     if run.get("quality") == "perfect_run" and run.get("play_card", 0) == 0:
         warnings.append("这个 run 已标为完美，但没有 play_card 标签；修好 Hook 后建议再采一局高质量数据。")
     return {"active_run": run, "warnings": warnings}
@@ -1029,6 +1126,7 @@ INDEX_HTML = r"""<!doctype html>
     input[type=text], input[type=password], input[type=number] { width:100%; }
     button { cursor:pointer; font-weight:600; }
     button:hover { border-color:#b8c0cc; background:#f9fafb; }
+    button:disabled { cursor:not-allowed; opacity:.55; }
     button.primary { background:var(--blue); color:#fff; border-color:var(--blue); }
     button.good { background:var(--good); color:#fff; border-color:var(--good); }
     button.bad { background:var(--bad); color:#fff; border-color:var(--bad); }
@@ -1079,6 +1177,23 @@ INDEX_HTML = r"""<!doctype html>
     .metric-value { font-size:20px; font-weight:700; }
     .metric-label { color:var(--muted); font-size:12px; }
     .warning-list { display:grid; gap:8px; margin-top:12px; }
+    .check-list {
+      display:grid;
+      grid-template-columns:repeat(auto-fit, minmax(210px, 1fr));
+      gap:8px;
+      margin-top:12px;
+    }
+    .check-item {
+      border:1px solid #eef1f5;
+      border-radius:8px;
+      padding:10px;
+      background:#fff;
+      min-height:78px;
+    }
+    .check-top { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:6px; }
+    .check-title { font-weight:700; }
+    .check-detail { color:var(--muted); font-size:12px; overflow-wrap:anywhere; }
+    .compact-actions { display:flex; gap:8px; flex-wrap:wrap; }
     table { width:100%; border-collapse:collapse; font-size:13px; }
     th, td { border-bottom:1px solid #eef1f5; text-align:left; padding:9px 8px; vertical-align:top; }
     th { color:var(--muted); font-weight:600; background:#fbfcfe; }
@@ -1153,7 +1268,7 @@ INDEX_HTML = r"""<!doctype html>
         <div id="aiDetail" class="status-sub">-</div>
       </div>
       <div class="status-card">
-        <div class="status-title">采集入池</div>
+        <div class="status-title">采集总开关</div>
         <div id="collectStatus" class="status-main">读取中</div>
         <div id="collectDetail" class="status-sub">-</div>
       </div>
@@ -1247,7 +1362,7 @@ INDEX_HTML = r"""<!doctype html>
           <span id="collectBadge" class="pill">-</span>
         </div>
         <div class="switch">
-          <div><div class="switch-title">采集进入训练池</div><div class="switch-note">关闭后原始日志仍可保留，但训练会跳过该时间段</div></div>
+          <div><div class="switch-title">采集总开关</div><div class="switch-note">打开才写入战斗/宏观日志；关闭后不采集本局后续动作</div></div>
           <input id="collection_enabled" type="checkbox" onchange="saveControl()">
         </div>
         <div class="field">
@@ -1292,7 +1407,7 @@ INDEX_HTML = r"""<!doctype html>
     <div class="stack">
       <section>
         <div class="section-head">
-          <h2>当前数据</h2>
+          <h2>Run 数据体检</h2>
           <span id="currentDataBadge" class="pill">读取中</span>
         </div>
         <div id="currentData">读取中</div>
@@ -1323,11 +1438,11 @@ INDEX_HTML = r"""<!doctype html>
       <section>
         <div class="section-head">
           <h2>最近 Run</h2>
-          <span class="fine">手动质量不会被自动分类覆盖</span>
+          <span class="fine">质量和数据完整度分开看</span>
         </div>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Run</th><th>进度</th><th>动作</th><th>来源</th><th>结果</th><th>质量</th><th>保留</th><th></th></tr></thead>
+            <thead><tr><th>Run</th><th>进度</th><th>动作</th><th>来源</th><th>结果</th><th>质量</th><th>数据</th><th>保留</th><th></th></tr></thead>
             <tbody id="runs"></tbody>
           </table>
         </div>
@@ -1427,6 +1542,24 @@ function setPill(id, text, cls) {
   el.textContent = text;
   el.className = `pill ${cls || ""}`;
 }
+function checkClass(status) {
+  if (status === "ok") return "on";
+  if (status === "missing") return "off";
+  if (status === "warn") return "warn";
+  return "info";
+}
+function checkLabel(status) {
+  if (status === "ok") return "正常";
+  if (status === "missing") return "缺失";
+  if (status === "warn") return "确认";
+  return "可选";
+}
+function dataHealthClass(health) {
+  if (health === "ok") return "on";
+  if (health === "missing") return "off";
+  if (health === "warn") return "warn";
+  return "info";
+}
 let llmFormDirty = false;
 let llmProfilesCache = [];
 function markLLMDirty() {
@@ -1466,9 +1599,11 @@ async function refresh() {
   document.getElementById("aiStatus").textContent = s.control.ai_enabled ? "允许出牌" : "手动模式";
   document.getElementById("aiStatus").className = `status-main ${s.control.ai_enabled ? "on" : "warn"}`;
   document.getElementById("aiDetail").textContent = s.ai_pid ? `托管进程 PID ${s.ai_pid}` : "AI 进程未由控制台托管";
-  document.getElementById("collectStatus").textContent = s.control.collection_enabled ? "正在入池" : "暂停入池";
+  document.getElementById("collectStatus").textContent = s.control.collection_enabled ? "采集中" : "已暂停";
   document.getElementById("collectStatus").className = `status-main ${s.control.collection_enabled ? "on" : "off"}`;
-  document.getElementById("collectDetail").textContent = s.control.include_ai_in_training ? "Human + AI 数据会进入训练" : "仅 Human 数据进入训练";
+  document.getElementById("collectDetail").textContent = s.control.collection_enabled
+    ? (s.control.include_ai_in_training ? "写入 Human + AI 数据" : "写入 Human 数据，AI 不进 BC")
+    : "不会写入新的战斗/宏观日志";
   document.getElementById("runQuality").textContent = active ? (active.quality_label || active.quality || "-") : "无 run";
   document.getElementById("runQuality").className = `status-main ${active && active.discarded ? "off" : "info"}`;
   document.getElementById("runDetail").textContent = active ? `Act ${active.max_act || 0} / Floor ${active.max_floor || 0}，${active.records || 0} 条` : "尚未读取到采集数据";
@@ -1519,17 +1654,28 @@ function renderCurrentData(data) {
     return;
   }
   const warnings = (data.warnings || []).map(w => `<div><span class="pill off">注意</span> ${w}</div>`).join("");
-  setPill("currentDataBadge", run.play_card > 0 ? "有出牌样本" : "缺出牌样本", run.play_card > 0 ? "on" : "warn");
+  const checks = (run.data_checks || []).map(c => `
+    <div class="check-item">
+      <div class="check-top">
+        <span class="check-title">${c.label || "-"}</span>
+        <span class="pill ${checkClass(c.status)}">${checkLabel(c.status)}</span>
+      </div>
+      <div class="check-detail">${c.detail || "-"}</div>
+    </div>
+  `).join("");
+  setPill("currentDataBadge", run.data_health_label || "体检", dataHealthClass(run.data_health));
   document.getElementById("currentData").innerHTML = `
     <div class="kv"><span>Run</span><code>${run.run_id}</code></div>
     <div class="kv"><span>时间</span><span>${run.last_time || "-"}</span></div>
     <div class="metric-grid">
       <div class="metric"><div class="metric-value">${run.records || 0}</div><div class="metric-label">总记录</div></div>
       <div class="metric"><div class="metric-value">${run.combat || 0}</div><div class="metric-label">战斗记录</div></div>
+      <div class="metric"><div class="metric-value">${run.macro || 0}</div><div class="metric-label">宏观记录</div></div>
       <div class="metric"><div class="metric-value">${run.play_card || 0}</div><div class="metric-label">出牌样本</div></div>
       <div class="metric"><div class="metric-value">${run.end_turn || 0}</div><div class="metric-label">结束回合</div></div>
       <div class="metric"><div class="metric-value">A${run.max_act || 0}/F${run.max_floor || 0}</div><div class="metric-label">${run.quality_label || "未知"}</div></div>
     </div>
+    <div class="check-list">${checks}</div>
     <div class="warning-list">${warnings || '<div><span class="pill on">正常</span> 最近 run 有数据写入</div>'}</div>`;
 }
 function renderRuns(runs) {
@@ -1544,10 +1690,11 @@ function renderRuns(runs) {
         <select onchange="setQuality('${run.run_id}', this.value)">${qualityOptions(run.quality)}</select>
         <br><span class="fine">${run.quality_manual ? "手动标签" : "自动推断"}</span>
       </td>
+      <td><span class="pill ${dataHealthClass(run.data_health)}">${run.data_health_label || "-"}</span><br><span class="fine">${(run.missing_data || []).slice(0, 2).join("、") || "关键项正常"}</span></td>
       <td>${run.discarded ? '<span class="pill off">丢弃</span>' : '<span class="pill on">保留</span>'}</td>
       <td><button onclick="markRun('${run.run_id}', ${!run.discarded})">${run.discarded ? "保留" : "丢弃"}</button></td>
     </tr>`).join("");
-  document.getElementById("runs").innerHTML = rows || "<tr><td colspan=8>暂无数据</td></tr>";
+  document.getElementById("runs").innerHTML = rows || "<tr><td colspan=9>暂无数据</td></tr>";
 }
 function renderRecentRecords(records) {
   document.getElementById("recentRecords").innerHTML = records.slice(0, 12).map(r => `
