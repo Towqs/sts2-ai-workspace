@@ -941,7 +941,7 @@ INDEX_HTML = r"""<!doctype html>
         </div>
       </section>
 
-      <section>
+      <section id="llmConfigSection">
         <div class="section-head">
           <h2>LLM 模型接入</h2>
           <span id="llmProcessBadge" class="pill">-</span>
@@ -967,15 +967,15 @@ INDEX_HTML = r"""<!doctype html>
         </div>
         <div class="field">
           <span>Base URL</span>
-          <input id="llm_base_url" type="text" placeholder="https://api.openai.com/v1">
+          <input id="llm_base_url" type="text" placeholder="https://api.openai.com/v1" oninput="markLLMDirty()">
         </div>
         <div class="field">
           <span>API Key</span>
-          <input id="llm_api_key" type="password" placeholder="留空表示不修改已保存 key">
+          <input id="llm_api_key" type="password" placeholder="留空表示不修改已保存 key" oninput="markLLMDirty()">
         </div>
         <div class="field">
           <span>Model</span>
-          <input id="llm_model" type="text" placeholder="例如 gpt-4.1-mini">
+          <input id="llm_model" type="text" placeholder="例如 gpt-4.1-mini" oninput="markLLMDirty()">
         </div>
         <div class="row" style="margin-top:12px">
           <button class="primary" onclick="saveLLMConfig()">保存模型配置</button>
@@ -1131,6 +1131,22 @@ function setPill(id, text, cls) {
   el.textContent = text;
   el.className = `pill ${cls || ""}`;
 }
+let llmFormDirty = false;
+function markLLMDirty() {
+  llmFormDirty = true;
+}
+function isLLMFormEditing() {
+  const section = document.getElementById("llmConfigSection");
+  return llmFormDirty || (section && section.contains(document.activeElement));
+}
+function applyLLMConfigToForm(llmCfg) {
+  document.getElementById("llm_enabled").checked = !!llmCfg.enabled;
+  document.getElementById("llm_mode").value = llmCfg.mode || "advisor";
+  document.getElementById("llm_execute_combat").checked = !!llmCfg.execute_combat;
+  document.getElementById("llm_base_url").value = llmCfg.base_url || "";
+  document.getElementById("llm_model").value = llmCfg.model || "";
+  document.getElementById("llm_api_key").placeholder = llmCfg.has_api_key ? "已保存，留空不修改" : "未配置 API Key";
+}
 async function refresh() {
   const s = await api("/api/status");
   const active = s.current_data && s.current_data.active_run;
@@ -1142,12 +1158,9 @@ async function refresh() {
   document.getElementById("include_ai_in_training").checked = !!s.control.include_ai_in_training;
   document.getElementById("min_training_quality").value = s.control.min_training_quality || "unknown";
   const llmCfg = (s.llm && s.llm.config) || {};
-  document.getElementById("llm_enabled").checked = !!llmCfg.enabled;
-  document.getElementById("llm_mode").value = llmCfg.mode || "advisor";
-  document.getElementById("llm_execute_combat").checked = !!llmCfg.execute_combat;
-  document.getElementById("llm_base_url").value = llmCfg.base_url || "";
-  document.getElementById("llm_model").value = llmCfg.model || "";
-  document.getElementById("llm_api_key").placeholder = llmCfg.has_api_key ? "已保存，留空不修改" : "未配置 API Key";
+  if (!isLLMFormEditing()) {
+    applyLLMConfigToForm(llmCfg);
+  }
 
   document.getElementById("gamePhase").textContent = phase.label;
   document.getElementById("gamePhase").className = `status-main ${phase.cls}`;
@@ -1309,9 +1322,11 @@ async function saveLLMConfig() {
     model: document.getElementById("llm_model").value.trim()
   };
   if (apiKey) body.api_key = apiKey;
-  await api("/api/llm/config", body);
+  const result = await api("/api/llm/config", body);
+  llmFormDirty = false;
   document.getElementById("llm_api_key").value = "";
-  refresh();
+  if (result.config) applyLLMConfigToForm(result.config);
+  await refresh();
 }
 async function setRunMode(mode) { await api("/api/control", {next_run_mode: mode}); refresh(); }
 async function startAI(){ await api("/api/ai/start", {}); refresh(); }
