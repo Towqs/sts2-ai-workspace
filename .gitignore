@@ -17,6 +17,7 @@ Thumbs.db
 RL_Datasets/
 Data_Packages/
 AI_Training/ProcessedParams/
+AI_Training/ProcessedMacroParams/
 
 # Runtime control state
 AI_Training/control_state.json
