@@ -74,8 +74,11 @@ QUALITY_ORDER = {
 }
 
 TRAIN_LOCK = threading.Lock()
+LLM_TEST_LOCK = threading.Lock()
+LLM_TEST_COOLDOWN_SEC = 60
 LAST_TRAIN = {"running": False, "started": None, "finished": None, "output": ""}
 LAST_EXPORT = {"path": None, "filename": None, "created": None, "size": 0, "file_count": 0}
+LLM_TEST_STATE = {"running": False, "last_started": 0.0, "last_finished": 0.0}
 
 
 def read_json(path, default):
@@ -331,6 +334,23 @@ def test_llm_connection():
     if not data.get("model"):
         return {"status": "error", "message": "Missing model name."}
 
+    now = time.time()
+    with LLM_TEST_LOCK:
+        if LLM_TEST_STATE.get("running"):
+            return {
+                "status": "rejected",
+                "message": "连接测试正在进行中，本次点击已拒绝，未请求模型。",
+            }
+        wait = LLM_TEST_COOLDOWN_SEC - (now - float(LLM_TEST_STATE.get("last_started") or 0))
+        if wait > 0:
+            return {
+                "status": "rejected",
+                "message": f"连接测试冷却中，还需 {int(wait) + 1} 秒。本次点击已拒绝，未请求模型。",
+                "retry_after_sec": int(wait) + 1,
+            }
+        LLM_TEST_STATE["running"] = True
+        LLM_TEST_STATE["last_started"] = now
+
     body = {
         "model": data["model"],
         "messages": [
@@ -364,6 +384,10 @@ def test_llm_connection():
         return {"status": "error", "message": f"HTTP {exc.code}: {raw[:500]}"}
     except Exception as exc:
         return {"status": "error", "message": str(exc)}
+    finally:
+        with LLM_TEST_LOCK:
+            LLM_TEST_STATE["running"] = False
+            LLM_TEST_STATE["last_finished"] = time.time()
 
 
 def ensure_llm_profiles_initialized():
@@ -1205,7 +1229,7 @@ INDEX_HTML = r"""<!doctype html>
         <div class="row" style="margin-top:12px">
           <button class="primary" onclick="saveLLMConfig()">保存模型配置</button>
           <button onclick="saveLLMProfile()">保存为 API 配置</button>
-          <button onclick="testLLM()">测试连接</button>
+          <button id="llmTestButton" onclick="testLLM()">测试连接</button>
         </div>
         <div id="llmTestResult" class="fine" style="margin-top:8px">未测试</div>
         <div class="fine" style="margin-top:10px">API Key 只保存在本机 <code>AI_Training/model_config.json</code>，不会进入 Git。</div>
@@ -1673,10 +1697,16 @@ async function saveLLMProfileEdit() {
   await refresh();
 }
 async function testLLM() {
-  await saveLLMConfig();
-  document.getElementById("llmTestResult").textContent = "正在测试...";
-  const result = await api("/api/llm/test", {});
-  document.getElementById("llmTestResult").textContent = result.message || result.status || "测试完成";
+  const button = document.getElementById("llmTestButton");
+  button.disabled = true;
+  try {
+    await saveLLMConfig();
+    document.getElementById("llmTestResult").textContent = "正在测试...";
+    const result = await api("/api/llm/test", {});
+    document.getElementById("llmTestResult").textContent = result.message || result.status || "测试完成";
+  } finally {
+    button.disabled = false;
+  }
 }
 async function setRunMode(mode) { await api("/api/control", {next_run_mode: mode}); refresh(); }
 async function startAI(){ await api("/api/ai/start", {}); refresh(); }

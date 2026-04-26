@@ -149,6 +149,7 @@ def compact_state(state):
             "potions": player.get("potions", []),
         },
         "battle": {
+            "round": battle.get("round"),
             "turn": battle.get("turn"),
             "is_play_phase": battle.get("is_play_phase"),
             "player_actions_disabled": battle.get("player_actions_disabled"),
@@ -405,11 +406,37 @@ def should_execute(cfg, payload, state):
     return state_type in COMBAT_TYPES and payload.get("action") in ("play_card", "end_turn")
 
 
+def error_backoff_seconds(error_text, consecutive_errors):
+    text = str(error_text or "").lower()
+    if "invalid token" in text or "recaptcha" in text or "http 401" in text:
+        return 300
+    return min(300, 15 * (2 ** min(max(consecutive_errors - 1, 0), 4)))
+
+
+def state_signature(compact):
+    battle = compact.get("battle", {})
+    player = compact.get("player", {})
+    hand = player.get("hand", [])
+    enemies = compact.get("battle", {}).get("enemies", [])
+    return json.dumps({
+        "state_type": compact.get("state_type"),
+        "round": battle.get("round"),
+        "turn": battle.get("turn"),
+        "play_phase": battle.get("is_play_phase"),
+        "energy": player.get("energy"),
+        "hand": [(c.get("index"), c.get("id"), c.get("cost"), c.get("can_play")) for c in hand],
+        "enemies": [(e.get("entity_id"), e.get("hp"), e.get("block")) for e in enemies],
+    }, sort_keys=True, ensure_ascii=False)
+
+
 def run_agent():
     session_id = f"llm_{datetime.now():%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:8]}"
     last_decision_key = None
     actions_this_turn = 0
     last_turn_id = None
+    consecutive_errors = 0
+    next_request_at = 0.0
+    last_error = ""
 
     print("STS2 LLM agent started.")
     while True:
@@ -424,9 +451,22 @@ def run_agent():
             continue
 
         try:
+            now = time.time()
+            if next_request_at > now:
+                remaining = max(1, int(next_request_at - now))
+                write_json(LOGIC_PATH, {
+                    "timestamp": int(now * 1000),
+                    "status": "cooldown",
+                    "error": last_error,
+                    "retry_after_sec": remaining,
+                    "message": f"LLM request paused after API error. Retry in {remaining}s.",
+                })
+                time.sleep(min(5.0, remaining))
+                continue
+
             state = get_game_state()
             compact = compact_state(state)
-            turn_id = f"{compact.get('state_type')}:{compact.get('battle', {}).get('turn')}:{compact.get('player', {}).get('energy')}:{len(compact.get('player', {}).get('hand', []))}"
+            turn_id = state_signature(compact)
             if turn_id != last_turn_id:
                 actions_this_turn = 0
                 last_turn_id = turn_id
@@ -466,17 +506,28 @@ def run_agent():
             }
             write_json(LOGIC_PATH, snapshot)
             append_llm_log(session_id, snapshot)
+            consecutive_errors = 0
+            next_request_at = 0.0
+            last_error = ""
         except (HTTPError, URLError) as exc:
+            last_error = f"connection_error: {exc}"
+            consecutive_errors += 1
+            next_request_at = time.time() + error_backoff_seconds(last_error, consecutive_errors)
             write_json(LOGIC_PATH, {
                 "timestamp": int(time.time() * 1000),
                 "status": "error",
-                "error": f"connection_error: {exc}",
+                "error": last_error,
+                "retry_after_sec": max(1, int(next_request_at - time.time())),
             })
         except Exception as exc:
+            last_error = str(exc)
+            consecutive_errors += 1
+            next_request_at = time.time() + error_backoff_seconds(last_error, consecutive_errors)
             write_json(LOGIC_PATH, {
                 "timestamp": int(time.time() * 1000),
                 "status": "error",
-                "error": str(exc),
+                "error": last_error,
+                "retry_after_sec": max(1, int(next_request_at - time.time())),
             })
 
         time.sleep(load_config().get("decision_interval_sec", 3.0))
