@@ -257,9 +257,70 @@ def delete_llm_profile(profile_id):
     return read_llm_config(mask_key=True)
 
 
+def update_llm_profile(patch):
+    profile_id = str(patch.get("profile_id") or "")
+    if not profile_id:
+        raise ValueError("profile_id is required")
+
+    data = DEFAULT_LLM_CONFIG.copy()
+    data.update(read_json(LLM_CONFIG_PATH, {}))
+    profiles = data.get("profiles") if isinstance(data.get("profiles"), list) else []
+    profile = None
+    for item in profiles:
+        if item.get("id") == profile_id:
+            profile = item
+            break
+    if profile is None:
+        raise ValueError("profile not found")
+
+    for key in ("name", "base_url", "model"):
+        if key in patch:
+            profile[key] = str(patch.get(key) or "").strip()
+    api_key = str(patch.get("api_key") or "").strip()
+    if api_key and api_key != "********":
+        profile["api_key"] = api_key
+    profile["provider"] = "openai_compatible"
+    profile["updated_at"] = datetime.now().isoformat(timespec="seconds")
+
+    if data.get("active_profile_id") == profile_id:
+        data.update({
+            "provider": "openai_compatible",
+            "base_url": profile.get("base_url", ""),
+            "api_key": profile.get("api_key", ""),
+            "model": profile.get("model", ""),
+        })
+
+    data["profiles"] = profiles
+    write_json(LLM_CONFIG_PATH, data)
+    return read_llm_config(mask_key=True)
+
+
 def _llm_chat_url(base_url):
     base = str(base_url or "").rstrip("/")
     return base if base.endswith("/chat/completions") else base + "/chat/completions"
+
+
+def _chat_response_content(result):
+    choices = result.get("choices") if isinstance(result, dict) else None
+    if not choices:
+        return None
+    choice = choices[0] if choices else {}
+    message = choice.get("message") if isinstance(choice, dict) else None
+    if isinstance(message, dict):
+        content = message.get("content")
+        if isinstance(content, list):
+            parts = []
+            for part in content:
+                if isinstance(part, dict):
+                    parts.append(str(part.get("text") or part.get("content") or ""))
+                else:
+                    parts.append(str(part))
+            return "\n".join(p for p in parts if p)
+        if content is not None:
+            return str(content)
+    if isinstance(choice, dict) and choice.get("text") is not None:
+        return str(choice.get("text"))
+    return None
 
 
 def test_llm_connection():
@@ -285,14 +346,19 @@ def test_llm_connection():
         method="POST",
         headers={
             "Content-Type": "application/json",
+            "Accept": "application/json",
             "Authorization": f"Bearer {data['api_key']}",
         },
     )
     try:
         with urlopen(req, timeout=30) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
-        json.loads(raw)
-        return {"status": "ok", "message": "Model connection OK."}
+        result = json.loads(raw)
+        content = _chat_response_content(result)
+        if content is None:
+            preview = json.dumps(result, ensure_ascii=False)[:500]
+            return {"status": "error", "message": f"API reached, but response has no chat content: {preview}"}
+        return {"status": "ok", "message": f"Model connection OK. Response: {content[:120]}"}
     except HTTPError as exc:
         raw = exc.read().decode("utf-8", errors="replace")
         return {"status": "error", "message": f"HTTP {exc.code}: {raw[:500]}"}
@@ -1009,6 +1075,25 @@ INDEX_HTML = r"""<!doctype html>
     .table-wrap { overflow:auto; border:1px solid #eef1f5; border-radius:8px; }
     .table-wrap table th, .table-wrap table td { white-space:nowrap; }
     .run-id { max-width:260px; white-space:normal; }
+    .modal-backdrop {
+      display:none;
+      position:fixed;
+      inset:0;
+      z-index:20;
+      background:rgba(15,23,42,.36);
+      padding:20px;
+      align-items:center;
+      justify-content:center;
+    }
+    .modal-backdrop.open { display:flex; }
+    .modal {
+      width:min(560px, 100%);
+      background:#fff;
+      border:1px solid var(--line);
+      border-radius:8px;
+      padding:16px;
+      box-shadow:0 18px 48px rgba(16,24,40,.18);
+    }
     @media (max-width: 1120px) {
       .status-grid { grid-template-columns:repeat(2, minmax(160px, 1fr)); }
       main { grid-template-columns:1fr; }
@@ -1246,11 +1331,49 @@ INDEX_HTML = r"""<!doctype html>
       </section>
     </div>
   </main>
+  <div id="llmProfileEditor" class="modal-backdrop" onclick="closeLLMProfileEditor(event)">
+    <div class="modal" onclick="event.stopPropagation()">
+      <div class="section-head">
+        <h2>修改 API 配置</h2>
+        <button onclick="closeLLMProfileEditor()">关闭</button>
+      </div>
+      <input id="edit_profile_id" type="hidden">
+      <div class="field">
+        <span>名称</span>
+        <input id="edit_profile_name" type="text">
+      </div>
+      <div class="field">
+        <span>Base URL</span>
+        <input id="edit_base_url" type="text">
+      </div>
+      <div class="field">
+        <span>Model</span>
+        <input id="edit_model" type="text">
+      </div>
+      <div class="field">
+        <span>API Key</span>
+        <input id="edit_api_key" type="password" placeholder="留空表示不修改已保存 key">
+      </div>
+      <div class="row" style="margin-top:14px">
+        <button class="primary" onclick="saveLLMProfileEdit()">保存修改</button>
+        <button onclick="closeLLMProfileEditor()">取消</button>
+      </div>
+    </div>
+  </div>
 <script>
 async function api(path, body) {
   const opts = body ? {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)} : {};
   const r = await fetch(path, opts);
   return await r.json();
+}
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>"']/g, ch => ({
+    "&":"&amp;",
+    "<":"&lt;",
+    ">":"&gt;",
+    '"':"&quot;",
+    "'":"&#39;"
+  }[ch]));
 }
 function phaseInfo(game) {
   if (!game.online) return {label:"未连接", cls:"off", detail:`游戏 API 离线：${game.error || "无响应"}`};
@@ -1281,6 +1404,7 @@ function setPill(id, text, cls) {
   el.className = `pill ${cls || ""}`;
 }
 let llmFormDirty = false;
+let llmProfilesCache = [];
 function markLLMDirty() {
   llmFormDirty = true;
 }
@@ -1453,14 +1577,16 @@ function renderLLMLogic(logic, cfg) {
     <div class="kv"><span>理由</span><span>${d.reason || "-"}</span></div>`;
 }
 function renderLLMProfiles(profiles, activeId) {
+  llmProfilesCache = profiles || [];
   const rows = (profiles || []).map(p => `
     <tr>
-      <td>${p.id === activeId ? '<span class="pill on">当前</span> ' : ''}${p.name || "-"}</td>
-      <td><code>${p.base_url || "-"}</code></td>
-      <td>${p.model || "-"}</td>
-      <td>${p.has_api_key ? `••••${p.key_tail || ""}` : "-"}</td>
+      <td>${p.id === activeId ? '<span class="pill on">当前</span> ' : ''}${escapeHtml(p.name || "-")}</td>
+      <td><code>${escapeHtml(p.base_url || "-")}</code></td>
+      <td>${escapeHtml(p.model || "-")}</td>
+      <td>${p.has_api_key ? `****${escapeHtml(p.key_tail || "")}` : "-"}</td>
       <td class="row">
         <button onclick="useLLMProfile('${p.id}')">使用</button>
+        <button onclick="openLLMProfileEditor('${p.id}')">修改</button>
         <button onclick="deleteLLMProfile('${p.id}')">删除</button>
       </td>
     </tr>`).join("");
@@ -1516,6 +1642,34 @@ async function useLLMProfile(profileId) {
 }
 async function deleteLLMProfile(profileId) {
   await api("/api/llm/profile/delete", {profile_id: profileId});
+  await refresh();
+}
+function openLLMProfileEditor(profileId) {
+  const profile = llmProfilesCache.find(p => p.id === profileId);
+  if (!profile) return;
+  document.getElementById("edit_profile_id").value = profile.id || "";
+  document.getElementById("edit_profile_name").value = profile.name || "";
+  document.getElementById("edit_base_url").value = profile.base_url || "";
+  document.getElementById("edit_model").value = profile.model || "";
+  document.getElementById("edit_api_key").value = "";
+  document.getElementById("llmProfileEditor").classList.add("open");
+}
+function closeLLMProfileEditor(event) {
+  if (event && event.target && event.target.id !== "llmProfileEditor") return;
+  document.getElementById("llmProfileEditor").classList.remove("open");
+}
+async function saveLLMProfileEdit() {
+  const body = {
+    profile_id: document.getElementById("edit_profile_id").value,
+    name: document.getElementById("edit_profile_name").value.trim(),
+    base_url: document.getElementById("edit_base_url").value.trim(),
+    model: document.getElementById("edit_model").value.trim()
+  };
+  const apiKey = document.getElementById("edit_api_key").value.trim();
+  if (apiKey) body.api_key = apiKey;
+  await api("/api/llm/profile/update", body);
+  closeLLMProfileEditor();
+  llmFormDirty = false;
   await refresh();
 }
 async function testLLM() {
@@ -1604,6 +1758,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, {"config": use_llm_profile(body["profile_id"])})
             elif self.path == "/api/llm/profile/delete":
                 self._json(200, {"config": delete_llm_profile(body["profile_id"])})
+            elif self.path == "/api/llm/profile/update":
+                self._json(200, {"config": update_llm_profile(body)})
             elif self.path == "/api/llm/test":
                 self._json(200, test_llm_connection())
             elif self.path == "/api/llm/start":

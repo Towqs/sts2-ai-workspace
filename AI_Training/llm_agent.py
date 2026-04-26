@@ -173,8 +173,11 @@ def action_catalog(compact):
             if card.get("can_play") and card_cost(card, energy) <= energy:
                 args = {"card_index": card["index"]}
                 if card.get("target_type") == "AnyEnemy":
-                    args["target"] = "REQUIRED enemy entity_id"
-                actions.append({"action": "combat_play_card", "args": args, "card": card.get("id")})
+                    args["target"] = "one battle.enemies entity_id"
+                action = {"action": "combat_play_card", "args": args, "card": card.get("id")}
+                if card.get("target_type") == "AnyEnemy":
+                    action["target_options"] = [e.get("entity_id") for e in compact.get("battle", {}).get("enemies", []) if e.get("entity_id")]
+                actions.append(action)
         actions.append({"action": "combat_end_turn", "args": {}})
     else:
         actions.extend([
@@ -212,6 +215,31 @@ def extract_json(text):
         return json.loads(match.group(0))
 
 
+def chat_response_content(result):
+    choices = result.get("choices") if isinstance(result, dict) else None
+    if not choices:
+        return None
+    choice = choices[0] if choices else {}
+    message = choice.get("message") if isinstance(choice, dict) else None
+    if isinstance(message, dict):
+        content = message.get("content")
+        if isinstance(content, list):
+            parts = []
+            for part in content:
+                if isinstance(part, dict):
+                    parts.append(str(part.get("text") or part.get("content") or ""))
+                else:
+                    parts.append(str(part))
+            return "\n".join(p for p in parts if p)
+        if content is not None:
+            return str(content)
+        if message.get("tool_calls"):
+            return ""
+    if isinstance(choice, dict) and choice.get("text") is not None:
+        return str(choice.get("text"))
+    return None
+
+
 def call_openai_compatible(cfg, compact, actions):
     if not cfg.get("api_key"):
         raise RuntimeError("Missing API key")
@@ -243,11 +271,19 @@ def call_openai_compatible(cfg, compact, actions):
         ],
         "temperature": cfg.get("temperature", 0.2),
         "max_tokens": cfg.get("max_tokens", 700),
+        "stream": False,
     }
-    headers = {"Authorization": f"Bearer {cfg['api_key']}"}
+    headers = {"Authorization": f"Bearer {cfg['api_key']}", "Accept": "application/json"}
     result = request_json(chat_url(cfg.get("base_url")), method="POST", body=body, headers=headers, timeout=45)
-    content = result["choices"][0]["message"]["content"]
-    decision = extract_json(content)
+    content = chat_response_content(result)
+    if content is None:
+        preview = json.dumps(result, ensure_ascii=False)[:1500]
+        raise RuntimeError(f"Model response has no chat content: {preview}")
+    try:
+        decision = extract_json(content)
+    except Exception as exc:
+        preview = content[:1500].replace("\n", " ")
+        raise RuntimeError(f"Model response did not contain JSON decision: {preview}") from exc
     decision["_raw_content"] = content
     return decision
 
@@ -309,8 +345,14 @@ def validate_and_convert(decision, state):
         payload = {"action": "play_card", "card_index": idx}
         if card.get("target_type") == "AnyEnemy":
             target = args.get("target")
-            valid_targets = {e.get("entity_id") for e in battle.get("enemies", []) if e.get("entity_id")}
+            living_enemies = [e for e in battle.get("enemies", []) if e.get("entity_id")]
+            valid_targets = {e.get("entity_id") for e in living_enemies}
             if target not in valid_targets:
+                placeholder = str(target or "").strip().lower()
+                if living_enemies and placeholder in ("", "required enemy entity_id", "one battle.enemies entity_id", "enemy", "target"):
+                    target = min(living_enemies, key=enemy_hp).get("entity_id")
+                    payload["target"] = target
+                    return payload, "auto_targeted_lowest_hp"
                 return None, "missing_or_invalid_target"
             payload["target"] = target
         return payload, "ok"
