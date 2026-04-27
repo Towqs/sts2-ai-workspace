@@ -127,6 +127,11 @@ def should_use_record(record):
         return False
     if record.get("source") == "ai" and not include_ai():
         return False
+    if record.get("action_type") == "select_map_node":
+        screen = record.get("screen_state") or record.get("screen") or {}
+        options = ((screen.get("map") or {}).get("next_options") or [])
+        if len(options) <= 1:
+            return False
     min_quality = min_training_quality()
     if QUALITY_ORDER.get(run_quality(record.get("run_id")), 0) < QUALITY_ORDER.get(min_quality, 0):
         return False

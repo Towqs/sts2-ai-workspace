@@ -48,6 +48,7 @@ class CombatBCModel(nn.Module):
 def load_agent(processed_dir):
     vocab_path = os.path.join(processed_dir, 'vocab.json')
     model_path = os.path.join(processed_dir, 'bc_model_best.pth')
+    metadata_path = os.path.join(processed_dir, 'metadata.json')
     
     encoded = StateEncoder(vocab_path)
     
@@ -56,16 +57,34 @@ def load_agent(processed_dir):
     
     id_to_action = {v: k for k, v in vocab['actions'].items()}
     
-    input_dim = 61
+    metadata = {}
+    try:
+        with open(metadata_path, "r", encoding="utf-8") as f:
+            metadata = json.load(f)
+    except Exception:
+        pass
+    state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
+    weight_input_dim = int(state_dict.get("net.0.weight").shape[1])
+    input_dim = int(metadata.get("features") or weight_input_dim)
+    if input_dim != weight_input_dim:
+        input_dim = weight_input_dim
     output_dim = len(vocab['actions'])
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = CombatBCModel(input_dim, output_dim).to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+    model.load_state_dict(state_dict)
     model.eval()
     
-    print(Fore.CYAN + f"[*] AI Brain Loaded! Action space: {output_dim} | Device: {device}")
+    print(Fore.CYAN + f"[*] AI Brain Loaded! Action space: {output_dim} | Features: {input_dim} | Device: {device}")
     return encoded, id_to_action, model, device
+
+
+def align_feature_vector(vector, expected_dim):
+    if len(vector) == expected_dim:
+        return vector
+    if len(vector) > expected_dim:
+        return vector[:expected_dim]
+    return np.pad(vector, (0, expected_dim - len(vector)), mode="constant")
 
 
 def load_macro_agent(processed_dir):
@@ -340,6 +359,114 @@ def macro_fallback_payload(state):
     return None, ""
 
 
+def safe_num(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def route_type_score(node_type, hp_ratio, gold):
+    node_type = str(node_type or "").lower()
+    if "boss" in node_type:
+        return 0.0
+    if "elite" in node_type:
+        if hp_ratio >= 0.70:
+            return 5.0
+        if hp_ratio >= 0.55:
+            return 1.5
+        return -6.0
+    if "rest" in node_type or "camp" in node_type:
+        return 5.0 if hp_ratio < 0.55 else 1.0
+    if "shop" in node_type or "merchant" in node_type:
+        if gold >= 180:
+            return 3.5
+        if gold >= 110:
+            return 1.0
+        return -3.0
+    if "treasure" in node_type:
+        return 2.5
+    if "event" in node_type or "unknown" in node_type or "ancient" in node_type:
+        return 1.5
+    if "monster" in node_type:
+        return 2.0
+    return 0.5
+
+
+def choose_map_route_action(state):
+    options = ((state.get("map") or {}).get("next_options") or [])
+    if not options:
+        return None, {
+            "top_actions": [],
+            "chosen_action": None,
+            "payload": None,
+            "reason": "no_map_options",
+        }
+    if len(options) == 1:
+        option = options[0]
+        return {"action": "choose_map_node", "index": int(option.get("index", 0))}, {
+            "top_actions": [{"action": "route:index_0", "confidence": 100.0, "marker": "only_option"}],
+            "chosen_action": "route:index_0",
+            "payload": {"action": "choose_map_node", "index": int(option.get("index", 0))},
+            "reason": "only_option",
+        }
+
+    player = state.get("player") or {}
+    run = state.get("run") or {}
+    hp = safe_num(player.get("hp"))
+    max_hp = max(safe_num(player.get("max_hp"), 1.0), 1.0)
+    hp_ratio = hp / max_hp
+    gold = safe_num(player.get("gold"))
+    floor = int(safe_num(run.get("floor")))
+
+    scored = []
+    for fallback_index, option in enumerate(options):
+        node_type = option.get("type")
+        score = route_type_score(node_type, hp_ratio, gold)
+        leads = option.get("leads_to") or []
+        score += min(len(leads), 3) * 0.25
+        for lead in leads[:4]:
+            score += route_type_score(lead.get("type"), hp_ratio, gold) * 0.35
+        # Avoid deterministic left-edge drift on close scores.
+        score += (safe_num(option.get("col")) % 2) * 0.05
+        scored.append({
+            "fallback_index": fallback_index,
+            "index": int(option.get("index", fallback_index)),
+            "type": node_type,
+            "col": option.get("col"),
+            "row": option.get("row"),
+            "score": round(score, 3),
+            "leads": len(leads),
+        })
+
+    best_score = max(item["score"] for item in scored)
+    tied = [item for item in scored if best_score - item["score"] <= 0.25]
+    if len(tied) > 1:
+        center = sum(safe_num(o.get("col")) for o in options) / len(options)
+        if floor % 2:
+            best = max(tied, key=lambda item: (item["leads"], safe_num(item["col"]) - center))
+        else:
+            best = max(tied, key=lambda item: (item["leads"], center - safe_num(item["col"])))
+    else:
+        best = max(scored, key=lambda item: item["score"])
+
+    payload = {"action": "choose_map_node", "index": best["index"]}
+    top_actions = [
+        {
+            "action": f"route:index_{item['index']}:{item['type']}",
+            "confidence": item["score"],
+            "marker": f"col={item['col']} leads={item['leads']}",
+        }
+        for item in sorted(scored, key=lambda item: item["score"], reverse=True)[:6]
+    ]
+    return payload, {
+        "top_actions": top_actions,
+        "chosen_action": f"route:index_{best['index']}:{best['type']}",
+        "payload": payload,
+        "reason": f"route_score hp={hp_ratio:.2f} gold={int(gold)}",
+    }
+
+
 def macro_state_signature(state):
     state_type = str(state.get("state_type") or "").lower()
     payload = {"state_type": state_type}
@@ -380,6 +507,9 @@ def macro_state_signature(state):
 
 
 def choose_macro_action(macro_agent, state, allow_shop=False):
+    if str(state.get("state_type") or "").lower() == "map":
+        return choose_map_route_action(state)
+
     if not macro_agent:
         return None, {
             "top_actions": [],
@@ -742,6 +872,7 @@ def run_agent():
             
         # 特征编码 + 模型推理
         state_vec = encoder.encode(state)
+        state_vec = align_feature_vector(state_vec, model.net[0].in_features)
         state_tensor = torch.tensor([state_vec], dtype=torch.float32).to(device)
         
         with torch.no_grad():

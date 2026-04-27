@@ -3,6 +3,7 @@ import json
 import glob
 import numpy as np
 import time
+import re
 
 # 超参数/常量定义
 MAX_HAND = 10
@@ -71,6 +72,39 @@ def _parse_card_cost(card, energy):
         return int(cost)
     except (TypeError, ValueError):
         return 99
+
+
+def _safe_float(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_number_text(text):
+    return [int(n) for n in re.findall(r"\d+", str(text or ""))]
+
+
+def _intent_damage(intent):
+    label = str(intent.get("label") or "")
+    nums = _parse_number_text(label)
+    if "x" in label.lower() or "×" in label:
+        return nums[0] * nums[1] if len(nums) >= 2 else (nums[0] if nums else 0)
+    if nums:
+        return nums[0]
+    nums = _parse_number_text(intent.get("description"))
+    return nums[0] if nums else 0
+
+
+def _card_number_hint(card, mode):
+    text = " ".join(str(card.get(k) or "") for k in ("description", "name", "id", "type"))
+    lowered = text.lower()
+    if mode == "attack" and not any(k in lowered for k in ("deal", "damage", "attack", "造成", "伤害")):
+        return 0
+    if mode == "block" and not any(k in lowered for k in ("block", "defend", "armor", "格挡", "护甲")):
+        return 0
+    nums = _parse_number_text(text)
+    return nums[0] if nums else 0
 
 
 def _has_affordable_playable_card(state):
@@ -227,6 +261,7 @@ class StateEncoder:
     def encode(self, state):
         player = state.get("player", {})
         battle = state.get("battle", {})
+        run = state.get("run", {})
         
         features = []
         
@@ -236,6 +271,17 @@ class StateEncoder:
         block = player.get("block", 0)
         energy = player.get("energy", 0)
         max_energy = max(player.get("max_energy", 1), 1)
+        hand = player.get("hand", [])
+        enemies = [e for e in battle.get("enemies", []) if _safe_float(e.get("hp")) > 0]
+        incoming_damage = sum(_intent_damage(intent) for e in enemies for intent in e.get("intents", []))
+        net_incoming = max(0.0, incoming_damage - _safe_float(block))
+        playable = [c for c in hand if c.get("can_play", False)]
+        affordable = [c for c in playable if _parse_card_cost(c, energy) <= energy]
+        zero_cost = [c for c in affordable if _parse_card_cost(c, energy) == 0]
+        affordable_attack = sum(_card_number_hint(c, "attack") for c in affordable)
+        affordable_block = sum(_card_number_hint(c, "block") for c in affordable)
+        enemy_effective_hp = [_safe_float(e.get("hp")) + _safe_float(e.get("block")) for e in enemies]
+        can_kill_any = bool(enemy_effective_hp and affordable_attack >= min(enemy_effective_hp))
         
         features.extend([
             cur_hp / max_hp,
@@ -243,12 +289,26 @@ class StateEncoder:
             energy / max_energy,
             player.get("draw_pile_count", 0) / 30.0,
             player.get("discard_pile_count", 0) / 30.0,
-            player.get("exhaust_pile_count", 0) / 30.0
+            player.get("exhaust_pile_count", 0) / 30.0,
+            _safe_float(run.get("act")) / 4.0,
+            _safe_float(run.get("floor")) / 60.0,
+            _safe_float(battle.get("round")) / 20.0,
+            min(incoming_damage / max_hp, 2.0),
+            min(net_incoming / max_hp, 2.0),
+            max((cur_hp - net_incoming) / max_hp, -1.0),
+            len(enemies) / MAX_ENEMIES,
+            len(playable) / MAX_HAND,
+            len(affordable) / MAX_HAND,
+            len(zero_cost) / MAX_HAND,
+            min(affordable_attack / 100.0, 2.0),
+            min(affordable_block / 100.0, 2.0),
+            1.0 if can_kill_any else 0.0,
+            1.0 if net_incoming >= cur_hp and net_incoming > 0 else 0.0,
+            1.0 if net_incoming >= max_hp * 0.3 else 0.0
         ])
         
         # 2. 手牌特征 (MAX_HAND 个槽位)
         # 每个牌槽位: [card_vocab_id, normalized_cost, is_upgraded]
-        hand = player.get("hand", [])
         for i in range(MAX_HAND):
             if i < len(hand):
                 c = hand[i]
@@ -267,7 +327,6 @@ class StateEncoder:
                 
         # 3. 敌人特征 (MAX_ENEMIES 个槽位)
         # 每个敌人槽位: [enemy_vocab_id, hp_norm, block_norm, primary_intent_vocab_id, intent_dmg_norm]
-        enemies = battle.get("enemies", [])
         for i in range(MAX_ENEMIES):
             if i < len(enemies):
                 e = enemies[i]
@@ -368,6 +427,22 @@ def build_dataset(data_dirs, output_dir):
     # 3. 保存 Numpy 数据集
     np.save(os.path.join(output_dir, 'X_train.npy'), X_data)
     np.save(os.path.join(output_dir, 'Y_train.npy'), Y_data)
+    metadata = {
+        "samples": int(len(Y_data)),
+        "features": int(X_data.shape[1]) if X_data.ndim == 2 else 0,
+        "feature_version": 2,
+        "feature_notes": [
+            "act_floor_round",
+            "incoming_damage",
+            "net_incoming_after_block",
+            "hp_after_incoming",
+            "affordable_playable_counts",
+            "affordable_attack_block_estimates",
+            "lethal_and_threat_flags",
+        ],
+    }
+    with open(os.path.join(output_dir, "metadata.json"), "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2, ensure_ascii=False)
     print(f"Saved matrices. X shape: {X_data.shape}, Y shape: {Y_data.shape}")
 
 if __name__ == "__main__":

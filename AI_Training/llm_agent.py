@@ -111,9 +111,18 @@ def enemy_id(enemy):
     return enemy.get("entity_id") or enemy.get("id") or enemy.get("name") or ""
 
 
+def intent_damage(intent):
+    text = str(intent.get("label") or intent.get("description") or "")
+    nums = [int(n) for n in re.findall(r"\d+", text)]
+    if ("x" in text.lower() or "×" in text) and len(nums) >= 2:
+        return nums[0] * nums[1]
+    return nums[0] if nums else 0
+
+
 def compact_state(state):
     player = state.get("player", {})
     battle = state.get("battle", {})
+    run = state.get("run", {})
     hand = []
     for i, card in enumerate(player.get("hand", [])):
         hand.append({
@@ -135,16 +144,34 @@ def compact_state(state):
             "block": enemy.get("block", 0),
             "intents": enemy.get("intents", []),
         })
+    incoming_damage = sum(intent_damage(intent) for enemy in enemies for intent in enemy.get("intents", []))
+    block = player.get("block") or 0
+    hp = player.get("hp") or 0
+    net_incoming = max(0, incoming_damage - block)
+    affordable_cards = [
+        card for card in hand
+        if card.get("can_play") and card_cost(card, player.get("energy") or 0) <= (player.get("energy") or 0)
+    ]
     return {
         "state_type": state.get("state_type"),
+        "run": {
+            "act": run.get("act"),
+            "floor": run.get("floor"),
+            "ascension": run.get("ascension"),
+        },
         "player": {
             "character": player.get("character"),
             "hp": player.get("hp"),
             "max_hp": player.get("max_hp"),
             "block": player.get("block"),
             "energy": player.get("energy"),
+            "max_energy": player.get("max_energy"),
             "gold": player.get("gold"),
+            "draw_pile_count": player.get("draw_pile_count"),
+            "discard_pile_count": player.get("discard_pile_count"),
+            "exhaust_pile_count": player.get("exhaust_pile_count"),
             "hand": hand,
+            "affordable_cards": [{"index": c["index"], "id": c["id"], "cost": c["cost"]} for c in affordable_cards],
             "relics": player.get("relics", [])[:12],
             "potions": player.get("potions", []),
         },
@@ -153,6 +180,9 @@ def compact_state(state):
             "turn": battle.get("turn"),
             "is_play_phase": battle.get("is_play_phase"),
             "player_actions_disabled": battle.get("player_actions_disabled"),
+            "incoming_damage": incoming_damage,
+            "net_incoming_after_block": net_incoming,
+            "hp_after_incoming": hp - net_incoming,
             "enemies": enemies,
         },
         "map": state.get("map", {}),
@@ -259,6 +289,8 @@ def call_openai_compatible(cfg, compact, actions):
             "For enemy-targeted cards, target must be an entity_id from battle.enemies.",
             "Prefer playing useful zero-cost cards before spending energy.",
             "Do not end turn while affordable playable cards remain unless clearly justified.",
+            "Use battle.incoming_damage, battle.net_incoming_after_block, and battle.hp_after_incoming to decide whether blocking is mandatory.",
+            "Use run.act, run.floor, battle.round, relics, potions, and pile counts when explaining risk.",
             "Shop purchases are suggestions unless execution is explicitly enabled.",
         ],
         "state": compact,

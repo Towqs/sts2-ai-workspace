@@ -1019,6 +1019,7 @@ def models_status():
     macro_dir = AI_DIR / "ProcessedMacroParams"
     combat_model = combat_dir / "bc_model_best.pth"
     combat_vocab = combat_dir / "vocab.json"
+    combat_metadata = read_json(combat_dir / "metadata.json", {})
     macro_model = macro_dir / "macro_bc_model_best.pth"
     macro_vocab = macro_dir / "vocab.json"
     macro_summary = read_json(macro_dir / "training_summary.json", {})
@@ -1028,6 +1029,7 @@ def models_status():
             "ready": combat_model.exists() and combat_vocab.exists(),
             "model": file_status(combat_model),
             "vocab": file_status(combat_vocab),
+            "metadata": combat_metadata,
         },
         "macro": {
             "ready": macro_model.exists() and macro_vocab.exists(),
@@ -1834,6 +1836,7 @@ function renderCurrentData(data) {
 function renderModelHealth(models, aiProcess, control) {
   const combat = models.combat || {};
   const macro = models.macro || {};
+  const combatMeta = combat.metadata || {};
   const macroSummary = macro.summary || {};
   const macroMeta = macro.metadata || {};
   const ready = !!combat.ready && !!macro.ready;
@@ -1854,7 +1857,7 @@ function renderModelHealth(models, aiProcess, control) {
     : `<div class="notice good">战斗模型和宏观模型都已就绪。</div>`;
 
   document.getElementById("modelHealth").innerHTML = `
-    <div class="kv"><span>战斗模型</span><span><span class="pill ${combat.ready ? "on" : "off"}">${combat.ready ? "可用" : "缺失"}</span> ${combat.model && combat.model.mtime ? combat.model.mtime : ""}</span></div>
+    <div class="kv"><span>战斗模型</span><span><span class="pill ${combat.ready ? "on" : "off"}">${combat.ready ? "可用" : "缺失"}</span> 样本 ${combatMeta.samples || "-"}，特征 ${combatMeta.features || "旧版"} ${combat.model && combat.model.mtime ? combat.model.mtime : ""}</span></div>
     <div class="kv"><span>宏观模型</span><span><span class="pill ${macro.ready ? "on" : "off"}">${macro.ready ? "可用" : "缺失"}</span> 样本 ${macroSummary.samples || macroMeta.samples || 0}，动作 ${macroSummary.actions || macroMeta.classes || 0}</span></div>
     <div class="kv"><span>AI 进程</span><span>${aiProcess.pid ? `PID ${aiProcess.pid}` : "未启动"}${aiProcess.started_at ? `，启动 ${aiProcess.started_at}` : ""}</span></div>
     <div class="kv"><span>宏观执行</span><span><span class="pill ${control.macro_enabled ? "warn" : "info"}">${control.macro_enabled ? "开启" : "关闭"}</span> ${control.macro_enabled ? "会自动点地图/奖励/选卡" : "只显示战斗托管"}</span></div>

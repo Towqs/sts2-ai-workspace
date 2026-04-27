@@ -26,6 +26,7 @@ def train(processed_dir):
     x_path = os.path.join(processed_dir, 'X_train.npy')
     y_path = os.path.join(processed_dir, 'Y_train.npy')
     vocab_path = os.path.join(processed_dir, 'vocab.json')
+    metadata_path = os.path.join(processed_dir, 'metadata.json')
     
     if not os.path.exists(x_path):
         print("Data files not found. Please run data_pipeline.py first.")
@@ -45,6 +46,9 @@ def train(processed_dir):
     print(f"X_train shape: {X_train.shape}")
     print(f"Y_train shape: {Y_train.shape}")
     print(f"Input Features: {input_dim}, Action Space: {num_actions}")
+    if len(Y_train) == 0:
+        print("No training samples available. Check collection settings and run quality filters.")
+        return
     
     # Check GPU
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -102,6 +106,17 @@ def train(processed_dir):
             torch.save(model.state_dict(), os.path.join(processed_dir, 'bc_model_best.pth'))
             
     print(f"Training complete. Best model saved to bc_model_best.pth (Loss: {best_loss:.4f})")
+    summary = {
+        "samples": int(len(Y_train)),
+        "features": int(input_dim),
+        "actions": int(num_actions),
+        "epochs": int(epochs),
+        "best_loss": float(best_loss),
+        "device": str(device),
+        "model_path": "bc_model_best.pth",
+    }
+    with open(metadata_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
 
 if __name__ == "__main__":
     WORKSPACE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
