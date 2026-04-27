@@ -33,6 +33,7 @@ API_URL = "http://localhost:15526/api/v1/singleplayer"
 DEFAULT_CONTROL = {
     "ai_enabled": False,
     "macro_enabled": False,
+    "macro_shop_enabled": False,
     "record_ai_actions": True,
     "include_ai_in_training": False,
     "next_run_mode": "new",
@@ -80,6 +81,7 @@ LLM_TEST_COOLDOWN_SEC = 60
 LAST_TRAIN = {"running": False, "started": None, "finished": None, "output": ""}
 LAST_EXPORT = {"path": None, "filename": None, "created": None, "size": 0, "file_count": 0}
 LLM_TEST_STATE = {"running": False, "last_started": 0.0, "last_finished": 0.0}
+GAME_CACHE = {"state": None, "ts": 0.0}
 
 
 def read_json(path, default):
@@ -486,6 +488,21 @@ def get_game_state():
             return json.loads(resp.read().decode("utf-8"))
     except Exception as exc:
         return {"error": str(exc)}
+
+
+def get_game_state_for_dashboard(control):
+    cached = GAME_CACHE.get("state")
+    cached_type = str((cached or {}).get("state_type") or "").lower()
+    shop_guard = cached_type in ("shop", "fake_merchant") and not control.get("macro_shop_enabled", False)
+    if shop_guard and time.time() - float(GAME_CACHE.get("ts") or 0) < 12:
+        state = dict(cached)
+        state["shop_poll_guard"] = True
+        return state
+    state = get_game_state()
+    if "error" not in state:
+        GAME_CACHE["state"] = state
+        GAME_CACHE["ts"] = time.time()
+    return state
 
 
 def pid_is_running(pid):
@@ -1054,10 +1071,11 @@ def restart_ai():
 
 
 def status_payload():
-    game = get_game_state()
+    control = read_control()
+    game = get_game_state_for_dashboard(control)
     ai_process = ai_process_status()
     return {
-        "control": read_control(),
+        "control": control,
         "ai_pid": ai_process.get("pid"),
         "ai_process": ai_process,
         "models": models_status(),
@@ -1069,6 +1087,7 @@ def status_payload():
             "hp": game.get("player", {}).get("hp"),
             "max_hp": game.get("player", {}).get("max_hp"),
             "energy": game.get("player", {}).get("energy"),
+            "shop_poll_guard": game.get("shop_poll_guard", False),
         },
         "runs": latest_runs(),
         "current_data": current_data_summary(),
@@ -1118,6 +1137,7 @@ INDEX_HTML = r"""<!doctype html>
       background:var(--bg);
       font-size:14px;
       line-height:1.45;
+      overflow-x:hidden;
     }
     header {
       background:var(--panel);
@@ -1154,17 +1174,20 @@ INDEX_HTML = r"""<!doctype html>
     main {
       padding:20px 24px 28px;
       display:grid;
-      grid-template-columns:minmax(320px, 400px) minmax(0, 1fr);
+      grid-template-columns:360px minmax(0, 1fr);
       gap:18px;
       align-items:start;
     }
-    .stack { display:grid; gap:16px; }
+    .stack { display:grid; gap:16px; min-width:0; }
+    .sidebar { min-width:0; max-width:360px; }
+    .content { min-width:0; overflow:hidden; }
     section {
       background:var(--panel);
       border:1px solid var(--line);
       border-radius:8px;
       padding:16px;
       box-shadow:var(--shadow);
+      min-width:0;
     }
     .section-head {
       display:flex;
@@ -1173,7 +1196,6 @@ INDEX_HTML = r"""<!doctype html>
       gap:12px;
       margin-bottom:12px;
     }
-    .sidebar { position:static; }
     .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
     .field { display:grid; gap:6px; margin-top:12px; }
     .field span { color:var(--muted); font-size:12px; }
@@ -1320,7 +1342,7 @@ INDEX_HTML = r"""<!doctype html>
     @media (max-width: 1120px) {
       .status-grid { grid-template-columns:repeat(2, minmax(160px, 1fr)); }
       main { grid-template-columns:1fr; }
-      .sidebar { position:static; }
+      .sidebar { max-width:none; }
     }
     @media (max-width: 720px) {
       header { padding:14px; }
@@ -1385,6 +1407,10 @@ INDEX_HTML = r"""<!doctype html>
         <div class="switch">
           <div><div class="switch-title">允许 AI 宏观操作</div><div class="switch-note">地图、奖励、选卡、事件、休息点；默认关闭</div></div>
           <input id="macro_enabled" type="checkbox" onchange="saveControl()">
+        </div>
+        <div class="switch">
+          <div><div class="switch-title">允许 AI 商店购买</div><div class="switch-note">独立开关；默认关闭，避免和手动商店操作冲突</div></div>
+          <input id="macro_shop_enabled" type="checkbox" onchange="saveControl()">
         </div>
         <div class="switch">
           <div><div class="switch-title">记录 AI 战斗动作</div><div class="switch-note">写入 AI_Combat，方便复盘</div></div>
@@ -1503,7 +1529,7 @@ INDEX_HTML = r"""<!doctype html>
       </section>
     </div>
 
-    <div class="stack">
+    <div class="stack content">
       <section>
         <div class="section-head">
           <h2>Run 数据体检</h2>
@@ -1620,7 +1646,9 @@ function phaseInfo(game) {
   const lower = raw.toLowerCase();
   if (lower.includes("menu")) return {label:"主菜单", cls:"warn", detail:"游戏已连接，当前不在一局游戏内"};
   if (lower.includes("monster") || lower.includes("combat")) return {label:"战斗中", cls:"on", detail:`${game.character || ""} HP ${game.hp ?? "?"}/${game.max_hp ?? "?"} 能量 ${game.energy ?? "?"}`};
-  if (lower.includes("shop") || lower.includes("merchant")) return {label:"商店中", cls:"warn", detail:raw};
+  if (lower.includes("shop") || lower.includes("merchant")) {
+    return {label:"商店中", cls:"warn", detail:game.shop_poll_guard ? `${raw}；商店保护中，减少自动刷新` : raw};
+  }
   if (lower.includes("map")) return {label:"地图中", cls:"info", detail:raw};
   if (lower.includes("event")) return {label:"事件中", cls:"info", detail:raw};
   if (lower.includes("rest")) return {label:"营火中", cls:"info", detail:raw};
@@ -1706,6 +1734,7 @@ function renderStatus(s) {
 
   document.getElementById("ai_enabled").checked = !!s.control.ai_enabled;
   document.getElementById("macro_enabled").checked = !!s.control.macro_enabled;
+  document.getElementById("macro_shop_enabled").checked = !!s.control.macro_shop_enabled;
   document.getElementById("collection_enabled").checked = !!s.control.collection_enabled;
   document.getElementById("record_ai_actions").checked = !!s.control.record_ai_actions;
   document.getElementById("include_ai_in_training").checked = !!s.control.include_ai_in_training;
@@ -1721,7 +1750,7 @@ function renderStatus(s) {
   document.getElementById("gameDetail").textContent = phase.detail;
   document.getElementById("aiStatus").textContent = s.control.ai_enabled ? (s.control.macro_enabled ? "战斗+宏观" : "只管战斗") : "手动模式";
   document.getElementById("aiStatus").className = `status-main ${s.control.ai_enabled ? "on" : "warn"}`;
-  document.getElementById("aiDetail").textContent = s.ai_pid ? `托管进程 PID ${s.ai_pid}；宏观 ${s.control.macro_enabled ? "开启" : "关闭"}` : "AI 进程未由控制台托管";
+  document.getElementById("aiDetail").textContent = s.ai_pid ? `托管进程 PID ${s.ai_pid}；宏观 ${s.control.macro_enabled ? "开启" : "关闭"}；商店 ${s.control.macro_shop_enabled ? "允许" : "保护"}` : "AI 进程未由控制台托管";
   document.getElementById("collectStatus").textContent = s.control.collection_enabled ? "采集中" : "已暂停";
   document.getElementById("collectStatus").className = `status-main ${s.control.collection_enabled ? "on" : "off"}`;
   document.getElementById("collectDetail").textContent = s.control.collection_enabled
@@ -1814,6 +1843,7 @@ function renderModelHealth(models, aiProcess, control) {
   if (!macro.ready) warnings.push("宏观 BC 模型缺失，需要先训练宏观模型。");
   if (needsRestart) warnings.push("AI 进程早于当前 ai_agent.py，必须重启 AI 后宏观执行才会生效。");
   if (control.macro_enabled && !macro.ready) warnings.push("宏观开关已打开，但宏观模型不可用。");
+  if (control.macro_enabled && !control.macro_shop_enabled) warnings.push("商店保护已开启：AI 不会买东西，也不会自动离开商店。");
   setPill("modelBadge", ready ? (needsRestart ? "需重启" : "可用") : "缺模型", ready ? (needsRestart ? "warn" : "on") : "off");
 
   const restartNotice = needsRestart
@@ -1828,6 +1858,7 @@ function renderModelHealth(models, aiProcess, control) {
     <div class="kv"><span>宏观模型</span><span><span class="pill ${macro.ready ? "on" : "off"}">${macro.ready ? "可用" : "缺失"}</span> 样本 ${macroSummary.samples || macroMeta.samples || 0}，动作 ${macroSummary.actions || macroMeta.classes || 0}</span></div>
     <div class="kv"><span>AI 进程</span><span>${aiProcess.pid ? `PID ${aiProcess.pid}` : "未启动"}${aiProcess.started_at ? `，启动 ${aiProcess.started_at}` : ""}</span></div>
     <div class="kv"><span>宏观执行</span><span><span class="pill ${control.macro_enabled ? "warn" : "info"}">${control.macro_enabled ? "开启" : "关闭"}</span> ${control.macro_enabled ? "会自动点地图/奖励/选卡" : "只显示战斗托管"}</span></div>
+    <div class="kv"><span>商店保护</span><span><span class="pill ${control.macro_shop_enabled ? "warn" : "on"}">${control.macro_shop_enabled ? "允许购买" : "保护中"}</span> ${control.macro_shop_enabled ? "AI 可买明确商品；不自动删牌" : "AI 不碰商店，避免抢操作"}</span></div>
     ${restartNotice}
     ${warningHtml}`;
 }
@@ -1949,6 +1980,7 @@ async function saveControl() {
   await api("/api/control", {
     ai_enabled: document.getElementById("ai_enabled").checked,
     macro_enabled: document.getElementById("macro_enabled").checked,
+    macro_shop_enabled: document.getElementById("macro_shop_enabled").checked,
     collection_enabled: document.getElementById("collection_enabled").checked,
     record_ai_actions: document.getElementById("record_ai_actions").checked,
     include_ai_in_training: document.getElementById("include_ai_in_training").checked,

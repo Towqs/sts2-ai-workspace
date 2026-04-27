@@ -25,6 +25,7 @@ AI_LOG_DIR = os.path.join(WORKSPACE_DIR, "RL_Datasets", "AI_Combat")
 DEFAULT_CONTROL = {
     "ai_enabled": True,
     "macro_enabled": False,
+    "macro_shop_enabled": False,
     "record_ai_actions": True,
     "include_ai_in_training": False,
 }
@@ -170,7 +171,60 @@ def get_can_proceed(state, state_type):
     return False
 
 
-def macro_label_to_payload(label, state):
+def shop_item_matches(item, wanted):
+    wanted = str(wanted or "").lower()
+    fields = (
+        item.get("category"),
+        item.get("type"),
+        item.get("item_id"),
+        item.get("item_name"),
+        item.get("card_id"),
+        item.get("card_name"),
+        item.get("relic_id"),
+        item.get("relic_name"),
+        item.get("potion_id"),
+        item.get("potion_name"),
+    )
+    return any(str(value or "").lower() == wanted for value in fields)
+
+
+def choose_shop_item(state, state_type, wanted):
+    items = get_items_for_state(state, state_type)
+    available = [
+        (fallback_index, item)
+        for fallback_index, item in enumerate(items)
+        if item.get("is_stocked", True) and item.get("can_afford", True)
+    ]
+    if wanted not in ("?", "unknown", ""):
+        for fallback_index, item in available:
+            if shop_item_matches(item, wanted):
+                return item, fallback_index, "available"
+        return None, None, "shop_item_unavailable"
+
+    # Ambiguous shop labels come from weak training data. If shop automation is
+    # explicitly enabled, pick a conservative non-removal purchase.
+    priorities = {"relic": 0, "card": 1, "potion": 2}
+    candidates = []
+    for fallback_index, item in available:
+        category = str(item.get("category") or item.get("type") or "").lower()
+        if category == "card_removal":
+            continue
+        if category not in priorities:
+            continue
+        candidates.append((
+            priorities[category],
+            0 if item.get("on_sale") else 1,
+            int(item.get("price") or item.get("cost") or 9999),
+            fallback_index,
+            item,
+        ))
+    if not candidates:
+        return None, None, "no_safe_shop_purchase"
+    _, _, _, fallback_index, item = sorted(candidates)[0]
+    return item, fallback_index, "fallback_safe_purchase"
+
+
+def macro_label_to_payload(label, state, allow_shop=False):
     state_type = str(state.get("state_type") or "").lower()
 
     if label.startswith("select_map_node:index_"):
@@ -255,16 +309,19 @@ def macro_label_to_payload(label, state):
     if label.startswith("buy_item:"):
         if state_type not in ("shop", "fake_merchant"):
             return None, "not_shop"
+        if not allow_shop:
+            return None, "shop_protected"
         wanted = label.split(":", 1)[1].lower()
-        if wanted in ("?", "unknown", ""):
-            return None, "ambiguous_shop_item"
-        for fallback_index, item in enumerate(get_items_for_state(state, state_type)):
-            category = str(item.get("category") or item.get("type") or "").lower()
-            if category == wanted and item.get("is_stocked", True) and item.get("can_afford", True):
-                return {"action": "shop_purchase", "index": int(item.get("index", fallback_index))}, "available"
-        return None, "shop_item_unavailable"
+        if wanted == "card_removal":
+            return None, "card_removal_requires_manual_selection"
+        item, fallback_index, status = choose_shop_item(state, state_type, wanted)
+        if item:
+            return {"action": "shop_purchase", "index": int(item.get("index", fallback_index))}, status
+        return None, status
 
     if label == "proceed":
+        if state_type in ("shop", "fake_merchant") and not allow_shop:
+            return None, "shop_protected"
         if get_can_proceed(state, state_type):
             return {"action": "proceed"}, "available"
         return None, "proceed_unavailable"
@@ -278,7 +335,7 @@ def macro_fallback_payload(state):
         rewards = state.get("rewards") or {}
         if not rewards.get("items") and rewards.get("can_proceed"):
             return {"action": "proceed"}, "rewards_empty_proceed"
-    if state_type in ("shop", "fake_merchant", "rest_site", "treasure") and get_can_proceed(state, state_type):
+    if state_type in ("rest_site", "treasure") and get_can_proceed(state, state_type):
         return {"action": "proceed"}, f"{state_type}_proceed"
     return None, ""
 
@@ -322,7 +379,7 @@ def macro_state_signature(state):
     return json.dumps(payload, sort_keys=True, ensure_ascii=False)
 
 
-def choose_macro_action(macro_agent, state):
+def choose_macro_action(macro_agent, state, allow_shop=False):
     if not macro_agent:
         return None, {
             "top_actions": [],
@@ -356,7 +413,7 @@ def choose_macro_action(macro_agent, state):
         label = macro_agent["id_to_action"].get(idx.item(), "UNKNOWN")
         if label in ("UNKNOWN", "PAD"):
             continue
-        payload, status = macro_label_to_payload(label, state)
+        payload, status = macro_label_to_payload(label, state, allow_shop=allow_shop)
         conf = probs[idx].item() * 100
         top_actions.append({"action": label, "confidence": round(conf, 2), "marker": status})
         if chosen_payload is None and payload:
@@ -617,8 +674,26 @@ def run_agent():
         
         # 只在：战斗中 + 出牌阶段 + 轮到玩家 + 没有锁定 时才行动
         if not (state_type in ("monster", "elite", "boss") and is_play and turn == "player"):
+            if state_type in ("shop", "fake_merchant") and not control.get("macro_shop_enabled", False):
+                write_ai_logic_snapshot({
+                    "timestamp": int(time.time() * 1000),
+                    "session_id": session_id,
+                    "state_type": state_type,
+                    "mode": "macro",
+                    "top_actions": [],
+                    "chosen_action": None,
+                    "payload": None,
+                    "reason": "shop_protected",
+                })
+                if last_data_source != "human":
+                    set_data_source("human")
+                    last_data_source = "human"
+                time.sleep(4.0)
+                continue
+
             if control.get("macro_enabled", False) and state_type in ("map", "rewards", "card_reward", "event", "rest_site", "shop", "fake_merchant", "treasure"):
-                payload, macro_info = choose_macro_action(macro_agent, state)
+                allow_shop = bool(control.get("macro_shop_enabled", False))
+                payload, macro_info = choose_macro_action(macro_agent, state, allow_shop=allow_shop)
                 decision_key = json.dumps({
                     "signature": macro_state_signature(state),
                     "payload": payload,
@@ -645,6 +720,9 @@ def run_agent():
                         set_data_source("human")
                         last_data_source = "human"
                     time.sleep(1.5)
+                    continue
+                if state_type in ("shop", "fake_merchant") and not allow_shop:
+                    time.sleep(4.0)
                     continue
 
             if state_type not in ("monster", "elite", "boss") and last_data_source != "human":
