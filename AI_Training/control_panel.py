@@ -32,6 +32,7 @@ API_URL = "http://localhost:15526/api/v1/singleplayer"
 
 DEFAULT_CONTROL = {
     "ai_enabled": False,
+    "macro_enabled": False,
     "record_ai_actions": True,
     "include_ai_in_training": False,
     "next_run_mode": "new",
@@ -603,7 +604,7 @@ def latest_runs(limit=12):
     discarded = set(read_json(DISCARDED_PATH, {"discarded": []}).get("discarded", []))
     labels = read_run_labels().get("labels", {})
     files = []
-    for sub in ["Combat", "Human/Combat", "AI_Combat", "Macro", "Human/Macro"]:
+    for sub in ["Combat", "Human/Combat", "AI_Combat", "Macro", "Human/Macro", "AI/Macro"]:
         root = DATA_DIR / sub
         if root.exists():
             files.extend(root.glob("*.jsonl"))
@@ -800,7 +801,7 @@ def run_data_checks(run):
 
 
 def iter_recent_records(max_files=8):
-    roots = ["Human/Combat", "Human/Macro", "Combat", "Macro", "AI_Combat", "LLM_Actions"]
+    roots = ["Human/Combat", "Human/Macro", "AI/Macro", "Combat", "Macro", "AI_Combat", "LLM_Actions"]
     files = []
     for sub in roots:
         root = DATA_DIR / sub
@@ -984,11 +985,82 @@ def export_database_package():
     }
 
 
+def file_status(path):
+    exists = path.exists()
+    data = {
+        "exists": exists,
+        "path": str(path),
+        "name": path.name,
+        "size": path.stat().st_size if exists and path.is_file() else 0,
+        "mtime": datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds") if exists else "",
+    }
+    return data
+
+
+def models_status():
+    combat_dir = AI_DIR / "ProcessedParams"
+    macro_dir = AI_DIR / "ProcessedMacroParams"
+    combat_model = combat_dir / "bc_model_best.pth"
+    combat_vocab = combat_dir / "vocab.json"
+    macro_model = macro_dir / "macro_bc_model_best.pth"
+    macro_vocab = macro_dir / "vocab.json"
+    macro_summary = read_json(macro_dir / "training_summary.json", {})
+    macro_metadata = read_json(macro_dir / "metadata.json", {})
+    return {
+        "combat": {
+            "ready": combat_model.exists() and combat_vocab.exists(),
+            "model": file_status(combat_model),
+            "vocab": file_status(combat_vocab),
+        },
+        "macro": {
+            "ready": macro_model.exists() and macro_vocab.exists(),
+            "model": file_status(macro_model),
+            "vocab": file_status(macro_vocab),
+            "summary": macro_summary,
+            "metadata": {
+                "samples": macro_metadata.get("samples", 0),
+                "features": macro_metadata.get("features", 0),
+                "classes": len(macro_metadata.get("classes", {})) if isinstance(macro_metadata.get("classes"), dict) else 0,
+            },
+        },
+    }
+
+
+def script_newer_than_start(script_path, started_at):
+    if not started_at or not script_path.exists():
+        return False
+    try:
+        started_ts = datetime.fromisoformat(started_at).timestamp()
+    except Exception:
+        return False
+    return script_path.stat().st_mtime > started_ts + 1
+
+
+def ai_process_status():
+    state = read_json(SERVER_STATE_PATH, {})
+    pid = get_ai_pid()
+    started_at = state.get("ai_started_at", "") if pid else ""
+    return {
+        "pid": pid,
+        "started_at": started_at,
+        "needs_restart": bool(pid and script_newer_than_start(AGENT_PATH, started_at)),
+        "script_mtime": datetime.fromtimestamp(AGENT_PATH.stat().st_mtime).isoformat(timespec="seconds") if AGENT_PATH.exists() else "",
+    }
+
+
+def restart_ai():
+    stop_ai()
+    return start_ai()
+
+
 def status_payload():
     game = get_game_state()
+    ai_process = ai_process_status()
     return {
         "control": read_control(),
-        "ai_pid": get_ai_pid(),
+        "ai_pid": ai_process.get("pid"),
+        "ai_process": ai_process,
+        "models": models_status(),
         "game": {
             "online": "error" not in game,
             "error": game.get("error"),
@@ -1179,6 +1251,16 @@ INDEX_HTML = r"""<!doctype html>
     .metric-value { font-size:20px; font-weight:700; }
     .metric-label { color:var(--muted); font-size:12px; }
     .warning-list { display:grid; gap:8px; margin-top:12px; }
+    .notice {
+      border:1px solid var(--line);
+      border-radius:8px;
+      background:var(--panel-2);
+      padding:10px;
+      margin-top:10px;
+    }
+    .notice.warn { background:var(--warn-bg); border-color:#fedf89; color:var(--warn); }
+    .notice.bad { background:var(--bad-bg); border-color:#f4b5ad; color:var(--bad); }
+    .notice.good { background:var(--good-bg); border-color:#9ad6b8; color:var(--good); }
     .check-list {
       display:grid;
       grid-template-columns:repeat(auto-fit, minmax(210px, 1fr));
@@ -1293,9 +1375,16 @@ INDEX_HTML = r"""<!doctype html>
           <button class="good" onclick="startAI()">启动 AI</button>
           <button class="bad" onclick="stopAI()">停止 AI</button>
         </div>
+        <div class="row" style="margin-top:8px">
+          <button onclick="restartAI()">重启 AI</button>
+        </div>
         <div class="switch">
           <div><div class="switch-title">允许 AI 出牌</div><div class="switch-note">只影响战斗自动打牌</div></div>
           <input id="ai_enabled" type="checkbox" onchange="saveControl()">
+        </div>
+        <div class="switch">
+          <div><div class="switch-title">允许 AI 宏观操作</div><div class="switch-note">地图、奖励、选卡、事件、休息点；默认关闭</div></div>
+          <input id="macro_enabled" type="checkbox" onchange="saveControl()">
         </div>
         <div class="switch">
           <div><div class="switch-title">记录 AI 战斗动作</div><div class="switch-note">写入 AI_Combat，方便复盘</div></div>
@@ -1305,6 +1394,14 @@ INDEX_HTML = r"""<!doctype html>
           <div><div class="switch-title">AI 数据进入 BC</div><div class="switch-note">默认关闭，避免自举污染</div></div>
           <input id="include_ai_in_training" type="checkbox" onchange="saveControl()">
         </div>
+      </section>
+
+      <section>
+        <div class="section-head">
+          <h2>模型与进程</h2>
+          <span id="modelBadge" class="pill">-</span>
+        </div>
+        <div id="modelHealth">读取中</div>
       </section>
 
       <section id="llmConfigSection">
@@ -1505,6 +1602,7 @@ INDEX_HTML = r"""<!doctype html>
 async function api(path, body) {
   const opts = body ? {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)} : {};
   const r = await fetch(path, opts);
+  if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
   return await r.json();
 }
 function escapeHtml(value) {
@@ -1564,6 +1662,8 @@ function dataHealthClass(health) {
 }
 let llmFormDirty = false;
 let llmProfilesCache = [];
+let refreshInFlight = false;
+let refreshPending = false;
 function markLLMDirty() {
   llmFormDirty = true;
 }
@@ -1580,11 +1680,32 @@ function applyLLMConfigToForm(llmCfg) {
   document.getElementById("llm_api_key").placeholder = llmCfg.has_api_key ? "已保存，留空不修改" : "未配置 API Key";
 }
 async function refresh() {
-  const s = await api("/api/status");
+  if (refreshInFlight) {
+    refreshPending = true;
+    return;
+  }
+  refreshInFlight = true;
+  try {
+    const s = await api("/api/status");
+    renderStatus(s);
+  } catch (err) {
+    setPill("lastRefresh", "刷新失败", "off");
+    const detail = document.getElementById("gameDetail");
+    if (detail) detail.textContent = `控制台刷新失败：${err.message || err}`;
+  } finally {
+    refreshInFlight = false;
+    if (refreshPending) {
+      refreshPending = false;
+      window.setTimeout(refresh, 100);
+    }
+  }
+}
+function renderStatus(s) {
   const active = s.current_data && s.current_data.active_run;
   const phase = phaseInfo(s.game);
 
   document.getElementById("ai_enabled").checked = !!s.control.ai_enabled;
+  document.getElementById("macro_enabled").checked = !!s.control.macro_enabled;
   document.getElementById("collection_enabled").checked = !!s.control.collection_enabled;
   document.getElementById("record_ai_actions").checked = !!s.control.record_ai_actions;
   document.getElementById("include_ai_in_training").checked = !!s.control.include_ai_in_training;
@@ -1598,9 +1719,9 @@ async function refresh() {
   document.getElementById("gamePhase").textContent = phase.label;
   document.getElementById("gamePhase").className = `status-main ${phase.cls}`;
   document.getElementById("gameDetail").textContent = phase.detail;
-  document.getElementById("aiStatus").textContent = s.control.ai_enabled ? "允许出牌" : "手动模式";
+  document.getElementById("aiStatus").textContent = s.control.ai_enabled ? (s.control.macro_enabled ? "战斗+宏观" : "只管战斗") : "手动模式";
   document.getElementById("aiStatus").className = `status-main ${s.control.ai_enabled ? "on" : "warn"}`;
-  document.getElementById("aiDetail").textContent = s.ai_pid ? `托管进程 PID ${s.ai_pid}` : "AI 进程未由控制台托管";
+  document.getElementById("aiDetail").textContent = s.ai_pid ? `托管进程 PID ${s.ai_pid}；宏观 ${s.control.macro_enabled ? "开启" : "关闭"}` : "AI 进程未由控制台托管";
   document.getElementById("collectStatus").textContent = s.control.collection_enabled ? "采集中" : "已暂停";
   document.getElementById("collectStatus").className = `status-main ${s.control.collection_enabled ? "on" : "off"}`;
   document.getElementById("collectDetail").textContent = s.control.collection_enabled
@@ -1611,7 +1732,7 @@ async function refresh() {
   document.getElementById("runDetail").textContent = active ? `Act ${active.max_act || 0} / Floor ${active.max_floor || 0}，${active.records || 0} 条` : "尚未读取到采集数据";
 
   setPill("lastRefresh", `已刷新 ${new Date().toLocaleTimeString()}`, "info");
-  setPill("aiProcessBadge", s.ai_pid ? "运行中" : "未启动", s.ai_pid ? "on" : "warn");
+  setPill("aiProcessBadge", s.ai_pid ? (s.ai_process && s.ai_process.needs_restart ? "需重启" : "运行中") : "未启动", s.ai_pid ? ((s.ai_process && s.ai_process.needs_restart) ? "warn" : "on") : "warn");
   setPill("llmProcessBadge", s.llm && s.llm.pid ? "运行中" : "未启动", s.llm && s.llm.pid ? "on" : "warn");
   setPill("collectBadge", s.control.collection_enabled ? "启用" : "暂停", s.control.collection_enabled ? "on" : "off");
   setPill("nextRunBadge", s.control.next_run_mode === "continue" ? "继续游戏" : "新游戏", "info");
@@ -1622,6 +1743,7 @@ async function refresh() {
   renderCurrentData(s.current_data);
   renderRuns(s.runs || []);
   renderRecentRecords(s.recent_records || []);
+  renderModelHealth(s.models || {}, s.ai_process || {}, s.control || {});
   renderAiLogic(s.ai_logic);
   renderLLMLogic(s.llm && s.llm.logic, llmCfg);
 
@@ -1680,6 +1802,35 @@ function renderCurrentData(data) {
     <div class="check-list">${checks}</div>
     <div class="warning-list">${warnings || '<div><span class="pill on">正常</span> 最近 run 有数据写入</div>'}</div>`;
 }
+function renderModelHealth(models, aiProcess, control) {
+  const combat = models.combat || {};
+  const macro = models.macro || {};
+  const macroSummary = macro.summary || {};
+  const macroMeta = macro.metadata || {};
+  const ready = !!combat.ready && !!macro.ready;
+  const needsRestart = !!aiProcess.needs_restart;
+  const warnings = [];
+  if (!combat.ready) warnings.push("战斗 BC 模型缺失，需要重训。");
+  if (!macro.ready) warnings.push("宏观 BC 模型缺失，需要先训练宏观模型。");
+  if (needsRestart) warnings.push("AI 进程早于当前 ai_agent.py，必须重启 AI 后宏观执行才会生效。");
+  if (control.macro_enabled && !macro.ready) warnings.push("宏观开关已打开，但宏观模型不可用。");
+  setPill("modelBadge", ready ? (needsRestart ? "需重启" : "可用") : "缺模型", ready ? (needsRestart ? "warn" : "on") : "off");
+
+  const restartNotice = needsRestart
+    ? `<div class="notice warn"><b>需要重启 AI。</b>当前 AI 进程仍可能在跑旧代码，点击左侧“重启 AI”后宏观模型才会进入运行时。</div>`
+    : "";
+  const warningHtml = warnings.length
+    ? `<div class="warning-list">${warnings.map(w => `<div><span class="pill warn">注意</span> ${w}</div>`).join("")}</div>`
+    : `<div class="notice good">战斗模型和宏观模型都已就绪。</div>`;
+
+  document.getElementById("modelHealth").innerHTML = `
+    <div class="kv"><span>战斗模型</span><span><span class="pill ${combat.ready ? "on" : "off"}">${combat.ready ? "可用" : "缺失"}</span> ${combat.model && combat.model.mtime ? combat.model.mtime : ""}</span></div>
+    <div class="kv"><span>宏观模型</span><span><span class="pill ${macro.ready ? "on" : "off"}">${macro.ready ? "可用" : "缺失"}</span> 样本 ${macroSummary.samples || macroMeta.samples || 0}，动作 ${macroSummary.actions || macroMeta.classes || 0}</span></div>
+    <div class="kv"><span>AI 进程</span><span>${aiProcess.pid ? `PID ${aiProcess.pid}` : "未启动"}${aiProcess.started_at ? `，启动 ${aiProcess.started_at}` : ""}</span></div>
+    <div class="kv"><span>宏观执行</span><span><span class="pill ${control.macro_enabled ? "warn" : "info"}">${control.macro_enabled ? "开启" : "关闭"}</span> ${control.macro_enabled ? "会自动点地图/奖励/选卡" : "只显示战斗托管"}</span></div>
+    ${restartNotice}
+    ${warningHtml}`;
+}
 function renderRuns(runs) {
   const rows = runs.map(run => `
     <tr>
@@ -1710,12 +1861,26 @@ function renderAiLogic(logic) {
     setPill("aiDecisionBadge", "无决策", "warn");
     return;
   }
-  setPill("aiDecisionBadge", logic.chosen_action || "有决策", "info");
-  document.getElementById("aiLogic").innerHTML = `
-    <div class="kv"><span>时间</span><span>${logic.time || "-"}</span></div>
-    <div class="kv"><span>执行</span><span class="strong">${logic.chosen_action || "-"}</span></div>
-    <div class="kv"><span>手牌</span><span>${(logic.hand || []).join(", ") || "-"}</span></div>
-    <div class="kv"><span>原因</span><span>${logic.reason || "-"}</span></div>`;
+  const mode = logic.mode === "macro" ? "macro" : "combat";
+  const payload = logic.payload ? JSON.stringify(logic.payload) : "-";
+  setPill("aiDecisionBadge", mode === "macro" ? `宏观 ${logic.chosen_action || "-"}` : (logic.chosen_action || "有决策"), mode === "macro" ? "warn" : "info");
+  if (mode === "macro") {
+    document.getElementById("aiLogic").innerHTML = `
+      <div class="kv"><span>类型</span><span class="strong">宏观决策</span></div>
+      <div class="kv"><span>时间</span><span>${logic.time || "-"}</span></div>
+      <div class="kv"><span>场景</span><span>${logic.state_type || "-"}</span></div>
+      <div class="kv"><span>执行</span><span class="strong">${logic.chosen_action || "-"}</span></div>
+      <div class="kv"><span>Payload</span><code>${payload}</code></div>
+      <div class="kv"><span>原因</span><span>${logic.reason || "-"}</span></div>`;
+  } else {
+    document.getElementById("aiLogic").innerHTML = `
+      <div class="kv"><span>类型</span><span class="strong">战斗决策</span></div>
+      <div class="kv"><span>时间</span><span>${logic.time || "-"}</span></div>
+      <div class="kv"><span>执行</span><span class="strong">${logic.chosen_action || "-"}</span></div>
+      <div class="kv"><span>手牌</span><span>${(logic.hand || []).join(", ") || "-"}</span></div>
+      <div class="kv"><span>Payload</span><code>${payload}</code></div>
+      <div class="kv"><span>原因</span><span>${logic.reason || "-"}</span></div>`;
+  }
   document.getElementById("aiTopActions").innerHTML = (logic.top_actions || []).map(a => `
     <tr><td>${a.action}</td><td>${a.confidence}%</td><td>${a.marker || ""}</td></tr>
   `).join("") || "<tr><td colspan=3>暂无概率</td></tr>";
@@ -1783,6 +1948,7 @@ function renderLLMProfiles(profiles, activeId) {
 async function saveControl() {
   await api("/api/control", {
     ai_enabled: document.getElementById("ai_enabled").checked,
+    macro_enabled: document.getElementById("macro_enabled").checked,
     collection_enabled: document.getElementById("collection_enabled").checked,
     record_ai_actions: document.getElementById("record_ai_actions").checked,
     include_ai_in_training: document.getElementById("include_ai_in_training").checked,
@@ -1875,6 +2041,7 @@ async function testLLM() {
 async function setRunMode(mode) { await api("/api/control", {next_run_mode: mode}); refresh(); }
 async function startAI(){ await api("/api/ai/start", {}); refresh(); }
 async function stopAI(){ await api("/api/ai/stop", {}); refresh(); }
+async function restartAI(){ await api("/api/ai/restart", {}); refresh(); }
 async function startLLM(){ await saveLLMConfig(); await api("/api/llm/start", {}); refresh(); }
 async function stopLLM(){ await api("/api/llm/stop", {}); refresh(); }
 async function train(){ await api("/api/train", {}); refresh(); }
@@ -1893,7 +2060,7 @@ async function exportData(){
   }
 }
 refresh();
-setInterval(refresh, 3000);
+setInterval(refresh, 5000);
 </script>
 </body>
 </html>"""
@@ -1964,6 +2131,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, start_ai())
             elif self.path == "/api/ai/stop":
                 self._json(200, stop_ai())
+            elif self.path == "/api/ai/restart":
+                self._json(200, restart_ai())
             elif self.path == "/api/train":
                 self._json(200, run_training_background())
             elif self.path == "/api/export":

@@ -10,6 +10,8 @@ import numpy as np
 from colorama import init, Fore, Style
 
 from data_pipeline import StateEncoder
+from macro_data_pipeline import Vocab as MacroVocab, encode_record as encode_macro_record
+from train_macro_bc import MacroBCModel
 
 init(autoreset=True)
 
@@ -22,6 +24,7 @@ AI_LOG_DIR = os.path.join(WORKSPACE_DIR, "RL_Datasets", "AI_Combat")
 
 DEFAULT_CONTROL = {
     "ai_enabled": True,
+    "macro_enabled": False,
     "record_ai_actions": True,
     "include_ai_in_training": False,
 }
@@ -62,6 +65,319 @@ def load_agent(processed_dir):
     
     print(Fore.CYAN + f"[*] AI Brain Loaded! Action space: {output_dim} | Device: {device}")
     return encoded, id_to_action, model, device
+
+
+def load_macro_agent(processed_dir):
+    vocab_path = os.path.join(processed_dir, "vocab.json")
+    model_path = os.path.join(processed_dir, "macro_bc_model_best.pth")
+    metadata_path = os.path.join(processed_dir, "metadata.json")
+    if not os.path.exists(vocab_path) or not os.path.exists(model_path):
+        print(Fore.YELLOW + "[Macro] Macro model not found. Run macro_data_pipeline.py and train_macro_bc.py first.")
+        return None
+
+    vocab = MacroVocab.load(vocab_path)
+    id_to_action = {v: k for k, v in vocab.tables["actions"].items()}
+    metadata = {}
+    try:
+        with open(metadata_path, "r", encoding="utf-8") as f:
+            metadata = json.load(f)
+    except Exception:
+        pass
+    input_dim = int(metadata.get("features") or 115)
+    output_dim = len(vocab.tables["actions"])
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = MacroBCModel(input_dim, output_dim).to(device)
+    model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+    model.eval()
+    print(Fore.CYAN + f"[*] Macro Brain Loaded! Action space: {output_dim} | Features: {input_dim} | Device: {device}")
+    return {"vocab": vocab, "id_to_action": id_to_action, "model": model, "device": device, "input_dim": input_dim}
+
+
+def room_type_for_state(state_type):
+    mapping = {
+        "map": "MapRoom",
+        "rewards": "CombatRoom",
+        "card_reward": "CombatRoom",
+        "event": "EventRoom",
+        "rest_site": "RestSiteRoom",
+        "shop": "MerchantRoom",
+        "fake_merchant": "MerchantRoom",
+        "treasure": "TreasureRoom",
+    }
+    return mapping.get(str(state_type or "").lower(), "unknown")
+
+
+def build_macro_record_from_state(state):
+    state_type = state.get("state_type", "unknown")
+    run = state.get("run") or {}
+    player = state.get("player") or {}
+    relics = player.get("relics") or []
+    potions = player.get("potions") or []
+    macro_state = {
+        "act": run.get("act", 0),
+        "floor": run.get("floor", 0),
+        "ascension": run.get("ascension", 0),
+        "character": player.get("character"),
+        "hp": player.get("hp", 0),
+        "max_hp": player.get("max_hp", 1),
+        "gold": player.get("gold", 0),
+        "deck_size": player.get("deck_size") or len(player.get("deck", []) or []),
+        "relic_count": player.get("relic_count") or len(relics),
+        "potion_slots_filled": player.get("potion_slots_filled") or len(potions),
+        "relics": relics,
+        "potions": potions,
+        "room_type": state.get("room_type") or room_type_for_state(state_type),
+    }
+
+    screen = {"state_type": state_type}
+    for key in ("map", "rewards", "card_reward", "event", "rest_site", "shop", "fake_merchant", "treasure"):
+        if isinstance(state.get(key), dict):
+            screen[key] = state.get(key)
+    if "fake_merchant" in screen and "shop" not in screen:
+        fake_shop = (screen["fake_merchant"] or {}).get("shop")
+        if isinstance(fake_shop, dict):
+            screen["shop"] = fake_shop
+
+    return {
+        "type": "macro_action",
+        "action_type": "macro_inference",
+        "action_data": {},
+        "state": macro_state,
+        "screen_state": screen,
+    }
+
+
+def get_items_for_state(state, state_type):
+    state_type = str(state_type or "").lower()
+    if state_type == "rewards":
+        return (state.get("rewards") or {}).get("items", []) or []
+    if state_type == "shop":
+        return (state.get("shop") or {}).get("items", []) or []
+    if state_type == "fake_merchant":
+        return ((state.get("fake_merchant") or {}).get("shop") or {}).get("items", []) or []
+    return []
+
+
+def get_can_proceed(state, state_type):
+    state_type = str(state_type or "").lower()
+    if state_type in ("rewards", "shop", "rest_site"):
+        return bool((state.get(state_type) or {}).get("can_proceed"))
+    if state_type == "fake_merchant":
+        return bool(((state.get("fake_merchant") or {}).get("shop") or {}).get("can_proceed"))
+    if state_type == "treasure":
+        return bool((state.get("treasure") or {}).get("can_proceed"))
+    return False
+
+
+def macro_label_to_payload(label, state):
+    state_type = str(state.get("state_type") or "").lower()
+
+    if label.startswith("select_map_node:index_"):
+        if state_type != "map":
+            return None, "not_map"
+        options = ((state.get("map") or {}).get("next_options") or [])
+        try:
+            index = int(label.rsplit("_", 1)[1])
+        except ValueError:
+            return None, "bad_map_index"
+        if 0 <= index < len(options):
+            return {"action": "choose_map_node", "index": index}, "available"
+        return None, "map_index_out_of_range"
+
+    if label.startswith("select_map_node:type_"):
+        if state_type != "map":
+            return None, "not_map"
+        wanted = label.split("type_", 1)[1].lower()
+        options = ((state.get("map") or {}).get("next_options") or [])
+        for fallback_index, option in enumerate(options):
+            if str(option.get("type") or "").lower() == wanted:
+                return {"action": "choose_map_node", "index": int(option.get("index", fallback_index))}, "available"
+        return None, "map_type_unavailable"
+
+    if label.startswith("claim_reward:"):
+        if state_type != "rewards":
+            return None, "not_rewards"
+        reward_type = label.split(":", 1)[1].lower()
+        for fallback_index, item in enumerate(get_items_for_state(state, state_type)):
+            item_type = str(item.get("type") or item.get("category") or "").lower()
+            if item_type == reward_type or (reward_type == "card" and item_type == "special_card"):
+                return {"action": "claim_reward", "index": int(item.get("index", fallback_index))}, "available"
+        return None, f"reward_{reward_type}_unavailable"
+
+    if label.startswith("choose_card:index_"):
+        if state_type != "card_reward":
+            return None, "not_card_reward"
+        cards = ((state.get("card_reward") or {}).get("cards") or [])
+        try:
+            index = int(label.rsplit("_", 1)[1])
+        except ValueError:
+            return None, "bad_card_index"
+        if 0 <= index < len(cards):
+            return {"action": "select_card_reward", "card_index": index}, "available"
+        return None, "card_index_out_of_range"
+
+    if label == "skip_reward":
+        if state_type == "card_reward" and (state.get("card_reward") or {}).get("can_skip"):
+            return {"action": "skip_card_reward"}, "available"
+        return None, "skip_unavailable"
+
+    if label.startswith("choose_event_option:"):
+        if state_type != "event":
+            return None, "not_event"
+        event = state.get("event") or {}
+        if event.get("in_dialogue"):
+            return {"action": "advance_dialogue"}, "available"
+        options = event.get("options") or []
+        available = [o for o in options if not o.get("is_locked") and not o.get("was_chosen")]
+        if label.endswith(":unknown"):
+            if len(available) == 1:
+                return {"action": "choose_event_option", "index": int(available[0].get("index", 0))}, "single_event_option"
+            return None, "ambiguous_event_option"
+        try:
+            index = int(label.rsplit("_", 1)[1])
+        except ValueError:
+            return None, "bad_event_index"
+        valid = {int(o.get("index", i)) for i, o in enumerate(available)}
+        if index in valid:
+            return {"action": "choose_event_option", "index": index}, "available"
+        return None, "event_index_unavailable"
+
+    if label.startswith("choose_rest_option:"):
+        if state_type != "rest_site":
+            return None, "not_rest_site"
+        options = (state.get("rest_site") or {}).get("options") or []
+        enabled = [o for o in options if o.get("is_enabled", True)]
+        if not enabled:
+            return None, "no_rest_option_enabled"
+        return {"action": "choose_rest_option", "index": int(enabled[0].get("index", 0))}, "first_enabled_rest_option"
+
+    if label.startswith("buy_item:"):
+        if state_type not in ("shop", "fake_merchant"):
+            return None, "not_shop"
+        wanted = label.split(":", 1)[1].lower()
+        if wanted in ("?", "unknown", ""):
+            return None, "ambiguous_shop_item"
+        for fallback_index, item in enumerate(get_items_for_state(state, state_type)):
+            category = str(item.get("category") or item.get("type") or "").lower()
+            if category == wanted and item.get("is_stocked", True) and item.get("can_afford", True):
+                return {"action": "shop_purchase", "index": int(item.get("index", fallback_index))}, "available"
+        return None, "shop_item_unavailable"
+
+    if label == "proceed":
+        if get_can_proceed(state, state_type):
+            return {"action": "proceed"}, "available"
+        return None, "proceed_unavailable"
+
+    return None, "unsupported_macro_label"
+
+
+def macro_fallback_payload(state):
+    state_type = str(state.get("state_type") or "").lower()
+    if state_type == "rewards":
+        rewards = state.get("rewards") or {}
+        if not rewards.get("items") and rewards.get("can_proceed"):
+            return {"action": "proceed"}, "rewards_empty_proceed"
+    if state_type in ("shop", "fake_merchant", "rest_site", "treasure") and get_can_proceed(state, state_type):
+        return {"action": "proceed"}, f"{state_type}_proceed"
+    return None, ""
+
+
+def macro_state_signature(state):
+    state_type = str(state.get("state_type") or "").lower()
+    payload = {"state_type": state_type}
+    if state_type == "map":
+        payload["options"] = [
+            (o.get("index"), o.get("col"), o.get("row"), o.get("type"))
+            for o in ((state.get("map") or {}).get("next_options") or [])
+        ]
+    elif state_type == "rewards":
+        payload["items"] = [
+            (i.get("index"), i.get("type"), i.get("description"))
+            for i in ((state.get("rewards") or {}).get("items") or [])
+        ]
+        payload["can_proceed"] = (state.get("rewards") or {}).get("can_proceed")
+    elif state_type == "card_reward":
+        payload["cards"] = [
+            (c.get("index"), c.get("id"), c.get("name"))
+            for c in ((state.get("card_reward") or {}).get("cards") or [])
+        ]
+    elif state_type == "event":
+        payload["options"] = [
+            (o.get("index"), o.get("title"), o.get("is_locked"), o.get("is_proceed"), o.get("was_chosen"))
+            for o in ((state.get("event") or {}).get("options") or [])
+        ]
+        payload["in_dialogue"] = (state.get("event") or {}).get("in_dialogue")
+    elif state_type == "rest_site":
+        payload["options"] = [
+            (o.get("index"), o.get("id"), o.get("is_enabled"))
+            for o in ((state.get("rest_site") or {}).get("options") or [])
+        ]
+    elif state_type in ("shop", "fake_merchant"):
+        payload["items"] = [
+            (i.get("index"), i.get("category"), i.get("price") or i.get("cost"), i.get("can_afford"), i.get("is_stocked"))
+            for i in get_items_for_state(state, state_type)
+        ]
+        payload["can_proceed"] = get_can_proceed(state, state_type)
+    return json.dumps(payload, sort_keys=True, ensure_ascii=False)
+
+
+def choose_macro_action(macro_agent, state):
+    if not macro_agent:
+        return None, {
+            "top_actions": [],
+            "chosen_action": None,
+            "payload": None,
+            "reason": "macro_model_not_loaded",
+        }
+
+    record = build_macro_record_from_state(state)
+    state_vec = encode_macro_record(macro_agent["vocab"], record)
+    expected_dim = macro_agent.get("input_dim") or len(state_vec)
+    if len(state_vec) != expected_dim:
+        return None, {
+            "top_actions": [],
+            "chosen_action": None,
+            "payload": None,
+            "reason": f"macro_feature_dim_mismatch actual={len(state_vec)} expected={expected_dim}",
+        }
+
+    state_tensor = torch.tensor([state_vec], dtype=torch.float32).to(macro_agent["device"])
+    with torch.no_grad():
+        outputs = macro_agent["model"](state_tensor)
+        probs = torch.softmax(outputs[0], dim=0)
+        sorted_indices = torch.argsort(outputs[0], descending=True)
+
+    top_actions = []
+    chosen_payload = None
+    chosen_label = None
+    chosen_reason = "no_legal_macro_action"
+    for idx in sorted_indices:
+        label = macro_agent["id_to_action"].get(idx.item(), "UNKNOWN")
+        if label in ("UNKNOWN", "PAD"):
+            continue
+        payload, status = macro_label_to_payload(label, state)
+        conf = probs[idx].item() * 100
+        top_actions.append({"action": label, "confidence": round(conf, 2), "marker": status})
+        if chosen_payload is None and payload:
+            chosen_payload = payload
+            chosen_label = label
+            chosen_reason = status
+        if len(top_actions) >= 6 and chosen_payload is not None:
+            break
+
+    if chosen_payload is None:
+        chosen_payload, fallback_reason = macro_fallback_payload(state)
+        if chosen_payload:
+            chosen_label = chosen_payload.get("action")
+            chosen_reason = fallback_reason
+
+    return chosen_payload, {
+        "top_actions": top_actions[:6],
+        "chosen_action": chosen_label,
+        "payload": chosen_payload,
+        "reason": chosen_reason,
+    }
 
 
 def get_enemy_hp(enemy):
@@ -252,7 +568,9 @@ def set_data_source(source):
 
 def run_agent():
     processed_dir = os.path.join(os.path.dirname(__file__), "ProcessedParams")
+    macro_processed_dir = os.path.join(os.path.dirname(__file__), "ProcessedMacroParams")
     encoder, id_to_action, model, device = load_agent(processed_dir)
+    macro_agent = load_macro_agent(macro_processed_dir)
     session_id = f"ai_{datetime.now():%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:8]}"
     
     print(Fore.GREEN + Style.BRIGHT + "\n====== STS2 AI Control System v2 ======")
@@ -261,6 +579,7 @@ def run_agent():
     
     last_status_print = 0
     last_data_source = None
+    last_macro_decision_key = None
 
     while True:
         time.sleep(0.8)
@@ -298,6 +617,36 @@ def run_agent():
         
         # 只在：战斗中 + 出牌阶段 + 轮到玩家 + 没有锁定 时才行动
         if not (state_type in ("monster", "elite", "boss") and is_play and turn == "player"):
+            if control.get("macro_enabled", False) and state_type in ("map", "rewards", "card_reward", "event", "rest_site", "shop", "fake_merchant", "treasure"):
+                payload, macro_info = choose_macro_action(macro_agent, state)
+                decision_key = json.dumps({
+                    "signature": macro_state_signature(state),
+                    "payload": payload,
+                }, sort_keys=True, ensure_ascii=False)
+                write_ai_logic_snapshot({
+                    "timestamp": int(time.time() * 1000),
+                    "session_id": session_id,
+                    "state_type": state_type,
+                    "mode": "macro",
+                    "top_actions": macro_info.get("top_actions", []),
+                    "chosen_action": macro_info.get("chosen_action"),
+                    "payload": payload,
+                    "reason": macro_info.get("reason"),
+                })
+                if payload and decision_key != last_macro_decision_key:
+                    print(Fore.GREEN + Style.BRIGHT + f"  >>> MACRO EXECUTE: {macro_info.get('chosen_action')}")
+                    print(Fore.WHITE + f"  Sending: {json.dumps(payload, ensure_ascii=False)}")
+                    if last_data_source != "ai":
+                        set_data_source("ai")
+                        last_data_source = "ai"
+                    success = send_action(payload)
+                    last_macro_decision_key = decision_key
+                    if not success and last_data_source != "human":
+                        set_data_source("human")
+                        last_data_source = "human"
+                    time.sleep(1.5)
+                    continue
+
             if state_type not in ("monster", "elite", "boss") and last_data_source != "human":
                 set_data_source("human")
                 last_data_source = "human"
