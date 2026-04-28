@@ -55,8 +55,8 @@ def train(processed_dir):
     print(f"Using device: {device}")
     
     # Create DataLoader
-    X_tensor = torch.tensor(X_train, dtype=torch.float32).to(device)
-    Y_tensor = torch.tensor(Y_train, dtype=torch.int64).to(device)
+    X_tensor = torch.tensor(X_train, dtype=torch.float32)
+    Y_tensor = torch.tensor(Y_train, dtype=torch.int64)
     
     # Quick fix for any out of bounds action IDs (UNKNOWN=1)
     Y_tensor = torch.clamp(Y_tensor, 0, num_actions - 1)
@@ -80,6 +80,8 @@ def train(processed_dir):
         total = 0
         
         for batch_x, batch_y in dataloader:
+            batch_x = batch_x.to(device)
+            batch_y = batch_y.to(device)
             optimizer.zero_grad()
             outputs = model(batch_x)
             

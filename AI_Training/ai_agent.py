@@ -30,20 +30,7 @@ DEFAULT_CONTROL = {
     "include_ai_in_training": False,
 }
 
-class CombatBCModel(nn.Module):
-    def __init__(self, input_dim, output_dim):
-        super(CombatBCModel, self).__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, 256),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Linear(128, output_dim)
-        )
-        
-    def forward(self, x):
-        return self.net(x)
+from train_bc import CombatBCModel
 
 def load_agent(processed_dir):
     vocab_path = os.path.join(processed_dir, 'vocab.json')

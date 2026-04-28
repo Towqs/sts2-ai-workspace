@@ -31,6 +31,35 @@ def _read_json_file(path, default):
         return default
 
 
+class FilterContext:
+    """Pre-load all filter config once so we don't re-read JSON files per record."""
+
+    def __init__(self):
+        control = _read_json_file(CONTROL_PATH, {})
+        self.include_ai = bool(control.get("include_ai_in_training", False))
+        self.disabled_since = control.get("collection_disabled_since")
+        self.disabled_ranges = control.get("collection_disabled_ranges", [])
+        min_q = control.get("min_training_quality", "unknown")
+        self.min_quality = min_q if min_q in QUALITY_ORDER else "unknown"
+        self.discarded = set(
+            _read_json_file(DISCARDED_RUNS_PATH, {"discarded": []}).get("discarded", [])
+        )
+        self.labels = _read_json_file(RUN_LABELS_PATH, {"labels": {}}).get("labels", {})
+
+    def record_is_collectable(self, timestamp):
+        ts = int(timestamp or 0)
+        if self.disabled_since and ts >= int(self.disabled_since):
+            return False
+        for start, end in self.disabled_ranges:
+            if int(start) <= ts <= int(end):
+                return False
+        return True
+
+    def run_quality(self, run_id):
+        return self.labels.get(run_id, {}).get("quality", "unknown")
+
+
+# Keep module-level helpers for backward compatibility (used outside build_dataset)
 def _include_ai_in_training():
     control = _read_json_file(CONTROL_PATH, {})
     return bool(control.get("include_ai_in_training", False))
@@ -175,21 +204,31 @@ def _has_affordable_playable_card(state):
     return False
 
 
-def should_use_record(data, state, action):
-    """过滤掉 AI 自举失败样本，以及明显浪费费用的 end_turn 标签。"""
-    if not _record_is_collectable(data.get("timestamp")):
-        return False
-
-    if data.get("run_id") in _discarded_run_ids():
-        return False
-
-    run_quality = _run_quality(data.get("run_id"))
-    min_quality = _min_training_quality()
-    if QUALITY_ORDER.get(run_quality, 0) < QUALITY_ORDER.get(min_quality, 0):
-        return False
-
-    if data.get("source") == "ai" and not _include_ai_in_training():
-        return False
+def should_use_record(data, state, action, ctx=None):
+    """过滤掉 AI 自举失败样本，以及明显浪费费用的 end_turn 标签。
+    ctx: 可选 FilterContext，传入时避免每条记录重复读磁盘。
+    """
+    if ctx:
+        if not ctx.record_is_collectable(data.get("timestamp")):
+            return False
+        if data.get("run_id") in ctx.discarded:
+            return False
+        rq = ctx.run_quality(data.get("run_id"))
+        if QUALITY_ORDER.get(rq, 0) < QUALITY_ORDER.get(ctx.min_quality, 0):
+            return False
+        if data.get("source") == "ai" and not ctx.include_ai:
+            return False
+    else:
+        if not _record_is_collectable(data.get("timestamp")):
+            return False
+        if data.get("run_id") in _discarded_run_ids():
+            return False
+        run_quality = _run_quality(data.get("run_id"))
+        min_quality = _min_training_quality()
+        if QUALITY_ORDER.get(run_quality, 0) < QUALITY_ORDER.get(min_quality, 0):
+            return False
+        if data.get("source") == "ai" and not _include_ai_in_training():
+            return False
 
     act_type = action.get("action", action.get("action_type", data.get("action_type", "UNKNOWN")))
     if act_type == "end_turn" and _has_affordable_playable_card(state):
@@ -233,7 +272,7 @@ class VocabBuilder:
             except json.JSONDecodeError:
                 idx += 1 # Not ideal but prevents infinite loops if corrupted
 
-    def scan_files(self, filepaths):
+    def scan_files(self, filepaths, ctx=None):
         print(f"Scanning {len(filepaths)} files to build vocab...")
         count = 0
         for filepath in filepaths:
@@ -247,7 +286,7 @@ class VocabBuilder:
                     if action is None and act_type in ["action", "play_card", "end_turn"]: 
                         action = data
 
-                    if state and action and should_use_record(data, state, action):
+                    if state and action and should_use_record(data, state, action, ctx=ctx):
                         self._process_state(state)
                         self._process_action(action)
                         count += 1
@@ -428,6 +467,9 @@ def build_dataset(data_dirs, output_dir):
     os.makedirs(output_dir, exist_ok=True)
     vocab_path = os.path.join(output_dir, "vocab.json")
     
+    # 一次性加载过滤配置，避免每条记录都读磁盘
+    ctx = FilterContext()
+
     # 获取所有日志文件
     filepaths = []
     for d in data_dirs:
@@ -438,7 +480,7 @@ def build_dataset(data_dirs, output_dir):
     # 1. 扫描词表
     if not os.path.exists(vocab_path):
         builder = VocabBuilder()
-        builder.scan_files(filepaths)
+        builder.scan_files(filepaths, ctx=ctx)
         builder.save(vocab_path)
     else:
         print("Using existing vocab...")
@@ -468,7 +510,7 @@ def build_dataset(data_dirs, output_dir):
                     state
                     and action
                     and action.get("action") != "battle_start"
-                    and should_use_record(data, state, action)
+                    and should_use_record(data, state, action, ctx=ctx)
                 ):
                     state_vec = encoder.encode(state)
                     action_id = encoder.encode_action(action)

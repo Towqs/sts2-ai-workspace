@@ -157,8 +157,14 @@ namespace STS2_MCP
         // v3: 切换数据来源（被 McpMod.Actions.cs 调用）
         public static void SetDataSource(DataSource source)
         {
+            if (_currentDataSource == source) return;
             _currentDataSource = source;
-            Debug.Log($"[SOURCE] Data source set to: {source}");
+            // 关闭旧 writer，下一次写入时会按新来源目录重建
+            try { _combatWriter?.Close(); } catch { }
+            try { _macroWriter?.Close(); } catch { }
+            _combatWriter = null;
+            _macroWriter = null;
+            Debug.Log($"[SOURCE] Data source set to: {source}, writers reset");
         }
 
         // v3: 获取当前数据来源
