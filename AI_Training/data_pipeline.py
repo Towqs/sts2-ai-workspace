@@ -107,7 +107,65 @@ def _card_number_hint(card, mode):
     return nums[0] if nums else 0
 
 
+def _normalize_combat_state(state):
+    """Accept both API-shaped and collector-minimal combat states."""
+    if not isinstance(state, dict):
+        return {}
+    if isinstance(state.get("player"), dict) and isinstance(state.get("battle"), dict):
+        return state
+
+    player = {
+        "character": state.get("character"),
+        "hp": state.get("hp", 0),
+        "max_hp": state.get("max_hp", 1),
+        "block": state.get("block", 0),
+        "energy": state.get("energy", 0),
+        "max_energy": state.get("max_energy", 1),
+        "hand": state.get("hand", []),
+        "draw_pile_count": state.get("draw_pile_count", 0),
+        "discard_pile_count": state.get("discard_pile_count", 0),
+        "exhaust_pile_count": state.get("exhaust_pile_count", 0),
+        "relics": state.get("relics", []),
+        "potions": state.get("potions", []),
+        "gold": state.get("gold", 0),
+        "status": state.get("status", []),
+    }
+    enemies = []
+    for enemy in state.get("enemies", []) or []:
+        if not isinstance(enemy, dict):
+            continue
+        intents = enemy.get("intents", [])
+        if intents and isinstance(intents[0], str):
+            intents = [{"type": value, "label": "", "description": value} for value in intents]
+        enemies.append({
+            "entity_id": enemy.get("entity_id") or enemy.get("id") or enemy.get("name"),
+            "name": enemy.get("name") or enemy.get("id") or enemy.get("entity_id") or "UNKNOWN",
+            "hp": enemy.get("hp", 0),
+            "max_hp": enemy.get("max_hp", 1),
+            "block": enemy.get("block", 0),
+            "status": enemy.get("status", []),
+            "intents": intents or [],
+        })
+    battle = {
+        "round": state.get("round", 0),
+        "turn": str(state.get("turn", "")).lower(),
+        "is_play_phase": state.get("is_play_phase", False),
+        "enemies": enemies,
+    }
+    run = state.get("run") if isinstance(state.get("run"), dict) else {
+        "act": state.get("act", 0),
+        "floor": state.get("floor", 0),
+        "ascension": state.get("ascension", 0),
+    }
+    normalized = dict(state)
+    normalized["player"] = player
+    normalized["battle"] = battle
+    normalized["run"] = run
+    return normalized
+
+
 def _has_affordable_playable_card(state):
+    state = _normalize_combat_state(state)
     player = state.get("player", {})
     energy = player.get("energy", state.get("energy", 0))
     hand = player.get("hand", state.get("hand", []))
@@ -198,6 +256,7 @@ class VocabBuilder:
         print(f"Done. Scanned {count} valid state-action pairs.")
 
     def _process_state(self, state):
+        state = _normalize_combat_state(state)
         player = state.get("player", {})
         battle = state.get("battle", {})
         
@@ -259,6 +318,7 @@ class StateEncoder:
         return vocab.get(key, 1) # 1 is UNKNOWN
         
     def encode(self, state):
+        state = _normalize_combat_state(state)
         player = state.get("player", {})
         battle = state.get("battle", {})
         run = state.get("run", {})
@@ -449,6 +509,7 @@ if __name__ == "__main__":
     DATA_DIRS = [
         os.path.join(WORKSPACE_DIR, "RL_Datasets", "Combat"),
         os.path.join(WORKSPACE_DIR, "RL_Datasets", "Human", "Combat"),
+        os.path.join(WORKSPACE_DIR, "RL_Datasets", "AI", "Combat"),
         os.path.join(WORKSPACE_DIR, "RL_Datasets", "AI_Combat"),
     ]
     OUTPUT_DIR = os.path.join(WORKSPACE_DIR, "AI_Training", "ProcessedParams")

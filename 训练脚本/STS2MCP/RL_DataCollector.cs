@@ -458,6 +458,11 @@ namespace STS2_MCP
                 var creature = player.Creature;
                 var combatState = player.PlayerCombatState;
 
+                // 运行进度。训练管线会把这些字段转成 act/floor/round 特征。
+                state["act"] = runState.CurrentActIndex + 1;
+                state["floor"] = runState.TotalFloor;
+                state["ascension"] = runState.AscensionLevel;
+
                 // 玩家基础信息
                 state["character"] = McpMod.SafeGetText(() => player.Character.Title) ?? "Unknown";
                 state["hp"] = creature.CurrentHp;

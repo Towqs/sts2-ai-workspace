@@ -621,7 +621,7 @@ def latest_runs(limit=12):
     discarded = set(read_json(DISCARDED_PATH, {"discarded": []}).get("discarded", []))
     labels = read_run_labels().get("labels", {})
     files = []
-    for sub in ["Combat", "Human/Combat", "AI_Combat", "Macro", "Human/Macro", "AI/Macro"]:
+    for sub in ["Combat", "Human/Combat", "AI/Combat", "AI_Combat", "Macro", "Human/Macro", "AI/Macro"]:
         root = DATA_DIR / sub
         if root.exists():
             files.extend(root.glob("*.jsonl"))
@@ -818,7 +818,7 @@ def run_data_checks(run):
 
 
 def iter_recent_records(max_files=8):
-    roots = ["Human/Combat", "Human/Macro", "AI/Macro", "Combat", "Macro", "AI_Combat", "LLM_Actions"]
+    roots = ["Human/Combat", "Human/Macro", "AI/Combat", "AI/Macro", "Combat", "Macro", "AI_Combat", "LLM_Actions"]
     files = []
     for sub in roots:
         root = DATA_DIR / sub
@@ -1415,7 +1415,7 @@ INDEX_HTML = r"""<!doctype html>
           <input id="macro_shop_enabled" type="checkbox" onchange="saveControl()">
         </div>
         <div class="switch">
-          <div><div class="switch-title">记录 AI 战斗动作</div><div class="switch-note">写入 AI_Combat，方便复盘</div></div>
+          <div><div class="switch-title">记录 AI 战斗动作</div><div class="switch-note">控制台镜像写入 AI_Combat；Mod 正式记录写入 AI/Combat</div></div>
           <input id="record_ai_actions" type="checkbox" onchange="saveControl()">
         </div>
         <div class="switch">
