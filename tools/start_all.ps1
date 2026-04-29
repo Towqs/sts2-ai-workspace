@@ -131,6 +131,45 @@ function Test-PanelReady {
     }
 }
 
+function Test-CommandLineProcess {
+    param([string[]]$Needles)
+    if (-not $Needles -or $Needles.Count -eq 0) {
+        return $false
+    }
+
+    try {
+        $needleList = @($Needles | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        if ($needleList.Count -eq 0) {
+            return $false
+        }
+
+        $currentPid = $PID
+        $processes = Get-CimInstance Win32_Process -ErrorAction Stop
+        foreach ($process in $processes) {
+            if ($process.ProcessId -eq $currentPid) {
+                continue
+            }
+            $commandLine = [string]$process.CommandLine
+            if ([string]::IsNullOrWhiteSpace($commandLine)) {
+                continue
+            }
+            $allMatched = $true
+            foreach ($needle in $needleList) {
+                if ($commandLine.IndexOf($needle, [StringComparison]::OrdinalIgnoreCase) -lt 0) {
+                    $allMatched = $false
+                    break
+                }
+            }
+            if ($allMatched) {
+                return $true
+            }
+        }
+    } catch {
+        Write-Warning ("Cannot inspect running processes: " + $_.Exception.Message)
+    }
+    return $false
+}
+
 function Wait-PanelReady {
     $deadline = (Get-Date).AddSeconds($WaitSeconds)
     while ((Get-Date) -lt $deadline) {
@@ -236,8 +275,12 @@ if (-not $NoMonitor) {
 Set-Location -LiteralPath $rootQ
 & $watchQ -LogFile $rlLogQ -CombatDir $combatQ -MacroDir $macroQ
 "@
-    Write-Host "Starting RL log monitor..."
-    Start-ConsoleWindow -Title "STS2 RL Log Monitor" -Command $monitorCommand
+    if (Test-CommandLineProcess @($WatchScript, $RlLog)) {
+        Write-Host "RL log monitor is already running."
+    } else {
+        Write-Host "Starting RL log monitor..."
+        Start-ConsoleWindow -Title "STS2 RL Log Monitor" -Command $monitorCommand
+    }
 }
 
 if (-not $NoBrowser -and -not $DryRun) {
