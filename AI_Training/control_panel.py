@@ -63,6 +63,7 @@ DEFAULT_LLM_CONFIG = {
     "execute_combat": False,
     "confirm_shop": True,
     "max_actions_per_turn": 12,
+    "action_selection_mode": "catalog_args",
     "profiles": [],
     "active_profile_id": "",
 }
@@ -128,6 +129,8 @@ def read_llm_config(mask_key=True):
     data.update(read_json(LLM_CONFIG_PATH, {}))
     if data.get("mode") not in ("advisor", "combat_auto"):
         data["mode"] = "advisor"
+    if data.get("action_selection_mode") not in ("catalog_args", "candidate_id"):
+        data["action_selection_mode"] = "catalog_args"
     data["provider"] = "openai_compatible"
     profiles = data.get("profiles") if isinstance(data.get("profiles"), list) else []
     data["profiles"] = [_public_llm_profile(p) for p in profiles]
@@ -205,6 +208,8 @@ def update_llm_config(patch):
             data[key] = bool(patch[key])
         elif key == "mode":
             data[key] = patch[key] if patch[key] in ("advisor", "combat_auto") else "advisor"
+        elif key == "action_selection_mode":
+            data[key] = patch[key] if patch[key] in ("catalog_args", "candidate_id") else "catalog_args"
         elif key in ("temperature", "decision_interval_sec"):
             try:
                 data[key] = float(patch[key])
@@ -1102,6 +1107,13 @@ INDEX_HTML = r"""<!doctype html>
             <option value="combat_auto">Combat Auto：战斗可执行</option>
           </select>
         </div>
+        <div class="field">
+          <span>动作选择</span>
+          <select id="llm_action_selection_mode" onchange="saveLLMConfig()">
+            <option value="catalog_args">动作参数：保留旧模式</option>
+            <option value="candidate_id">候选 ID：只能选列表</option>
+          </select>
+        </div>
         <div class="switch">
           <div><div class="switch-title">允许 LLM 自动战斗</div><div class="switch-note">只执行战斗出牌/结束回合；宏观仍只建议</div></div>
           <input id="llm_execute_combat" type="checkbox" onchange="saveLLMConfig()">
@@ -1354,6 +1366,7 @@ function isLLMFormEditing() {
 function applyLLMConfigToForm(llmCfg) {
   document.getElementById("llm_enabled").checked = !!llmCfg.enabled;
   document.getElementById("llm_mode").value = llmCfg.mode || "advisor";
+  document.getElementById("llm_action_selection_mode").value = llmCfg.action_selection_mode || "catalog_args";
   document.getElementById("llm_execute_combat").checked = !!llmCfg.execute_combat;
   document.getElementById("llm_base_url").value = llmCfg.base_url || "";
   document.getElementById("llm_model").value = llmCfg.model || "";
@@ -1603,19 +1616,26 @@ function renderLLMLogic(logic, cfg) {
   }
   const d = logic.decision || {};
   const payload = logic.payload ? JSON.stringify(logic.payload) : "-";
+  const selected = logic.selected_candidate || {};
+  const suggestion = d.candidate_id || d.action || "-";
+  const args = d.candidate_id ? {candidate_id: d.candidate_id} : (d.args || {});
+  const raw = logic.raw_response ? escapeHtml(String(logic.raw_response).slice(0, 1200)) : "-";
   setPill("llmDecisionBadge", logic.executed ? "已执行" : "建议", logic.executed ? "on" : "info");
   document.getElementById("llmLogic").innerHTML = `
     <div class="kv"><span>时间</span><span>${logic.time || "-"}</span></div>
     <div class="kv"><span>模式</span><span>${logic.mode || "-"}</span></div>
+    <div class="kv"><span>动作选择</span><span>${logic.action_selection_mode || (cfg && cfg.action_selection_mode) || "-"}</span></div>
     <div class="kv"><span>模型</span><span>${logic.model || "-"}</span></div>
     <div class="kv"><span>场景</span><span>${logic.state_type || "-"}</span></div>
-    <div class="kv"><span>建议</span><span class="strong">${d.action || "-"}</span></div>
-    <div class="kv"><span>参数</span><code>${JSON.stringify(d.args || {})}</code></div>
+    <div class="kv"><span>建议</span><span class="strong">${suggestion}</span></div>
+    <div class="kv"><span>候选</span><span>${selected.id || "-"} / ${(logic.candidate_actions || []).length} 个</span></div>
+    <div class="kv"><span>参数</span><code>${JSON.stringify(args)}</code></div>
     <div class="kv"><span>校验</span><span>${logic.validation || "-"}</span></div>
     <div class="kv"><span>执行</span><span>${logic.executed ? "是" : "否"} ${logic.ok === false ? "(失败)" : ""}</span></div>
     <div class="kv"><span>Payload</span><code>${payload}</code></div>
     <div class="kv"><span>手牌</span><span>${(logic.hand_summary || []).join(", ") || "-"}</span></div>
-    <div class="kv"><span>理由</span><span>${d.reason || "-"}</span></div>`;
+    <div class="kv"><span>理由</span><span>${d.reason || "-"}</span></div>
+    <div class="kv"><span>原始回复</span><code>${raw}</code></div>`;
 }
 function renderLLMProfiles(profiles, activeId) {
   llmProfilesCache = profiles || [];
@@ -1650,6 +1670,7 @@ async function saveLLMConfig() {
   const body = {
     enabled: document.getElementById("llm_enabled").checked,
     mode: document.getElementById("llm_mode").value,
+    action_selection_mode: document.getElementById("llm_action_selection_mode").value,
     execute_combat: document.getElementById("llm_execute_combat").checked,
     base_url: document.getElementById("llm_base_url").value.trim(),
     model: document.getElementById("llm_model").value.trim()
@@ -1666,6 +1687,7 @@ async function saveLLMProfile() {
   const body = {
     enabled: document.getElementById("llm_enabled").checked,
     mode: document.getElementById("llm_mode").value,
+    action_selection_mode: document.getElementById("llm_action_selection_mode").value,
     execute_combat: document.getElementById("llm_execute_combat").checked,
     base_url: document.getElementById("llm_base_url").value.trim(),
     model: document.getElementById("llm_model").value.trim(),

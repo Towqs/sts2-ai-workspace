@@ -349,8 +349,11 @@ LLM 适用场景：
 
 - 地图、选卡、事件、营火、商店全部输出决策原因。
 - 事件和商店加白名单/保护规则。
-- LLM 改成只能选择候选动作，不允许自由构造动作。
-- 复盘页面展示 LLM 原始建议和执行结果。
+- LLM 已支持双模式：
+  - `catalog_args`：保留旧模式，模型返回动作名和参数，本地再校验。
+  - `candidate_id`：候选 ID 模式，模型只能选择本地枚举出的候选动作 ID，不允许自由构造 payload。
+- LLM 复盘状态已记录 `raw_response`、`candidate_actions`、`selected_candidate`、`payload`、`validation`、执行结果。
+- 控制台已增加 LLM 动作选择模式开关，并展示原始回复、候选数量、选中的候选 ID。
 
 ### P3：长期
 

@@ -8,6 +8,8 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from combat_actions import enumerate_combat_actions
+
 WORKSPACE = Path(__file__).resolve().parents[1]
 AI_DIR = WORKSPACE / "AI_Training"
 DATA_DIR = WORKSPACE / "RL_Datasets"
@@ -29,6 +31,7 @@ DEFAULT_CONFIG = {
     "execute_combat": False,
     "confirm_shop": True,
     "max_actions_per_turn": 12,
+    "action_selection_mode": "catalog_args",
 }
 
 COMBAT_TYPES = {"monster", "elite", "boss"}
@@ -54,6 +57,8 @@ def load_config():
     cfg = DEFAULT_CONFIG.copy()
     cfg.update(read_json(CONFIG_PATH, {}))
     cfg["mode"] = cfg.get("mode") if cfg.get("mode") in ("advisor", "combat_auto") else "advisor"
+    if cfg.get("action_selection_mode") not in ("catalog_args", "candidate_id"):
+        cfg["action_selection_mode"] = "catalog_args"
     cfg["provider"] = "openai_compatible"
     cfg["temperature"] = float(cfg.get("temperature", 0.2) or 0.2)
     cfg["max_tokens"] = int(cfg.get("max_tokens", 700) or 700)
@@ -225,6 +230,161 @@ def action_catalog(compact):
     return actions
 
 
+def add_candidate(candidates, candidate_id, label, payload, detail=None):
+    item = {
+        "id": candidate_id,
+        "label": label,
+        "payload": payload,
+    }
+    if detail:
+        item["detail"] = detail
+    candidates.append(item)
+
+
+def items_for_state(state, state_type):
+    if state_type == "rewards":
+        return (state.get("rewards") or {}).get("items", []) or []
+    if state_type == "shop":
+        return (state.get("shop") or {}).get("items", []) or []
+    if state_type == "fake_merchant":
+        return ((state.get("fake_merchant") or {}).get("shop") or {}).get("items", []) or []
+    return []
+
+
+def can_proceed(state, state_type):
+    if state_type in ("rewards", "shop", "rest_site"):
+        return bool((state.get(state_type) or {}).get("can_proceed"))
+    if state_type == "fake_merchant":
+        return bool(((state.get("fake_merchant") or {}).get("shop") or {}).get("can_proceed"))
+    if state_type == "treasure":
+        return bool((state.get("treasure") or {}).get("can_proceed"))
+    return False
+
+
+def candidate_action_catalog(state, compact):
+    state_type = str(compact.get("state_type") or state.get("state_type") or "").lower()
+    candidates = []
+    add_candidate(candidates, "wait", "wait", None)
+
+    if state_type in COMBAT_TYPES and compact.get("battle", {}).get("is_play_phase") and compact.get("battle", {}).get("turn") == "player":
+        for candidate in enumerate_combat_actions(state):
+            item = candidate.to_dict(include_features=False)
+            add_candidate(
+                candidates,
+                candidate.label,
+                candidate.label,
+                candidate.payload,
+                {
+                    "kind": item.get("kind"),
+                    "card_id": item.get("card_id"),
+                    "potion_id": item.get("potion_id"),
+                    "card_index": item.get("card_index"),
+                    "potion_slot": item.get("potion_slot"),
+                    "target_id": item.get("target_id"),
+                },
+            )
+        return candidates
+
+    if state_type == "map":
+        for fallback_index, option in enumerate(((state.get("map") or {}).get("next_options") or [])):
+            index = int(option.get("index", fallback_index))
+            add_candidate(
+                candidates,
+                f"map:{index}",
+                f"choose map node {index}",
+                {"action": "choose_map_node", "index": index},
+                {"type": option.get("type"), "col": option.get("col"), "row": option.get("row")},
+            )
+
+    if state_type == "rewards":
+        for fallback_index, item in enumerate(items_for_state(state, state_type)):
+            index = int(item.get("index", fallback_index))
+            add_candidate(
+                candidates,
+                f"reward:{index}",
+                f"claim reward {index}",
+                {"action": "claim_reward", "index": index},
+                {
+                    "type": item.get("type") or item.get("category"),
+                    "description": item.get("description"),
+                    "potion": item.get("potion_id") or item.get("potion_name"),
+                },
+            )
+
+    if state_type == "card_reward":
+        card_state = state.get("card_reward") or {}
+        for fallback_index, card in enumerate(card_state.get("cards") or []):
+            index = int(card.get("index", fallback_index))
+            add_candidate(
+                candidates,
+                f"card_reward:{index}",
+                f"pick card reward {index}",
+                {"action": "select_card_reward", "card_index": index},
+                {
+                    "id": card.get("id"),
+                    "name": card.get("name"),
+                    "type": card.get("type"),
+                    "rarity": card.get("rarity"),
+                    "cost": card.get("cost"),
+                },
+            )
+        if card_state.get("can_skip"):
+            add_candidate(candidates, "card_reward:skip", "skip card reward", {"action": "skip_card_reward"})
+
+    if state_type == "event":
+        event = state.get("event") or {}
+        if event.get("in_dialogue"):
+            add_candidate(candidates, "event:advance_dialogue", "advance event dialogue", {"action": "advance_dialogue"})
+        for fallback_index, option in enumerate(event.get("options") or []):
+            if option.get("is_locked") or option.get("was_chosen"):
+                continue
+            index = int(option.get("index", fallback_index))
+            add_candidate(
+                candidates,
+                f"event:{index}",
+                f"choose event option {index}",
+                {"action": "choose_event_option", "index": index},
+                {"title": option.get("title"), "description": option.get("description"), "is_proceed": option.get("is_proceed")},
+            )
+
+    if state_type == "rest_site":
+        for fallback_index, option in enumerate((state.get("rest_site") or {}).get("options") or []):
+            if not option.get("is_enabled", True):
+                continue
+            index = int(option.get("index", fallback_index))
+            add_candidate(
+                candidates,
+                f"rest:{index}",
+                f"choose rest option {index}",
+                {"action": "choose_rest_option", "index": index},
+                {"id": option.get("id"), "name": option.get("name"), "description": option.get("description")},
+            )
+
+    if state_type in ("shop", "fake_merchant"):
+        for fallback_index, item in enumerate(items_for_state(state, state_type)):
+            if item.get("is_stocked") is False or item.get("can_afford") is False:
+                continue
+            index = int(item.get("index", fallback_index))
+            add_candidate(
+                candidates,
+                f"shop:{index}",
+                f"buy shop item {index}",
+                {"action": "shop_purchase", "index": index},
+                {
+                    "category": item.get("category"),
+                    "price": item.get("price"),
+                    "card": item.get("card_id") or item.get("card_name"),
+                    "relic": item.get("relic_id") or item.get("relic_name"),
+                    "potion": item.get("potion_id") or item.get("potion_name"),
+                },
+            )
+
+    if can_proceed(state, state_type):
+        add_candidate(candidates, "proceed", "proceed", {"action": "proceed"})
+
+    return candidates
+
+
 def chat_url(base_url):
     base = (base_url or "").rstrip("/")
     if base.endswith("/chat/completions"):
@@ -321,6 +481,57 @@ def call_openai_compatible(cfg, compact, actions):
     return decision
 
 
+def call_openai_candidate_selector(cfg, compact, candidates):
+    if not cfg.get("api_key"):
+        raise RuntimeError("Missing API key")
+    if not cfg.get("model"):
+        raise RuntimeError("Missing model name")
+
+    system = (
+        "You are a Slay the Spire 2 decision agent. "
+        "Choose exactly one candidate id from the provided candidate_actions list. "
+        "Return only JSON with keys: candidate_id, reason, confidence. "
+        "Do not create actions, arguments, card indexes, enemy ids, or payloads. "
+        "If no useful action is safe, choose candidate_id \"wait\"."
+    )
+    user = {
+        "mode": cfg.get("mode"),
+        "rules": [
+            "candidate_id must exactly match one id in candidate_actions.",
+            "Candidate payloads are read-only; never modify or invent them.",
+            "Prefer useful zero-cost cards before spending energy.",
+            "Do not choose end_turn while affordable playable cards remain unless clearly justified.",
+            "Use battle.incoming_damage, battle.net_incoming_after_block, and battle.hp_after_incoming to decide whether blocking is mandatory.",
+            "Shop purchases are suggestions unless execution is explicitly enabled.",
+        ],
+        "state": compact,
+        "candidate_actions": candidates,
+    }
+    body = {
+        "model": cfg["model"],
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
+        ],
+        "temperature": cfg.get("temperature", 0.2),
+        "max_tokens": cfg.get("max_tokens", 700),
+        "stream": False,
+    }
+    headers = {"Authorization": f"Bearer {cfg['api_key']}", "Accept": "application/json"}
+    result = request_json(chat_url(cfg.get("base_url")), method="POST", body=body, headers=headers, timeout=45)
+    content = chat_response_content(result)
+    if content is None:
+        preview = json.dumps(result, ensure_ascii=False)[:1500]
+        raise RuntimeError(f"Model response has no chat content: {preview}")
+    try:
+        decision = extract_json(content)
+    except Exception as exc:
+        preview = content[:1500].replace("\n", " ")
+        raise RuntimeError(f"Model response did not contain JSON decision: {preview}") from exc
+    decision["_raw_content"] = content
+    return decision
+
+
 def normalize_decision(decision):
     aliases = {
         "play_card": "combat_play_card",
@@ -342,6 +553,25 @@ def normalize_decision(decision):
         "reason": str(decision.get("reason", ""))[:1200],
         "confidence": decision.get("confidence"),
     }
+
+
+def normalize_candidate_decision(decision):
+    candidate_id = decision.get("candidate_id") or decision.get("id") or decision.get("action")
+    return {
+        "candidate_id": str(candidate_id or ""),
+        "reason": str(decision.get("reason", ""))[:1200],
+        "confidence": decision.get("confidence"),
+    }
+
+
+def validate_candidate_decision(decision, candidates):
+    normalized = normalize_candidate_decision(decision)
+    candidate_id = normalized["candidate_id"]
+    by_id = {item.get("id"): item for item in candidates}
+    selected = by_id.get(candidate_id)
+    if selected is None:
+        return normalized, None, "candidate_id_not_found", None
+    return normalized, selected.get("payload"), "ok" if selected.get("payload") else "advisor_wait", selected
 
 
 def validate_and_convert(decision, state):
@@ -526,10 +756,17 @@ def run_agent():
             if actions_this_turn >= cfg.get("max_actions_per_turn", 12):
                 raise RuntimeError("max_actions_per_turn reached")
 
+            selection_mode = cfg.get("action_selection_mode", "catalog_args")
             actions = action_catalog(compact)
-            decision = call_openai_compatible(cfg, compact, actions)
-            normalized = normalize_decision(decision)
-            payload, validation = validate_and_convert(normalized, state)
+            candidates = candidate_action_catalog(state, compact)
+            selected_candidate = None
+            if selection_mode == "candidate_id":
+                decision = call_openai_candidate_selector(cfg, compact, candidates)
+                normalized, payload, validation, selected_candidate = validate_candidate_decision(decision, candidates)
+            else:
+                decision = call_openai_compatible(cfg, compact, actions)
+                normalized = normalize_decision(decision)
+                payload, validation = validate_and_convert(normalized, state)
             execute = should_execute(cfg, payload, state)
             result = None
             ok = None
@@ -546,10 +783,14 @@ def run_agent():
                 "status": "ok",
                 "session_id": session_id,
                 "mode": cfg.get("mode"),
+                "action_selection_mode": selection_mode,
                 "provider": cfg.get("provider"),
                 "model": cfg.get("model"),
                 "state_type": state.get("state_type"),
                 "decision": normalized,
+                "raw_response": decision.get("_raw_content"),
+                "candidate_actions": candidates,
+                "selected_candidate": selected_candidate,
                 "payload": payload,
                 "validation": validation,
                 "executed": bool(execute and payload),
