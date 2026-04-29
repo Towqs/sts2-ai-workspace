@@ -148,6 +148,15 @@ public static partial class McpMod
                 failed.Add("CharacterSelectNewRunIntent");
             }
 
+            try {
+                MegaCrit.Sts2.Core.Combat.CombatManager.Instance.TurnStarted -= RL_DataCollector.Hook_TurnStarted;
+                MegaCrit.Sts2.Core.Combat.CombatManager.Instance.TurnStarted += RL_DataCollector.Hook_TurnStarted;
+                Debug.Log("Harmony", "[PATCH] TurnStarted event OK");
+            } catch (Exception ex) {
+                Debug.Log("Harmony", "[PATCH] TurnStarted event FAILED: " + ex.Message);
+                failed.Add("TurnStartedEvent");
+            }
+
             // 2. CombatStateChange
             try {
                 harmony.Patch(

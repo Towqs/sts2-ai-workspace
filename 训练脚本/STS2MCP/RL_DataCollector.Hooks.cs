@@ -42,6 +42,37 @@ namespace STS2_MCP
             RL_DataCollector.MarkMenuRunIntent("new", seed);
         }
 
+        public static void Hook_TurnStarted(CombatState state)
+        {
+            try
+            {
+                if (state == null)
+                {
+                    Debug.Log("TurnStart", "[HOOK] skipped: state null");
+                    return;
+                }
+
+                if (!string.Equals(state.CurrentSide.ToString(), "Player", StringComparison.OrdinalIgnoreCase))
+                {
+                    Debug.Log("TurnStart", $"[HOOK] skipped: side={state.CurrentSide}");
+                    return;
+                }
+
+                if (!CombatManager.Instance.IsPlayPhase)
+                {
+                    Debug.Log("TurnStart", "[HOOK] skipped: not play phase");
+                    return;
+                }
+
+                Debug.Log("TurnStart", $"[HOOK] TurnStarted fired round={state.RoundNumber}");
+                RL_DataCollector.RecordTurnStart();
+            }
+            catch (Exception ex)
+            {
+                Debug.Log("TurnStart", $"[HOOK] ERROR: {ex.Message}");
+            }
+        }
+
         // Hook_RunStateChange Postfix (called manually via TryApplyHarmonyPatches)
         public static void Hook_RunStateChange_Postfix(RunManager __instance, ref bool __result)
         {
