@@ -1515,16 +1515,12 @@ INDEX_HTML = r"""<!doctype html>
       box-shadow:0 22px 54px rgba(38,55,58,.24);
     }
     .module-library {
-      padding:15px;
+      padding:0;
       background:linear-gradient(135deg, rgba(255,254,250,.98), rgba(237,245,242,.96));
     }
     .module-library::after { display:none; }
-    .library-head {
-      display:grid;
-      grid-template-columns:minmax(0, 1fr) auto;
-      align-items:center;
-      gap:10px;
-      margin-bottom:12px;
+    .module-library .fold-body {
+      background:linear-gradient(180deg, #fff, rgba(237,245,242,.72));
     }
     .module-groups { display:grid; gap:12px; }
     .module-group { display:grid; gap:7px; }
@@ -1537,7 +1533,7 @@ INDEX_HTML = r"""<!doctype html>
     .module-item {
       width:100%;
       display:grid;
-      grid-template-columns:18px minmax(0, 1fr) auto;
+      grid-template-columns:18px minmax(0, 1fr) 28px;
       align-items:center;
       gap:9px;
       min-height:42px;
@@ -1553,6 +1549,10 @@ INDEX_HTML = r"""<!doctype html>
       border-color:rgba(47,111,120,.38);
       background:var(--primary-bg);
     }
+    .module-item.collapsed {
+      background:#fff;
+      border-style:dashed;
+    }
     .module-item.dragging { opacity:.58; }
     .module-glyph {
       width:16px;
@@ -1562,9 +1562,21 @@ INDEX_HTML = r"""<!doctype html>
       transform:rotate(45deg);
     }
     .module-label { min-width:0; font-weight:850; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-    .module-state { color:var(--muted); font-size:12px; font-weight:800; }
+    .module-state {
+      width:26px;
+      height:26px;
+      display:inline-grid;
+      place-items:center;
+      color:var(--primary-strong);
+      font-size:18px;
+      line-height:1;
+      font-weight:900;
+      border:1px solid rgba(47,111,120,.28);
+      background:#fff;
+      border-radius:8px;
+    }
     .workspace {
-      min-height:360px;
+      min-height:0;
       border-radius:18px;
       transition:background .15s ease, outline-color .15s ease;
     }
@@ -1574,11 +1586,13 @@ INDEX_HTML = r"""<!doctype html>
       background:rgba(229,242,243,.45);
     }
     .module-card {
+      align-self:start;
       transition:opacity .15s ease, transform .15s ease, box-shadow .15s ease;
     }
     .module-card.is-hidden { display:none; }
     .module-card.is-collapsed {
       padding-bottom:14px;
+      min-height:0;
     }
     .module-card.is-collapsed > :not(.section-head) { display:none; }
     .module-card.flash {
@@ -1607,6 +1621,8 @@ INDEX_HTML = r"""<!doctype html>
       background:#fff;
     }
     .module-action:hover { background:var(--primary-bg); }
+    .priority-grid { align-items:start; }
+    .priority-grid.single-visible { grid-template-columns:1fr; }
     @media (max-width: 1120px) {
       .status-grid { grid-template-columns:repeat(2, minmax(160px, 1fr)); }
       main { grid-template-columns:1fr; }
@@ -1679,43 +1695,47 @@ INDEX_HTML = r"""<!doctype html>
 
   <main>
     <div class="stack sidebar">
-      <section class="module-library">
-        <div class="library-head">
-          <h2>工作区</h2>
-          <span id="openModuleCount" class="pill info">-</span>
-        </div>
-        <div class="module-groups">
-          <div class="module-group">
-            <div class="module-group-title">决策</div>
-            <button class="module-item" data-module-target="ai_logic" draggable="true" onclick="openModule('ai_logic')" ondragstart="beginModuleDrag(event, 'ai_logic')" ondragend="endModuleDrag(event)">
-              <span class="module-glyph"></span><span class="module-label">AI 出牌逻辑</span><span class="module-state">打开</span>
-            </button>
-            <button class="module-item" data-module-target="llm_logic" draggable="true" onclick="openModule('llm_logic')" ondragstart="beginModuleDrag(event, 'llm_logic')" ondragend="endModuleDrag(event)">
-              <span class="module-glyph"></span><span class="module-label">LLM 决策</span><span class="module-state">打开</span>
-            </button>
+      <section class="fold-panel module-library">
+        <details open>
+          <summary>
+            <span class="fold-title">工作区</span>
+            <span id="openModuleCount" class="pill info">-</span>
+          </summary>
+          <div class="fold-body">
+            <div class="module-groups">
+              <div class="module-group">
+                <div class="module-group-title">决策</div>
+                <button class="module-item" data-module-target="ai_logic" draggable="true" onclick="openModule('ai_logic')" ondragstart="beginModuleDrag(event, 'ai_logic')" ondragend="endModuleDrag(event)">
+                  <span class="module-glyph"></span><span class="module-label">AI 出牌逻辑</span><span class="module-state">+</span>
+                </button>
+                <button class="module-item" data-module-target="llm_logic" draggable="true" onclick="openModule('llm_logic')" ondragstart="beginModuleDrag(event, 'llm_logic')" ondragend="endModuleDrag(event)">
+                  <span class="module-glyph"></span><span class="module-label">LLM 决策</span><span class="module-state">+</span>
+                </button>
+              </div>
+              <div class="module-group">
+                <div class="module-group-title">数据</div>
+                <button class="module-item" data-module-target="current_data" draggable="true" onclick="openModule('current_data')" ondragstart="beginModuleDrag(event, 'current_data')" ondragend="endModuleDrag(event)">
+                  <span class="module-glyph"></span><span class="module-label">Run 数据体检</span><span class="module-state">+</span>
+                </button>
+                <button class="module-item" data-module-target="runs" draggable="true" onclick="openModule('runs')" ondragstart="beginModuleDrag(event, 'runs')" ondragend="endModuleDrag(event)">
+                  <span class="module-glyph"></span><span class="module-label">最近 Run</span><span class="module-state">+</span>
+                </button>
+                <button class="module-item" data-module-target="records" draggable="true" onclick="openModule('records')" ondragstart="beginModuleDrag(event, 'records')" ondragend="endModuleDrag(event)">
+                  <span class="module-glyph"></span><span class="module-label">最近采集记录</span><span class="module-state">+</span>
+                </button>
+              </div>
+              <div class="module-group">
+                <div class="module-group-title">训练</div>
+                <button class="module-item" data-module-target="evaluation" draggable="true" onclick="openModule('evaluation')" ondragstart="beginModuleDrag(event, 'evaluation')" ondragend="endModuleDrag(event)">
+                  <span class="module-glyph"></span><span class="module-label">策略评测</span><span class="module-state">+</span>
+                </button>
+                <button class="module-item" data-module-target="training" draggable="true" onclick="openModule('training')" ondragstart="beginModuleDrag(event, 'training')" ondragend="endModuleDrag(event)">
+                  <span class="module-glyph"></span><span class="module-label">训练输出</span><span class="module-state">+</span>
+                </button>
+              </div>
+            </div>
           </div>
-          <div class="module-group">
-            <div class="module-group-title">数据</div>
-            <button class="module-item" data-module-target="current_data" draggable="true" onclick="openModule('current_data')" ondragstart="beginModuleDrag(event, 'current_data')" ondragend="endModuleDrag(event)">
-              <span class="module-glyph"></span><span class="module-label">Run 数据体检</span><span class="module-state">打开</span>
-            </button>
-            <button class="module-item" data-module-target="runs" draggable="true" onclick="openModule('runs')" ondragstart="beginModuleDrag(event, 'runs')" ondragend="endModuleDrag(event)">
-              <span class="module-glyph"></span><span class="module-label">最近 Run</span><span class="module-state">打开</span>
-            </button>
-            <button class="module-item" data-module-target="records" draggable="true" onclick="openModule('records')" ondragstart="beginModuleDrag(event, 'records')" ondragend="endModuleDrag(event)">
-              <span class="module-glyph"></span><span class="module-label">最近采集记录</span><span class="module-state">打开</span>
-            </button>
-          </div>
-          <div class="module-group">
-            <div class="module-group-title">训练</div>
-            <button class="module-item" data-module-target="evaluation" draggable="true" onclick="openModule('evaluation')" ondragstart="beginModuleDrag(event, 'evaluation')" ondragend="endModuleDrag(event)">
-              <span class="module-glyph"></span><span class="module-label">策略评测</span><span class="module-state">打开</span>
-            </button>
-            <button class="module-item" data-module-target="training" draggable="true" onclick="openModule('training')" ondragstart="beginModuleDrag(event, 'training')" ondragend="endModuleDrag(event)">
-              <span class="module-glyph"></span><span class="module-label">训练输出</span><span class="module-state">打开</span>
-            </button>
-          </div>
-        </div>
+        </details>
       </section>
 
       <section class="fold-panel">
@@ -2129,6 +2149,7 @@ function moduleElement(id) {
 }
 function syncModuleUI() {
   let openCount = 0;
+  let visibleDecisionCards = 0;
   for (const id of MODULE_IDS) {
     const state = moduleState[id] || {open:true, collapsed:false};
     const card = moduleElement(id);
@@ -2139,16 +2160,23 @@ function syncModuleUI() {
     const dock = document.querySelector(`.module-item[data-module-target="${id}"]`);
     if (dock) {
       dock.classList.toggle("active", !!state.open);
+      dock.classList.toggle("collapsed", !!state.open && !!state.collapsed);
+      dock.title = !state.open ? "点击打开；也可以拖到右侧工作区" : (state.collapsed ? "已收起，点击展开并定位" : "已打开，点击定位");
       const label = dock.querySelector(".module-state");
-      if (label) label.textContent = state.open ? (state.collapsed ? "收起" : "打开") : "关闭";
+      if (label) label.textContent = state.open && !state.collapsed ? "-" : "+";
     }
     const collapseButton = document.querySelector(`[data-collapse-for="${id}"]`);
     if (collapseButton) {
       collapseButton.textContent = state.collapsed ? "+" : "-";
       collapseButton.title = state.collapsed ? "展开" : "收起";
     }
-    if (state.open) openCount++;
+    if (state.open) {
+      openCount++;
+      if (id === "ai_logic" || id === "llm_logic") visibleDecisionCards++;
+    }
   }
+  const decisionGrid = document.querySelector(".priority-grid");
+  if (decisionGrid) decisionGrid.classList.toggle("single-visible", visibleDecisionCards === 1);
   const count = document.getElementById("openModuleCount");
   if (count) count.textContent = `${openCount}/${MODULE_IDS.length}`;
 }
