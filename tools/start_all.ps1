@@ -29,18 +29,64 @@ $RlLog = Join-Path $Root "RL_Datasets\rl_monitor.log"
 $CombatDir = Join-Path $Root "RL_Datasets\Combat"
 $MacroDir = Join-Path $Root "RL_Datasets\Macro"
 
-if ($env:STS2_AI_PYTHON) {
-    $PythonExe = $env:STS2_AI_PYTHON
-} else {
-    $PythonExe = Join-Path $Root ".venv\Scripts\python.exe"
-}
-if (-not (Test-Path -LiteralPath $PythonExe)) {
-    $PythonExe = "python"
-}
-
 function Quote-PSLiteral {
     param([string]$Value)
     return "'" + ($Value -replace "'", "''") + "'"
+}
+
+function Test-PythonExe {
+    param([string]$Candidate)
+    if ([string]::IsNullOrWhiteSpace($Candidate)) {
+        return $false
+    }
+    if ((Split-Path -Leaf $Candidate) -ne $Candidate -and -not (Test-Path -LiteralPath $Candidate)) {
+        return $false
+    }
+    try {
+        $output = & $Candidate --version 2>&1
+        return ($LASTEXITCODE -eq 0 -and ($output -join "`n") -match "Python")
+    } catch {
+        return $false
+    }
+}
+
+function Resolve-PythonExe {
+    $candidates = New-Object System.Collections.Generic.List[string]
+
+    if ($env:STS2_AI_PYTHON) {
+        $candidates.Add($env:STS2_AI_PYTHON)
+    }
+    $candidates.Add((Join-Path $Root ".venv\Scripts\python.exe"))
+    if ($env:USERPROFILE) {
+        $candidates.Add((Join-Path $env:USERPROFILE ".cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe"))
+    }
+
+    foreach ($name in @("python.exe", "python", "py.exe", "py")) {
+        try {
+            $cmd = Get-Command $name -ErrorAction Stop
+            if ($cmd.Source) {
+                $candidates.Add($cmd.Source)
+            }
+        } catch {
+        }
+    }
+
+    $seen = @{}
+    foreach ($candidate in $candidates) {
+        if ([string]::IsNullOrWhiteSpace($candidate)) {
+            continue
+        }
+        $key = $candidate.ToLowerInvariant()
+        if ($seen.ContainsKey($key)) {
+            continue
+        }
+        $seen[$key] = $true
+        if (Test-PythonExe $candidate) {
+            return $candidate
+        }
+    }
+
+    throw "No runnable Python found. Rebuild .venv or set STS2_AI_PYTHON to a working python.exe."
 }
 
 function Start-ConsoleWindow {
@@ -78,7 +124,7 @@ $Command
 
 function Test-PanelReady {
     try {
-        $null = Invoke-WebRequest -Uri "$PanelUrl/api/status" -UseBasicParsing -TimeoutSec 2
+        $null = Invoke-WebRequest -Uri "$PanelUrl/api/ping" -UseBasicParsing -TimeoutSec 2
         return $true
     } catch {
         return $false
@@ -150,6 +196,10 @@ Write-Host "Workspace: $Root"
 Write-Host "Panel:    $PanelUrl"
 Write-Host ""
 
+$PythonExe = Resolve-PythonExe
+Write-Host "Python:   $PythonExe"
+Write-Host ""
+
 $rootQ = Quote-PSLiteral $Root
 $pythonQ = Quote-PSLiteral $PythonExe
 $panelQ = Quote-PSLiteral $ControlPanel
@@ -161,7 +211,9 @@ if (Test-PanelReady) {
     $controlCommand = @"
 Set-Location -LiteralPath $rootQ
 `$env:PYTHONIOENCODING = 'utf-8'
-& $pythonQ $panelQ 2>&1 | Tee-Object -FilePath $controlLogQ -Append
+`$env:PYTHONUTF8 = '1'
+`$env:STS2_AI_PYTHON = $pythonQ
+& $pythonQ -X utf8 $panelQ 2>&1 | Tee-Object -FilePath $controlLogQ -Append
 "@
     Write-Host "Starting control panel..."
     Start-ConsoleWindow -Title "STS2 AI Control Panel" -Command $controlCommand

@@ -1,6 +1,8 @@
 # 一键启动说明
 
-双击仓库根目录的 `一键启动全部.bat`。
+推荐双击仓库根目录的 `start_all.bat`。
+
+`一键启动全部.bat` 仍然保留，但它只是包装 `start_all.bat`。如果 Windows、快捷方式或压缩包对中文文件名处理不稳定，直接用 ASCII 文件名的 `start_all.bat`。
 
 它会做四件事：
 
@@ -12,6 +14,7 @@
 注意：
 
 - 游戏和 STS2_MCP Mod 仍然需要先启动；否则网页会显示游戏未连接。
+- 启动器会先测试 `.venv\Scripts\python.exe` 是否真的可运行；如果本地 venv 损坏，会自动跳过并尝试 Codex bundled Python 或 PATH 里的 Python。
 - 如果 LLM 没有配置 API Key 或模型名，总启动器会跳过 LLM，避免空配置循环报错。
 - 如果战斗模型不存在，总启动器会跳过 BC AI，需要先在控制台里训练或导入模型。
 

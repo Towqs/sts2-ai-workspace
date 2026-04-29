@@ -1814,7 +1814,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type + "; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            return
 
     def _file(self, path, content_type="application/octet-stream"):
         data = path.read_bytes()
@@ -1837,6 +1840,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/":
             self._send(200, INDEX_HTML, "text/html")
+        elif self.path == "/api/ping":
+            self._json(200, {"status": "ok", "time": datetime.now().isoformat(timespec="seconds")})
         elif self.path == "/api/status":
             self._json(200, status_payload())
         elif self.path.startswith("/exports/"):

@@ -41,10 +41,10 @@
 已经装好依赖和 Mod 后，日常使用可以直接双击：
 
 ```text
-一键启动全部.bat
+start_all.bat
 ```
 
-它会打开网页控制台、后台输出窗口、RL 日志窗口，并在模型配置可用时启动 BC AI 和 LLM。详细说明见 [`docs/startup.md`](docs/startup.md)。
+它会打开网页控制台、后台输出窗口、RL 日志窗口，并在模型配置可用时启动 BC AI 和 LLM。中文名的 `一键启动全部.bat` 也保留，但如果路径或快捷方式有中文兼容问题，优先用 `start_all.bat`。详细说明见 [`docs/startup.md`](docs/startup.md)。
 
 ### 1. 安装 Python 依赖
 
