@@ -28,6 +28,7 @@ WORKSPACE = Path(__file__).resolve().parents[1]
 AI_DIR = WORKSPACE / "AI_Training"
 DATA_DIR = WORKSPACE / "RL_Datasets"
 EXPORT_DIR = WORKSPACE / "Data_Packages"
+ASSETS_DIR = AI_DIR / "assets"
 CONTROL_PATH = AI_DIR / "control_state.json"
 AI_LOGIC_PATH = AI_DIR / "ai_logic_state.json"
 LLM_CONFIG_PATH = AI_DIR / "model_config.json"
@@ -919,7 +920,10 @@ INDEX_HTML = r"""<!doctype html>
       border-bottom:1px solid var(--line);
       padding:18px 24px;
     }
-    .topbar { display:flex; justify-content:space-between; align-items:flex-start; gap:16px; }
+    .topbar { display:flex; justify-content:space-between; align-items:center; gap:16px; }
+    .brand { display:flex; align-items:center; gap:12px; min-width:0; }
+    .brand-logo { width:54px; height:60px; object-fit:contain; flex:0 0 auto; }
+    .brand-copy { min-width:0; }
     h1 { margin:0; font-size:22px; letter-spacing:0; }
     h2 { margin:0 0 12px; font-size:15px; }
     h3 { margin:0; font-size:13px; color:var(--muted); font-weight:600; }
@@ -953,33 +957,37 @@ INDEX_HTML = r"""<!doctype html>
       border-radius:8px;
       padding:14px;
     }
-    .activity-feed { display:grid; gap:0; }
+    .activity-feed {
+      display:grid;
+      grid-template-columns:repeat(auto-fit, minmax(170px, 1fr));
+      gap:8px;
+    }
     .activity-item {
       display:grid;
-      grid-template-columns:32px minmax(0, 1fr) auto;
-      gap:10px;
-      align-items:center;
-      padding:8px 0;
-      border-top:1px solid #eef1f5;
-    }
-    .activity-item:first-child { border-top:0; padding-top:0; }
-    .activity-icon {
-      width:32px;
-      height:32px;
+      gap:7px;
+      min-height:92px;
+      padding:10px;
+      border:1px solid #e6eaf0;
+      border-left:3px solid #cdd5df;
       border-radius:8px;
-      border:1px solid var(--line);
-      display:grid;
-      place-items:center;
-      font-weight:800;
-      font-size:12px;
-      background:var(--panel-2);
-      color:var(--muted);
+      background:#fbfcfe;
     }
-    .activity-item.on .activity-icon { color:var(--good); border-color:#9ad6b8; background:var(--good-bg); }
-    .activity-item.warn .activity-icon { color:var(--warn); border-color:#fedf89; background:var(--warn-bg); }
-    .activity-item.off .activity-icon { color:var(--bad); border-color:#f4b5ad; background:var(--bad-bg); }
-    .activity-item.info .activity-icon { color:var(--blue); border-color:#b2ccff; background:var(--blue-bg); }
-    .activity-title { font-weight:700; overflow-wrap:anywhere; }
+    .activity-item.tone-on { border-left-color:var(--good); }
+    .activity-item.tone-warn { border-left-color:var(--warn); }
+    .activity-item.tone-off { border-left-color:var(--bad); }
+    .activity-item.tone-info { border-left-color:var(--blue); }
+    .activity-meta { display:flex; justify-content:space-between; align-items:center; gap:8px; }
+    .activity-label {
+      color:var(--muted);
+      font-size:12px;
+      font-weight:700;
+      white-space:nowrap;
+    }
+    .activity-item.tone-on .activity-label { color:var(--good); }
+    .activity-item.tone-warn .activity-label { color:var(--warn); }
+    .activity-item.tone-off .activity-label { color:var(--bad); }
+    .activity-item.tone-info .activity-label { color:var(--blue); }
+    .activity-title { font-weight:700; overflow-wrap:anywhere; line-height:1.35; }
     .activity-detail { color:var(--muted); font-size:12px; overflow-wrap:anywhere; }
     .activity-time { color:var(--muted); font-size:12px; white-space:nowrap; }
     main {
@@ -1019,6 +1027,18 @@ INDEX_HTML = r"""<!doctype html>
     }
     .fold-panel summary::-webkit-details-marker { display:none; }
     .fold-title { font-size:15px; font-weight:700; }
+    .fold-panel summary::after, details.more-panel summary::after {
+      content:"展开";
+      color:var(--blue);
+      border:1px solid #b2ccff;
+      background:var(--blue-bg);
+      border-radius:999px;
+      padding:2px 8px;
+      font-size:12px;
+      font-weight:700;
+      white-space:nowrap;
+    }
+    .fold-panel details[open] > summary::after, details.more-panel[open] > summary::after { content:"收起"; }
     .fold-body {
       border-top:1px solid #eef1f5;
       padding:14px 16px 16px;
@@ -1166,6 +1186,10 @@ INDEX_HTML = r"""<!doctype html>
     details.more-panel { margin-top:10px; }
     details.more-panel summary {
       cursor:pointer;
+      display:flex;
+      justify-content:space-between;
+      align-items:center;
+      gap:10px;
       color:var(--blue);
       font-weight:700;
       margin-bottom:10px;
@@ -1199,9 +1223,10 @@ INDEX_HTML = r"""<!doctype html>
       header { padding:14px; }
       main { padding:14px; }
       .topbar { display:block; }
+      .brand-logo { width:44px; height:50px; }
+      #lastRefresh { margin-top:10px; }
       .status-grid, .metric-grid { grid-template-columns:1fr; }
-      .activity-item { grid-template-columns:28px minmax(0, 1fr); }
-      .activity-time { grid-column:2; }
+      .activity-feed { grid-template-columns:1fr; }
       .button-row { grid-template-columns:1fr; }
     }
   </style>
@@ -1209,9 +1234,12 @@ INDEX_HTML = r"""<!doctype html>
 <body>
   <header>
     <div class="topbar">
-      <div>
-        <h1>STS2 AI 控制台</h1>
-        <div class="subtitle">战斗托管、数据采集、BC 重训和 run 质量管理</div>
+      <div class="brand">
+        <img class="brand-logo" src="/assets/sts2_ai_logo.png" alt="STS2 AI">
+        <div class="brand-copy">
+          <h1>STS2 AI 控制台</h1>
+          <div class="subtitle">战斗托管、数据采集、BC 重训和 run 质量管理</div>
+        </div>
       </div>
       <span id="lastRefresh" class="pill info">读取中</span>
     </div>
@@ -1250,11 +1278,13 @@ INDEX_HTML = r"""<!doctype html>
 
   <main>
     <div class="stack sidebar">
-      <section>
-        <div class="section-head">
-          <h2>战斗 AI</h2>
-          <span id="aiProcessBadge" class="pill">-</span>
-        </div>
+      <section class="fold-panel">
+        <details open>
+          <summary>
+            <span class="fold-title">战斗 AI</span>
+            <span id="aiProcessBadge" class="pill">-</span>
+          </summary>
+          <div class="fold-body">
         <div class="button-row">
           <button class="good" onclick="startAI()">启动 AI</button>
           <button class="bad" onclick="stopAI()">停止 AI</button>
@@ -1282,6 +1312,8 @@ INDEX_HTML = r"""<!doctype html>
           <div><div class="switch-title">AI 数据进入 BC</div><div class="switch-note">默认关闭，避免自举污染</div></div>
           <input id="include_ai_in_training" type="checkbox" onchange="saveControl()">
         </div>
+          </div>
+        </details>
       </section>
 
       <section class="fold-panel">
@@ -1459,7 +1491,7 @@ INDEX_HTML = r"""<!doctype html>
         </div>
         <div id="latestRunCard" class="compact-card">读取中</div>
         <details class="more-panel">
-          <summary>展开更多 Run</summary>
+          <summary>更多 Run</summary>
           <div class="table-wrap">
             <table>
               <thead><tr><th>Run</th><th>进度</th><th>动作</th><th>来源</th><th>结果</th><th>质量</th><th>数据</th><th>保留</th><th></th></tr></thead>
@@ -1488,7 +1520,7 @@ INDEX_HTML = r"""<!doctype html>
           <span class="fine">原始事件流</span>
         </div>
         <details class="more-panel">
-          <summary>展开原始事件表</summary>
+          <summary>原始事件表</summary>
           <div class="notice">这里不是“每个 Run 一行”，而是 Mod/AI 写入的原始事件流：战斗开始、回合开始、出牌、回合结束、奖励、地图等都会各占一条。顶部“实时采集动态”是给人看的摘要，这里保留给排查字段。</div>
           <div class="table-wrap">
             <table>
@@ -1836,20 +1868,6 @@ function renderPolicyEvaluation(evaluation) {
     </tr>`).join("");
   document.getElementById("policyEval").innerHTML = rows || "<tr><td colspan=6>暂无可评测 run</td></tr>";
 }
-function activityIcon(record) {
-  const action = record.action_type || record.type || "";
-  const label = record.label || "";
-  if (action === "play_card") return "牌";
-  if (action === "use_potion") return "药";
-  if (action === "choose_card") return "选";
-  if (action === "claim_reward") return "奖";
-  if (action === "select_map_node") return "图";
-  if (action === "choose_event_option") return "事";
-  if (action === "buy_item") return "商";
-  if (record.type === "battle_end") return "结";
-  if (record.type === "battle_start") return "战";
-  return (label || "记").slice(0, 1);
-}
 function renderLiveActivity(records) {
   const items = (records || []).slice(0, 5);
   setPill("activityBadge", items.length ? `最近 ${items.length} 条` : "暂无记录", items.length ? "info" : "warn");
@@ -1860,16 +1878,18 @@ function renderLiveActivity(records) {
   }
   root.innerHTML = items.map(r => {
     const tone = ["on", "warn", "off", "info"].includes(r.tone) ? r.tone : "info";
+    const toneClass = `tone-${tone}`;
+    const label = escapeHtml(r.label || r.action_type || r.type || "记录");
     const summary = escapeHtml(r.summary || r.action_type || r.type || "记录");
     const detail = escapeHtml(r.detail || r.file || "");
     return `
-      <div class="activity-item ${tone}">
-        <div class="activity-icon">${escapeHtml(activityIcon(r))}</div>
-        <div>
-          <div class="activity-title">${summary}</div>
-          <div class="activity-detail">${detail}</div>
+      <div class="activity-item ${toneClass}">
+        <div class="activity-meta">
+          <span class="activity-label">${label}</span>
+          <span class="activity-time">${escapeHtml(r.time || "")}</span>
         </div>
-        <div class="activity-time">${escapeHtml(r.time || "")}</div>
+        <div class="activity-title">${summary}</div>
+        <div class="activity-detail">${detail}</div>
       </div>`;
   }).join("");
 }
@@ -2123,12 +2143,13 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
             return
 
-    def _file(self, path, content_type="application/octet-stream"):
+    def _file(self, path, content_type="application/octet-stream", download=True):
         data = path.read_bytes()
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
-        self.send_header("Content-Disposition", f'attachment; filename="{path.name}"')
+        if download:
+            self.send_header("Content-Disposition", f'attachment; filename="{path.name}"')
         self.end_headers()
         self.wfile.write(data)
 
@@ -2148,6 +2169,14 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {"status": "ok", "time": datetime.now().isoformat(timespec="seconds")})
         elif self.path == "/api/status":
             self._json(200, status_payload())
+        elif self.path.startswith("/assets/"):
+            name = Path(self.path.split("?", 1)[0].split("/assets/", 1)[1]).name
+            path = ASSETS_DIR / name
+            content_types = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".svg": "image/svg+xml"}
+            if path.exists() and path.is_file() and path.suffix.lower() in content_types:
+                self._file(path, content_types[path.suffix.lower()], download=False)
+            else:
+                self._json(404, {"error": "asset not found"})
         elif self.path.startswith("/exports/"):
             name = Path(self.path.split("/exports/", 1)[1]).name
             path = EXPORT_DIR / name
