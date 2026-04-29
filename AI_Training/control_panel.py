@@ -1354,6 +1354,18 @@ INDEX_HTML = r"""<!doctype html>
     .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
     .field { display:grid; gap:6px; margin-top:12px; }
     .field span { color:var(--muted); font-size:12px; font-weight:750; }
+    .mode-help {
+      display:grid;
+      gap:8px;
+      margin-top:8px;
+      padding:10px 12px;
+      border:1px solid var(--line);
+      border-radius:10px;
+      background:var(--surface-soft);
+    }
+    .mode-help-row { display:grid; gap:3px; }
+    .mode-help-row b { color:var(--primary-strong); font-size:12px; }
+    .mode-help-row span { color:var(--muted); font-size:12px; line-height:1.45; }
     .kv {
       display:grid;
       grid-template-columns:104px minmax(0, 1fr);
@@ -1852,9 +1864,19 @@ INDEX_HTML = r"""<!doctype html>
         <div class="field">
           <span>动作选择</span>
           <select id="llm_action_selection_mode" onchange="saveLLMConfig()">
-            <option value="catalog_args">动作参数：安全兜底</option>
-            <option value="candidate_id">候选 ID：只能选列表</option>
+            <option value="candidate_id">推荐：只从合法候选动作里选</option>
+            <option value="catalog_args">兼容：让模型填写动作参数</option>
           </select>
+          <div class="mode-help">
+            <div class="mode-help-row">
+              <b>推荐模式</b>
+              <span>系统先列出当前能做的合法动作，例如出哪张牌、打哪个怪、用哪个药水、是否结束回合。LLM 只能选其中一个，不允许自己编动作。演示和实战优先用这个。</span>
+            </div>
+            <div class="mode-help-row">
+              <b>兼容模式</b>
+              <span>LLM 自己填写动作和参数，例如 card_index、target、potion slot。系统仍会校验和兜底，但更容易因为参数理解错被拦截。这个主要保留给对比和调试。</span>
+            </div>
+          </div>
         </div>
         <div class="switch">
           <div><div class="switch-title">允许 LLM 自动战斗</div><div class="switch-note">只执行战斗出牌/结束回合；宏观仍只建议</div></div>
