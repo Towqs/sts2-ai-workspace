@@ -49,6 +49,27 @@ KNOWN_ACTIONS = {
     "buy_item",
 }
 
+REWARD_LABELS = {
+    "CardReward": "卡牌奖励",
+    "PotionReward": "药水奖励",
+    "GoldReward": "金币奖励",
+    "RelicReward": "遗物奖励",
+    "StolenGoldReward": "金币奖励",
+}
+
+NODE_LABELS = {
+    "Monster": "普通战斗",
+    "Elite": "精英",
+    "Boss": "Boss",
+    "RestSite": "营火",
+    "Merchant": "商店",
+    "Shop": "商店",
+    "Treasure": "宝箱",
+    "Unknown": "问号",
+    "Event": "事件",
+    "Ancient": "远古事件",
+}
+
 
 def read_json(path, default):
     try:
@@ -399,20 +420,325 @@ def iter_recent_records(max_files=8):
             yield record
 
 
+def clean_label(value):
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text or text == "MegaCrit.Sts2.Core.Localization.LocString":
+        return ""
+    return text
+
+
+def first_label(*values):
+    for value in values:
+        text = clean_label(value)
+        if text:
+            return text
+    return ""
+
+
+def source_label(value):
+    text = clean_label(value)
+    return {
+        "human": "玩家",
+        "ai": "AI",
+        "llm": "LLM",
+    }.get(text, text or "-")
+
+
+def reward_label(value):
+    text = clean_label(value)
+    return REWARD_LABELS.get(text, text)
+
+
+def node_label(value):
+    text = clean_label(value)
+    return NODE_LABELS.get(text, text)
+
+
+def action_payload(record):
+    payload = record.get("action_data")
+    if isinstance(payload, dict):
+        return payload
+    payload = record.get("payload")
+    if isinstance(payload, dict):
+        return payload
+    decision = record.get("decision")
+    if isinstance(decision, dict):
+        args = decision.get("args")
+        if isinstance(args, dict):
+            return args
+    return {}
+
+
+def preferred_state(record, *keys):
+    for key in keys or ("state_before", "state", "state_after"):
+        state = record.get(key)
+        if isinstance(state, dict):
+            return state
+    return {}
+
+
+def screen_state(record):
+    screen = record.get("screen_state")
+    return screen if isinstance(screen, dict) else {}
+
+
+def state_player(state):
+    player = state.get("player")
+    return player if isinstance(player, dict) else state
+
+
+def state_battle(state):
+    battle = state.get("battle")
+    return battle if isinstance(battle, dict) else state
+
+
+def state_run(state):
+    run = state.get("run")
+    return run if isinstance(run, dict) else state
+
+
+def list_field(container, key):
+    value = container.get(key) if isinstance(container, dict) else None
+    return value if isinstance(value, list) else []
+
+
+def find_card(state, index=None, card_id=None):
+    player = state_player(state)
+    for card in list_field(player, "hand"):
+        if not isinstance(card, dict):
+            continue
+        if index is not None and safe_int(card.get("index"), -999) == safe_int(index, -998):
+            return card
+        if card_id and clean_label(card.get("id")) == str(card_id):
+            return card
+    return {}
+
+
+def find_potion(state, slot=None, potion_id=None):
+    player = state_player(state)
+    for potion in list_field(player, "potions"):
+        if not isinstance(potion, dict):
+            continue
+        if slot is not None and safe_int(potion.get("slot"), -999) == safe_int(slot, -998):
+            return potion
+        if potion_id and clean_label(potion.get("id")) == str(potion_id):
+            return potion
+    return {}
+
+
+def find_enemy_name(state, target_id):
+    if target_id is None:
+        return ""
+    target = str(target_id)
+    battle = state_battle(state)
+    for enemy in list_field(battle, "enemies"):
+        if not isinstance(enemy, dict):
+            continue
+        identifiers = [
+            enemy.get("id"),
+            enemy.get("entity_id"),
+            enemy.get("combat_id"),
+            enemy.get("name"),
+        ]
+        if target in {str(item) for item in identifiers if item is not None}:
+            return first_label(enemy.get("name"), enemy.get("id"), enemy.get("entity_id"), target)
+    return target
+
+
+def record_context(record, state):
+    run = state_run(state)
+    battle = state_battle(state)
+    act = safe_int(run.get("act"))
+    floor = safe_int(record.get("floor") or run.get("floor"))
+    round_no = safe_int(record.get("round") or battle.get("round") or state.get("round"))
+    parts = []
+    if act or floor:
+        parts.append(f"Act {act or '?'} / Floor {floor or '?'}")
+    if round_no:
+        parts.append(f"Round {round_no}")
+    return "，".join(parts)
+
+
+def describe_recent_record(record):
+    rec_type = record.get("type")
+    action_type = record.get("action_type") or (record.get("decision") or {}).get("action")
+    payload = action_payload(record)
+    state = preferred_state(record, "state_before", "state", "state_after")
+    context = record_context(record, state)
+    source = source_label(record.get("source"))
+
+    def desc(label, summary, detail="", tone="info", category="system"):
+        return {
+            "label": label,
+            "summary": summary,
+            "detail": detail or context,
+            "tone": tone,
+            "category": category,
+        }
+
+    if action_type == "play_card":
+        card = find_card(state, payload.get("card_index"), payload.get("card_id"))
+        name = first_label(payload.get("card_name"), card.get("name"), payload.get("card_id"), card.get("id"), "未知卡牌")
+        target_id = payload.get("target_id") or payload.get("target")
+        target = find_enemy_name(state, target_id)
+        detail = f"目标 {target}" if target else context
+        if context and target:
+            detail = f"{detail}，{context}"
+        return desc("出牌", f"{source} 打出 {name}", detail, "on", "combat")
+
+    if action_type == "use_potion":
+        potion = find_potion(state, payload.get("slot"), payload.get("potion_id"))
+        name = first_label(payload.get("potion_name"), potion.get("name"), payload.get("potion_id"), potion.get("id"), "未知药水")
+        target_id = payload.get("target_id") or payload.get("target")
+        target = find_enemy_name(state, target_id)
+        detail = f"目标 {target}" if target else context
+        if context and target:
+            detail = f"{detail}，{context}"
+        return desc("药水", f"{source} 使用 {name}", detail, "warn", "combat")
+
+    if action_type == "end_turn":
+        cards_left = payload.get("cards_left")
+        energy_left = payload.get("energy_left")
+        extra = []
+        if cards_left is not None:
+            extra.append(f"剩 {cards_left} 张手牌")
+        if energy_left is not None:
+            extra.append(f"剩 {energy_left} 能量")
+        detail = "，".join(extra + ([context] if context else []))
+        return desc("回合", f"{source} 结束回合", detail, "info", "combat")
+
+    if action_type == "choose_card":
+        name = first_label(payload.get("card_name"), payload.get("card_id"), payload.get("name"), "未知卡牌")
+        return desc("选卡", f"{source} 选择 {name}", context, "on", "macro")
+
+    if action_type == "claim_reward":
+        reward = first_label(
+            payload.get("reward_name"),
+            payload.get("item_name"),
+            payload.get("relic_name"),
+            payload.get("potion_name"),
+            payload.get("card_name"),
+            reward_label(payload.get("reward_type")),
+            payload.get("type"),
+            "奖励",
+        )
+        return desc("领奖", f"{source} 领取 {reward}", context, "on", "macro")
+
+    if action_type == "skip_reward":
+        return desc("奖励", f"{source} 跳过奖励", context, "warn", "macro")
+
+    if action_type == "select_map_node":
+        node_type = first_label(node_label(payload.get("node_type")), node_label(payload.get("type")), "地图节点")
+        coord = []
+        if payload.get("col") is not None:
+            coord.append(f"列 {payload.get('col')}")
+        if payload.get("row") is not None:
+            coord.append(f"行 {payload.get('row')}")
+        detail = "，".join(coord + ([context] if context else []))
+        return desc("地图", f"{source} 前往 {node_type}", detail, "info", "macro")
+
+    if action_type == "choose_event_option":
+        event_screen = screen_state(record).get("event")
+        event_screen = event_screen if isinstance(event_screen, dict) else {}
+        options = list_field(event_screen, "options")
+        chosen_options = [option for option in options if isinstance(option, dict) and option.get("was_chosen")]
+        if not chosen_options and len(options) == 1 and isinstance(options[0], dict):
+            chosen_options = [options[0]]
+        chosen = chosen_options[0] if chosen_options else {}
+        event = first_label(payload.get("event_name"), event_screen.get("event_name"))
+        option = first_label(
+            payload.get("option_title"),
+            payload.get("option_name"),
+            chosen.get("title"),
+            chosen.get("relic_name"),
+            payload.get("index"),
+            "事件选项",
+        )
+        summary = f"{source} 选择 {option}"
+        if event:
+            summary = f"{source} 在 {event} 选择 {option}"
+        return desc("事件", summary, context, "warn", "macro")
+
+    if action_type == "choose_rest_option":
+        option = first_label(payload.get("option_name"), payload.get("rest_option"), payload.get("action"), "营火选项")
+        return desc("营火", f"{source} 选择 {option}", context, "warn", "macro")
+
+    if action_type == "buy_item":
+        name = first_label(payload.get("item_name"), payload.get("relic_name"), payload.get("card_name"), payload.get("potion_name"), payload.get("item_id"), "商品")
+        cost = payload.get("cost")
+        detail = f"花费 {cost} 金币" if cost is not None else context
+        if context and cost is not None:
+            detail = f"{detail}，{context}"
+        return desc("商店", f"{source} 购买 {name}", detail, "warn", "macro")
+
+    if rec_type == "battle_start":
+        battle = state_battle(state)
+        enemies = list_field(battle, "enemies")
+        enemy_names = [first_label(e.get("name"), e.get("id"), e.get("entity_id")) for e in enemies if isinstance(e, dict)]
+        detail = "，".join([x for x in [", ".join(enemy_names[:3]), context] if x])
+        return desc("战斗", "战斗开始", detail, "on", "combat")
+
+    if rec_type == "turn_start":
+        return desc("回合", "玩家回合开始", context, "info", "combat")
+
+    if rec_type == "turn_end":
+        return desc("回合", "玩家回合结束", context, "info", "combat")
+
+    if rec_type == "battle_end":
+        result = "胜利" if record.get("result") == "win" else ("失败" if record.get("result") == "lose" else clean_label(record.get("result")) or "结算")
+        hp = record.get("remaining_hp")
+        max_hp = record.get("max_hp")
+        rounds = record.get("rounds")
+        detail = []
+        if hp is not None and max_hp is not None:
+            detail.append(f"HP {hp}/{max_hp}")
+        if rounds is not None:
+            detail.append(f"{rounds} 回合")
+        if context:
+            detail.append(context)
+        return desc("结算", f"战斗{result}", "，".join(detail), "on" if record.get("result") == "win" else "warn", "combat")
+
+    if rec_type == "game_start":
+        return desc("开局", "记录到新游戏", context, "on", "system")
+
+    if rec_type == "game_resume":
+        return desc("续局", "记录到继续游戏", context, "info", "system")
+
+    if rec_type in ("run_end", "game_end", "victory"):
+        result = first_label(record.get("result"), "Run 结束")
+        return desc("Run", result, context, "on", "system")
+
+    label = first_label(action_type, rec_type, "记录")
+    result = first_label(record.get("result"))
+    summary = f"{source} {label}" if source != "-" else label
+    if result:
+        summary = f"{summary}：{result}"
+    return desc("记录", summary, context, "info", "system")
+
+
 def recent_records(limit=30):
     records = sorted(iter_recent_records(), key=lambda r: safe_int(r.get("timestamp")), reverse=True)[:limit]
     out = []
     for rec in records:
         ts = safe_int(rec.get("timestamp"))
+        description = describe_recent_record(rec)
         out.append({
             "time": datetime.fromtimestamp(ts / 1000).strftime("%H:%M:%S") if ts else "",
             "run_id": rec.get("run_id"),
             "type": rec.get("type"),
             "source": rec.get("source"),
+            "source_label": source_label(rec.get("source")),
             "action_type": rec.get("action_type") or (rec.get("decision") or {}).get("action"),
             "result": rec.get("result"),
             "round": rec.get("round") or (rec.get("state") or {}).get("round"),
             "file": rec.get("_file"),
+            "label": description.get("label"),
+            "summary": description.get("summary"),
+            "detail": description.get("detail"),
+            "tone": description.get("tone"),
+            "category": description.get("category"),
         })
     return out
 

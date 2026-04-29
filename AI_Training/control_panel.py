@@ -946,6 +946,42 @@ INDEX_HTML = r"""<!doctype html>
       display:block;
     }
     .status-sub { margin-top:4px; color:var(--muted); font-size:12px; overflow-wrap:anywhere; }
+    .live-panel {
+      margin-top:14px;
+      border:1px solid var(--line);
+      background:#fff;
+      border-radius:8px;
+      padding:14px;
+    }
+    .activity-feed { display:grid; gap:0; }
+    .activity-item {
+      display:grid;
+      grid-template-columns:32px minmax(0, 1fr) auto;
+      gap:10px;
+      align-items:center;
+      padding:8px 0;
+      border-top:1px solid #eef1f5;
+    }
+    .activity-item:first-child { border-top:0; padding-top:0; }
+    .activity-icon {
+      width:32px;
+      height:32px;
+      border-radius:8px;
+      border:1px solid var(--line);
+      display:grid;
+      place-items:center;
+      font-weight:800;
+      font-size:12px;
+      background:var(--panel-2);
+      color:var(--muted);
+    }
+    .activity-item.on .activity-icon { color:var(--good); border-color:#9ad6b8; background:var(--good-bg); }
+    .activity-item.warn .activity-icon { color:var(--warn); border-color:#fedf89; background:var(--warn-bg); }
+    .activity-item.off .activity-icon { color:var(--bad); border-color:#f4b5ad; background:var(--bad-bg); }
+    .activity-item.info .activity-icon { color:var(--blue); border-color:#b2ccff; background:var(--blue-bg); }
+    .activity-title { font-weight:700; overflow-wrap:anywhere; }
+    .activity-detail { color:var(--muted); font-size:12px; overflow-wrap:anywhere; }
+    .activity-time { color:var(--muted); font-size:12px; white-space:nowrap; }
     main {
       padding:20px 24px 28px;
       display:grid;
@@ -963,6 +999,29 @@ INDEX_HTML = r"""<!doctype html>
       padding:16px;
       box-shadow:var(--shadow);
       min-width:0;
+    }
+    .priority-grid {
+      display:grid;
+      grid-template-columns:minmax(0, 1.1fr) minmax(280px, .9fr);
+      gap:16px;
+      min-width:0;
+    }
+    .fold-panel { padding:0; overflow:hidden; }
+    .fold-panel details { padding:0; }
+    .fold-panel summary {
+      cursor:pointer;
+      display:flex;
+      justify-content:space-between;
+      align-items:center;
+      gap:10px;
+      padding:14px 16px;
+      list-style:none;
+    }
+    .fold-panel summary::-webkit-details-marker { display:none; }
+    .fold-title { font-size:15px; font-weight:700; }
+    .fold-body {
+      border-top:1px solid #eef1f5;
+      padding:14px 16px 16px;
     }
     .section-head {
       display:flex;
@@ -1133,6 +1192,7 @@ INDEX_HTML = r"""<!doctype html>
     @media (max-width: 1120px) {
       .status-grid { grid-template-columns:repeat(2, minmax(160px, 1fr)); }
       main { grid-template-columns:1fr; }
+      .priority-grid { grid-template-columns:1fr; }
       .sidebar { max-width:none; }
     }
     @media (max-width: 720px) {
@@ -1140,6 +1200,8 @@ INDEX_HTML = r"""<!doctype html>
       main { padding:14px; }
       .topbar { display:block; }
       .status-grid, .metric-grid { grid-template-columns:1fr; }
+      .activity-item { grid-template-columns:28px minmax(0, 1fr); }
+      .activity-time { grid-column:2; }
       .button-row { grid-template-columns:1fr; }
     }
   </style>
@@ -1173,6 +1235,15 @@ INDEX_HTML = r"""<!doctype html>
         <div class="status-title">当前 Run</div>
         <div id="runQuality" class="status-main">读取中</div>
         <div id="runDetail" class="status-sub">-</div>
+      </div>
+    </div>
+    <div class="live-panel">
+      <div class="section-head">
+        <h2>实时采集动态</h2>
+        <span id="activityBadge" class="pill info">读取中</span>
+      </div>
+      <div id="liveActivity" class="activity-feed">
+        <div class="muted">读取中</div>
       </div>
     </div>
   </header>
@@ -1213,19 +1284,25 @@ INDEX_HTML = r"""<!doctype html>
         </div>
       </section>
 
-      <section>
-        <div class="section-head">
-          <h2>模型与进程</h2>
-          <span id="modelBadge" class="pill">-</span>
-        </div>
-        <div id="modelHealth">读取中</div>
+      <section class="fold-panel">
+        <details>
+          <summary>
+            <span class="fold-title">模型与进程</span>
+            <span id="modelBadge" class="pill">-</span>
+          </summary>
+          <div class="fold-body">
+            <div id="modelHealth">读取中</div>
+          </div>
+        </details>
       </section>
 
-      <section id="llmConfigSection">
-        <div class="section-head">
-          <h2>LLM 模型接入</h2>
-          <span id="llmProcessBadge" class="pill">-</span>
-        </div>
+      <section id="llmConfigSection" class="fold-panel">
+        <details>
+          <summary>
+            <span class="fold-title">LLM 模型接入</span>
+            <span id="llmProcessBadge" class="pill">-</span>
+          </summary>
+          <div class="fold-body">
         <div class="button-row">
           <button class="good" onclick="startLLM()">启动 LLM</button>
           <button class="bad" onclick="stopLLM()">停止 LLM</button>
@@ -1277,13 +1354,17 @@ INDEX_HTML = r"""<!doctype html>
             <tbody id="llmProfiles"></tbody>
           </table>
         </div>
+          </div>
+        </details>
       </section>
 
-      <section>
-        <div class="section-head">
-          <h2>采集与训练</h2>
-          <span id="collectBadge" class="pill">-</span>
-        </div>
+      <section class="fold-panel">
+        <details>
+          <summary>
+            <span class="fold-title">采集与训练</span>
+            <span id="collectBadge" class="pill">-</span>
+          </summary>
+          <div class="fold-body">
         <div class="switch">
           <div><div class="switch-title">采集总开关</div><div class="switch-note">打开才写入战斗/宏观日志；关闭后不采集本局后续动作</div></div>
           <input id="collection_enabled" type="checkbox" onchange="saveControl()">
@@ -1303,60 +1384,72 @@ INDEX_HTML = r"""<!doctype html>
           <button class="primary" onclick="train()">重建数据 + 重训战斗/候选/宏观 BC</button>
           <button onclick="proceed()">Proceed</button>
         </div>
+          </div>
+        </details>
       </section>
 
-      <section>
-        <div class="section-head">
-          <h2>数据打包</h2>
-          <span id="exportBadge" class="pill info">未导出</span>
-        </div>
+      <section class="fold-panel">
+        <details>
+          <summary>
+            <span class="fold-title">数据打包</span>
+            <span id="exportBadge" class="pill info">未导出</span>
+          </summary>
+          <div class="fold-body">
         <button class="primary" onclick="exportData()">一键打包数据库</button>
         <div id="exportInfo" class="fine" style="margin-top:10px">生成 zip 后，直接把这个文件发给你。</div>
+          </div>
+        </details>
       </section>
 
-      <section>
-        <div class="section-head">
-          <h2>主菜单标记</h2>
-          <span id="nextRunBadge" class="pill info">-</span>
-        </div>
+      <section class="fold-panel">
+        <details>
+          <summary>
+            <span class="fold-title">主菜单标记</span>
+            <span id="nextRunBadge" class="pill info">-</span>
+          </summary>
+          <div class="fold-body">
         <div class="segmented">
           <button id="modeAuto" onclick="setRunMode('auto')">自动检测</button>
           <button id="modeNew" onclick="setRunMode('new')">强制新局一次</button>
           <button id="modeContinue" onclick="setRunMode('continue')">续接旧 Run</button>
         </div>
         <div class="fine" style="margin-top:10px">推荐用自动检测。手动按钮仍保留：如果你在主菜单明确要重开，点“强制新局一次”；如果是中途接回旧档，点“续接旧 Run”。</div>
+          </div>
+        </details>
       </section>
     </div>
 
     <div class="stack content">
+      <div class="priority-grid">
+        <section>
+          <div class="section-head">
+            <h2>AI 出牌逻辑</h2>
+            <span id="aiDecisionBadge" class="pill">-</span>
+          </div>
+          <div id="aiLogic" class="muted">暂无 AI 决策</div>
+          <div class="table-wrap" style="margin-top:10px">
+            <table>
+              <thead><tr><th>候选动作</th><th>概率</th><th>状态</th></tr></thead>
+              <tbody id="aiTopActions"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section>
+          <div class="section-head">
+            <h2>LLM 决策</h2>
+            <span id="llmDecisionBadge" class="pill">-</span>
+          </div>
+          <div id="llmLogic" class="muted">暂无 LLM 决策</div>
+        </section>
+      </div>
+
       <section>
         <div class="section-head">
           <h2>Run 数据体检</h2>
           <span id="currentDataBadge" class="pill">读取中</span>
         </div>
         <div id="currentData">读取中</div>
-      </section>
-
-      <section>
-        <div class="section-head">
-          <h2>AI 出牌逻辑</h2>
-          <span id="aiDecisionBadge" class="pill">-</span>
-        </div>
-        <div id="aiLogic" class="muted">暂无 AI 决策</div>
-        <div class="table-wrap" style="margin-top:10px">
-          <table>
-            <thead><tr><th>候选动作</th><th>概率</th><th>状态</th></tr></thead>
-            <tbody id="aiTopActions"></tbody>
-          </table>
-        </div>
-      </section>
-
-      <section>
-        <div class="section-head">
-          <h2>LLM 决策</h2>
-          <span id="llmDecisionBadge" class="pill">-</span>
-        </div>
-        <div id="llmLogic" class="muted">暂无 LLM 决策</div>
       </section>
 
       <section>
@@ -1394,13 +1487,16 @@ INDEX_HTML = r"""<!doctype html>
           <h2>最近采集记录</h2>
           <span class="fine">原始事件流</span>
         </div>
-        <div class="notice">这里不是“每个 Run 一行”，而是 Mod/AI 写入的原始事件流：战斗开始、回合开始、出牌、回合结束、奖励、地图等都会各占一条。看 run 总结优先看上面的“最近 Run”。</div>
-        <div class="table-wrap">
-          <table>
-            <thead><tr><th>时间</th><th>记录类型</th><th>来源</th><th>动作/结果</th><th>文件</th></tr></thead>
-            <tbody id="recentRecords"></tbody>
-          </table>
-        </div>
+        <details class="more-panel">
+          <summary>展开原始事件表</summary>
+          <div class="notice">这里不是“每个 Run 一行”，而是 Mod/AI 写入的原始事件流：战斗开始、回合开始、出牌、回合结束、奖励、地图等都会各占一条。顶部“实时采集动态”是给人看的摘要，这里保留给排查字段。</div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>时间</th><th>记录类型</th><th>来源</th><th>摘要</th><th>文件</th></tr></thead>
+              <tbody id="recentRecords"></tbody>
+            </table>
+          </div>
+        </details>
       </section>
 
       <section>
@@ -1593,6 +1689,7 @@ function renderStatus(s) {
   renderCurrentData(s.current_data);
   renderRuns(s.runs || []);
   renderPolicyEvaluation(s.evaluation || {});
+  renderLiveActivity(s.recent_records || []);
   renderRecentRecords(s.recent_records || []);
   renderModelHealth(s.models || {}, s.ai_process || {}, s.control || {}, s.python_runtime || {});
   renderAiLogic(s.ai_logic);
@@ -1739,6 +1836,43 @@ function renderPolicyEvaluation(evaluation) {
     </tr>`).join("");
   document.getElementById("policyEval").innerHTML = rows || "<tr><td colspan=6>暂无可评测 run</td></tr>";
 }
+function activityIcon(record) {
+  const action = record.action_type || record.type || "";
+  const label = record.label || "";
+  if (action === "play_card") return "牌";
+  if (action === "use_potion") return "药";
+  if (action === "choose_card") return "选";
+  if (action === "claim_reward") return "奖";
+  if (action === "select_map_node") return "图";
+  if (action === "choose_event_option") return "事";
+  if (action === "buy_item") return "商";
+  if (record.type === "battle_end") return "结";
+  if (record.type === "battle_start") return "战";
+  return (label || "记").slice(0, 1);
+}
+function renderLiveActivity(records) {
+  const items = (records || []).slice(0, 5);
+  setPill("activityBadge", items.length ? `最近 ${items.length} 条` : "暂无记录", items.length ? "info" : "warn");
+  const root = document.getElementById("liveActivity");
+  if (!items.length) {
+    root.innerHTML = '<div class="muted">暂无采集记录。进入游戏后这里会显示出牌、药水、选卡、领奖和地图动作。</div>';
+    return;
+  }
+  root.innerHTML = items.map(r => {
+    const tone = ["on", "warn", "off", "info"].includes(r.tone) ? r.tone : "info";
+    const summary = escapeHtml(r.summary || r.action_type || r.type || "记录");
+    const detail = escapeHtml(r.detail || r.file || "");
+    return `
+      <div class="activity-item ${tone}">
+        <div class="activity-icon">${escapeHtml(activityIcon(r))}</div>
+        <div>
+          <div class="activity-title">${summary}</div>
+          <div class="activity-detail">${detail}</div>
+        </div>
+        <div class="activity-time">${escapeHtml(r.time || "")}</div>
+      </div>`;
+  }).join("");
+}
 function renderRecentRecords(records) {
   const typeLabels = {
     game_start: "开局",
@@ -1752,7 +1886,7 @@ function renderRecentRecords(records) {
     run_end: "Run 结束"
   };
   document.getElementById("recentRecords").innerHTML = records.slice(0, 12).map(r => `
-    <tr><td>${r.time || ""}</td><td>${typeLabels[r.type] || r.type || ""}</td><td>${r.source || ""}</td><td>${r.action_type || r.result || ""}</td><td>${r.file || ""}</td></tr>
+    <tr><td>${escapeHtml(r.time || "")}</td><td>${escapeHtml(typeLabels[r.type] || r.type || "")}</td><td>${escapeHtml(r.source_label || r.source || "")}</td><td>${escapeHtml(r.summary || r.action_type || r.result || "")}<br><span class="fine">${escapeHtml(r.detail || "")}</span></td><td>${escapeHtml(r.file || "")}</td></tr>
   `).join("") || "<tr><td colspan=5>暂无记录</td></tr>";
 }
 function renderAiLogic(logic) {
