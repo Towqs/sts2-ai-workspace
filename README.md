@@ -1,5 +1,9 @@
 # STS2 AI Workspace
 
+<p align="center">
+  <img src="AI_Training/assets/sts2_ai_logo.png" alt="STS2 AI Logo" width="180">
+</p>
+
 这是一个 Slay the Spire 2 半自动 AI 工作区，用于本地数据采集、网页控制台、BC 模型训练，以及 OpenAI-compatible 大模型接入。
 
 当前工作流是：玩家负责宏观判断，AI 可以托管战斗；也可以打开宏观 AI，让模型自动处理地图、奖励、选卡、事件和营火。商店自动购买默认关闭，避免和玩家抢操作。
