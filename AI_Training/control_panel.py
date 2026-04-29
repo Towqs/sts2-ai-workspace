@@ -1514,6 +1514,99 @@ INDEX_HTML = r"""<!doctype html>
       padding:16px;
       box-shadow:0 22px 54px rgba(38,55,58,.24);
     }
+    .module-library {
+      padding:15px;
+      background:linear-gradient(135deg, rgba(255,254,250,.98), rgba(237,245,242,.96));
+    }
+    .module-library::after { display:none; }
+    .library-head {
+      display:grid;
+      grid-template-columns:minmax(0, 1fr) auto;
+      align-items:center;
+      gap:10px;
+      margin-bottom:12px;
+    }
+    .module-groups { display:grid; gap:12px; }
+    .module-group { display:grid; gap:7px; }
+    .module-group-title {
+      color:var(--muted);
+      font-size:12px;
+      font-weight:850;
+      padding-left:2px;
+    }
+    .module-item {
+      width:100%;
+      display:grid;
+      grid-template-columns:18px minmax(0, 1fr) auto;
+      align-items:center;
+      gap:9px;
+      min-height:42px;
+      padding:9px 10px;
+      text-align:left;
+      border-color:var(--line);
+      background:#fff;
+      color:var(--ink);
+      border-radius:12px;
+    }
+    .module-item:hover { background:var(--surface-tint); }
+    .module-item.active {
+      border-color:rgba(47,111,120,.38);
+      background:var(--primary-bg);
+    }
+    .module-item.dragging { opacity:.58; }
+    .module-glyph {
+      width:16px;
+      height:16px;
+      border:1px solid rgba(47,111,120,.44);
+      background:linear-gradient(135deg, #fff 0 48%, rgba(209,162,58,.24) 49%);
+      transform:rotate(45deg);
+    }
+    .module-label { min-width:0; font-weight:850; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .module-state { color:var(--muted); font-size:12px; font-weight:800; }
+    .workspace {
+      min-height:360px;
+      border-radius:18px;
+      transition:background .15s ease, outline-color .15s ease;
+    }
+    .workspace.drop-ready {
+      outline:2px dashed rgba(47,111,120,.45);
+      outline-offset:8px;
+      background:rgba(229,242,243,.45);
+    }
+    .module-card {
+      transition:opacity .15s ease, transform .15s ease, box-shadow .15s ease;
+    }
+    .module-card.is-hidden { display:none; }
+    .module-card.is-collapsed {
+      padding-bottom:14px;
+    }
+    .module-card.is-collapsed > :not(.section-head) { display:none; }
+    .module-card.flash {
+      box-shadow:0 0 0 3px rgba(209,162,58,.34), var(--shadow-soft);
+    }
+    .module-actions {
+      display:flex;
+      align-items:center;
+      justify-content:flex-end;
+      gap:7px;
+      min-width:0;
+    }
+    .module-action {
+      min-width:30px;
+      width:30px;
+      height:30px;
+      min-height:30px;
+      padding:0;
+      display:inline-grid;
+      place-items:center;
+      border-radius:9px;
+      font-size:16px;
+      line-height:1;
+      color:var(--primary-strong);
+      border-color:rgba(47,111,120,.30);
+      background:#fff;
+    }
+    .module-action:hover { background:var(--primary-bg); }
     @media (max-width: 1120px) {
       .status-grid { grid-template-columns:repeat(2, minmax(160px, 1fr)); }
       main { grid-template-columns:1fr; }
@@ -1586,6 +1679,45 @@ INDEX_HTML = r"""<!doctype html>
 
   <main>
     <div class="stack sidebar">
+      <section class="module-library">
+        <div class="library-head">
+          <h2>工作区</h2>
+          <span id="openModuleCount" class="pill info">-</span>
+        </div>
+        <div class="module-groups">
+          <div class="module-group">
+            <div class="module-group-title">决策</div>
+            <button class="module-item" data-module-target="ai_logic" draggable="true" onclick="openModule('ai_logic')" ondragstart="beginModuleDrag(event, 'ai_logic')" ondragend="endModuleDrag(event)">
+              <span class="module-glyph"></span><span class="module-label">AI 出牌逻辑</span><span class="module-state">打开</span>
+            </button>
+            <button class="module-item" data-module-target="llm_logic" draggable="true" onclick="openModule('llm_logic')" ondragstart="beginModuleDrag(event, 'llm_logic')" ondragend="endModuleDrag(event)">
+              <span class="module-glyph"></span><span class="module-label">LLM 决策</span><span class="module-state">打开</span>
+            </button>
+          </div>
+          <div class="module-group">
+            <div class="module-group-title">数据</div>
+            <button class="module-item" data-module-target="current_data" draggable="true" onclick="openModule('current_data')" ondragstart="beginModuleDrag(event, 'current_data')" ondragend="endModuleDrag(event)">
+              <span class="module-glyph"></span><span class="module-label">Run 数据体检</span><span class="module-state">打开</span>
+            </button>
+            <button class="module-item" data-module-target="runs" draggable="true" onclick="openModule('runs')" ondragstart="beginModuleDrag(event, 'runs')" ondragend="endModuleDrag(event)">
+              <span class="module-glyph"></span><span class="module-label">最近 Run</span><span class="module-state">打开</span>
+            </button>
+            <button class="module-item" data-module-target="records" draggable="true" onclick="openModule('records')" ondragstart="beginModuleDrag(event, 'records')" ondragend="endModuleDrag(event)">
+              <span class="module-glyph"></span><span class="module-label">最近采集记录</span><span class="module-state">打开</span>
+            </button>
+          </div>
+          <div class="module-group">
+            <div class="module-group-title">训练</div>
+            <button class="module-item" data-module-target="evaluation" draggable="true" onclick="openModule('evaluation')" ondragstart="beginModuleDrag(event, 'evaluation')" ondragend="endModuleDrag(event)">
+              <span class="module-glyph"></span><span class="module-label">策略评测</span><span class="module-state">打开</span>
+            </button>
+            <button class="module-item" data-module-target="training" draggable="true" onclick="openModule('training')" ondragstart="beginModuleDrag(event, 'training')" ondragend="endModuleDrag(event)">
+              <span class="module-glyph"></span><span class="module-label">训练输出</span><span class="module-state">打开</span>
+            </button>
+          </div>
+        </div>
+      </section>
+
       <section class="fold-panel">
         <details open>
           <summary>
@@ -1759,12 +1891,16 @@ INDEX_HTML = r"""<!doctype html>
       </section>
     </div>
 
-    <div class="stack content">
+    <div id="workspace" class="stack content workspace" ondragover="handleWorkspaceDragOver(event)" ondragleave="handleWorkspaceDragLeave(event)" ondrop="handleWorkspaceDrop(event)">
       <div class="priority-grid">
-        <section>
+        <section id="module-ai-logic" class="module-card" data-module="ai_logic">
           <div class="section-head">
             <h2>AI 出牌逻辑</h2>
-            <span id="aiDecisionBadge" class="pill">-</span>
+            <div class="module-actions">
+              <span id="aiDecisionBadge" class="pill">-</span>
+              <button class="module-action" onclick="toggleModuleCollapse('ai_logic')" data-collapse-for="ai_logic" title="收起">-</button>
+              <button class="module-action" onclick="closeModule('ai_logic')" title="关闭">×</button>
+            </div>
           </div>
           <div id="aiLogic" class="muted">暂无 AI 决策</div>
           <div class="table-wrap" style="margin-top:10px">
@@ -1775,27 +1911,39 @@ INDEX_HTML = r"""<!doctype html>
           </div>
         </section>
 
-        <section>
+        <section id="module-llm-logic" class="module-card" data-module="llm_logic">
           <div class="section-head">
             <h2>LLM 决策</h2>
-            <span id="llmDecisionBadge" class="pill">-</span>
+            <div class="module-actions">
+              <span id="llmDecisionBadge" class="pill">-</span>
+              <button class="module-action" onclick="toggleModuleCollapse('llm_logic')" data-collapse-for="llm_logic" title="收起">-</button>
+              <button class="module-action" onclick="closeModule('llm_logic')" title="关闭">×</button>
+            </div>
           </div>
           <div id="llmLogic" class="muted">暂无 LLM 决策</div>
         </section>
       </div>
 
-      <section>
+      <section id="module-current-data" class="module-card" data-module="current_data">
         <div class="section-head">
           <h2>Run 数据体检</h2>
-          <span id="currentDataBadge" class="pill">读取中</span>
+          <div class="module-actions">
+            <span id="currentDataBadge" class="pill">读取中</span>
+            <button class="module-action" onclick="toggleModuleCollapse('current_data')" data-collapse-for="current_data" title="收起">-</button>
+            <button class="module-action" onclick="closeModule('current_data')" title="关闭">×</button>
+          </div>
         </div>
         <div id="currentData">读取中</div>
       </section>
 
-      <section>
+      <section id="module-runs" class="module-card" data-module="runs">
         <div class="section-head">
           <h2>最近 Run</h2>
-          <span id="runsBadge" class="pill info">-</span>
+          <div class="module-actions">
+            <span id="runsBadge" class="pill info">-</span>
+            <button class="module-action" onclick="toggleModuleCollapse('runs')" data-collapse-for="runs" title="收起">-</button>
+            <button class="module-action" onclick="closeModule('runs')" title="关闭">×</button>
+          </div>
         </div>
         <div id="latestRunCard" class="compact-card">读取中</div>
         <details class="more-panel">
@@ -1809,10 +1957,14 @@ INDEX_HTML = r"""<!doctype html>
         </details>
       </section>
 
-      <section>
+      <section id="module-evaluation" class="module-card" data-module="evaluation">
         <div class="section-head">
           <h2>策略评测</h2>
-          <span id="evalBadge" class="pill info">读取中</span>
+          <div class="module-actions">
+            <span id="evalBadge" class="pill info">读取中</span>
+            <button class="module-action" onclick="toggleModuleCollapse('evaluation')" data-collapse-for="evaluation" title="收起">-</button>
+            <button class="module-action" onclick="closeModule('evaluation')" title="关闭">×</button>
+          </div>
         </div>
         <div class="table-wrap">
           <table>
@@ -1822,10 +1974,14 @@ INDEX_HTML = r"""<!doctype html>
         </div>
       </section>
 
-      <section>
+      <section id="module-records" class="module-card" data-module="records">
         <div class="section-head">
           <h2>最近采集记录</h2>
-          <span class="fine">原始事件流</span>
+          <div class="module-actions">
+            <span class="fine">原始事件流</span>
+            <button class="module-action" onclick="toggleModuleCollapse('records')" data-collapse-for="records" title="收起">-</button>
+            <button class="module-action" onclick="closeModule('records')" title="关闭">×</button>
+          </div>
         </div>
         <details class="more-panel">
           <summary>原始事件表</summary>
@@ -1839,10 +1995,14 @@ INDEX_HTML = r"""<!doctype html>
         </details>
       </section>
 
-      <section>
+      <section id="module-training" class="module-card" data-module="training">
         <div class="section-head">
           <h2>训练输出</h2>
-          <span id="trainStatus" class="pill">-</span>
+          <div class="module-actions">
+            <span id="trainStatus" class="pill">-</span>
+            <button class="module-action" onclick="toggleModuleCollapse('training')" data-collapse-for="training" title="收起">-</button>
+            <button class="module-action" onclick="closeModule('training')" title="关闭">×</button>
+          </div>
         </div>
         <pre id="trainOutput">暂无输出</pre>
       </section>
@@ -1940,6 +2100,121 @@ function dataHealthClass(health) {
   if (health === "missing") return "off";
   if (health === "warn") return "warn";
   return "info";
+}
+const MODULE_IDS = ["ai_logic", "llm_logic", "current_data", "runs", "records", "evaluation", "training"];
+const MODULE_STORAGE_KEY = "sts2_control_panel_modules";
+function defaultModuleState() {
+  return Object.fromEntries(MODULE_IDS.map(id => [id, {open:true, collapsed:false}]));
+}
+function readModuleState() {
+  const state = defaultModuleState();
+  try {
+    const saved = JSON.parse(localStorage.getItem(MODULE_STORAGE_KEY) || "{}");
+    for (const id of MODULE_IDS) {
+      if (saved[id]) {
+        state[id].open = saved[id].open !== false;
+        state[id].collapsed = !!saved[id].collapsed;
+      }
+    }
+  } catch (_) {}
+  return state;
+}
+let moduleState = readModuleState();
+let draggingModuleId = "";
+function saveModuleState() {
+  localStorage.setItem(MODULE_STORAGE_KEY, JSON.stringify(moduleState));
+}
+function moduleElement(id) {
+  return document.querySelector(`.module-card[data-module="${id}"]`);
+}
+function syncModuleUI() {
+  let openCount = 0;
+  for (const id of MODULE_IDS) {
+    const state = moduleState[id] || {open:true, collapsed:false};
+    const card = moduleElement(id);
+    if (card) {
+      card.classList.toggle("is-hidden", !state.open);
+      card.classList.toggle("is-collapsed", !!state.collapsed);
+    }
+    const dock = document.querySelector(`.module-item[data-module-target="${id}"]`);
+    if (dock) {
+      dock.classList.toggle("active", !!state.open);
+      const label = dock.querySelector(".module-state");
+      if (label) label.textContent = state.open ? (state.collapsed ? "收起" : "打开") : "关闭";
+    }
+    const collapseButton = document.querySelector(`[data-collapse-for="${id}"]`);
+    if (collapseButton) {
+      collapseButton.textContent = state.collapsed ? "+" : "-";
+      collapseButton.title = state.collapsed ? "展开" : "收起";
+    }
+    if (state.open) openCount++;
+  }
+  const count = document.getElementById("openModuleCount");
+  if (count) count.textContent = `${openCount}/${MODULE_IDS.length}`;
+}
+function flashModule(card) {
+  if (!card) return;
+  card.classList.remove("flash");
+  void card.offsetWidth;
+  card.classList.add("flash");
+  window.setTimeout(() => card.classList.remove("flash"), 900);
+}
+function openModule(id, opts = {}) {
+  if (!MODULE_IDS.includes(id)) return;
+  moduleState[id] = {open:true, collapsed:false};
+  saveModuleState();
+  syncModuleUI();
+  const card = moduleElement(id);
+  flashModule(card);
+  if (opts.scroll !== false && card) {
+    card.scrollIntoView({behavior:"smooth", block:"start"});
+  }
+}
+function closeModule(id) {
+  if (!MODULE_IDS.includes(id)) return;
+  moduleState[id] = {...(moduleState[id] || {}), open:false};
+  saveModuleState();
+  syncModuleUI();
+}
+function toggleModuleCollapse(id) {
+  if (!MODULE_IDS.includes(id)) return;
+  const current = moduleState[id] || {open:true, collapsed:false};
+  moduleState[id] = {open:true, collapsed:!current.collapsed};
+  saveModuleState();
+  syncModuleUI();
+  flashModule(moduleElement(id));
+}
+function beginModuleDrag(event, id) {
+  draggingModuleId = id;
+  event.dataTransfer.setData("text/plain", id);
+  event.dataTransfer.effectAllowed = "copy";
+  event.currentTarget.classList.add("dragging");
+}
+function endModuleDrag(event) {
+  draggingModuleId = "";
+  event.currentTarget.classList.remove("dragging");
+  const workspace = document.getElementById("workspace");
+  if (workspace) workspace.classList.remove("drop-ready");
+}
+function handleWorkspaceDragOver(event) {
+  const id = draggingModuleId || event.dataTransfer.getData("text/plain");
+  if (!MODULE_IDS.includes(id)) return;
+  event.preventDefault();
+  event.dataTransfer.dropEffect = "copy";
+  event.currentTarget.classList.add("drop-ready");
+}
+function handleWorkspaceDragLeave(event) {
+  if (!event.currentTarget.contains(event.relatedTarget)) {
+    event.currentTarget.classList.remove("drop-ready");
+  }
+}
+function handleWorkspaceDrop(event) {
+  const id = draggingModuleId || event.dataTransfer.getData("text/plain");
+  if (!MODULE_IDS.includes(id)) return;
+  event.preventDefault();
+  event.currentTarget.classList.remove("drop-ready");
+  draggingModuleId = "";
+  openModule(id, {scroll:false});
 }
 let llmFormDirty = false;
 let llmProfilesCache = [];
@@ -2432,6 +2707,7 @@ async function exportData(){
     document.getElementById("exportInfo").textContent = result.error || "导出失败";
   }
 }
+syncModuleUI();
 refresh();
 setInterval(refresh, 5000);
 </script>
