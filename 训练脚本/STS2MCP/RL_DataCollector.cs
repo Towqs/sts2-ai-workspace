@@ -130,6 +130,8 @@ namespace STS2_MCP
 
         // v3: 数据来源追踪
         private static DataSource _currentDataSource = DataSource.Human;
+        private static string? _currentPolicyName;
+        private static string? _currentModelVersion;
         // v3: MCP 防重复记录（记录上一个动作的哈希）
         private static string? _lastActionHash;
         private static long _lastActionTimestamp = 0;
@@ -161,6 +163,11 @@ namespace STS2_MCP
         {
             if (_currentDataSource == source) return;
             _currentDataSource = source;
+            if (source == DataSource.Human)
+            {
+                _currentPolicyName = null;
+                _currentModelVersion = null;
+            }
             // 关闭旧 writer，下一次写入时会按新来源目录重建
             try { _combatWriter?.Close(); } catch { }
             try { _macroWriter?.Close(); } catch { }
@@ -171,6 +178,12 @@ namespace STS2_MCP
 
         // v3: 获取当前数据来源
         public static DataSource GetDataSource() => _currentDataSource;
+
+        public static void SetPolicyContext(string? policyName, string? modelVersion)
+        {
+            _currentPolicyName = string.IsNullOrWhiteSpace(policyName) ? null : policyName;
+            _currentModelVersion = string.IsNullOrWhiteSpace(modelVersion) ? null : modelVersion;
+        }
 
         public static void StartNewRun()
         {

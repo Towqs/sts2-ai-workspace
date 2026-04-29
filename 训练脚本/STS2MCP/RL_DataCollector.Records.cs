@@ -35,6 +35,16 @@ namespace STS2_MCP
                 record["schema_version"] = SchemaVersion;
         }
 
+        private static void StampPolicyContext(Dictionary<string, object> record)
+        {
+            if (_currentDataSource != DataSource.AI)
+                return;
+            if (!string.IsNullOrWhiteSpace(_currentPolicyName) && !record.ContainsKey("policy_name"))
+                record["policy_name"] = _currentPolicyName;
+            if (!string.IsNullOrWhiteSpace(_currentModelVersion) && !record.ContainsKey("model_version"))
+                record["model_version"] = _currentModelVersion;
+        }
+
         private static void WriteCombatRecord(Dictionary<string, object> record)
         {
             try
@@ -45,6 +55,7 @@ namespace STS2_MCP
                     return;
                 }
                 StampSchemaVersion(record);
+                StampPolicyContext(record);
                 var writer = GetCombatWriter();
                 lock (writer)
                 {
@@ -69,6 +80,7 @@ namespace STS2_MCP
                     return;
                 }
                 StampSchemaVersion(record);
+                StampPolicyContext(record);
                 var writer = GetMacroWriter();
                 lock (writer)
                 {

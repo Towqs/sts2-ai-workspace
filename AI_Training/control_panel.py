@@ -13,6 +13,7 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from evaluation_summary import evaluation_summary
 from run_summary import (
     QUALITY_ORDER,
     current_data_summary,
@@ -749,6 +750,7 @@ def status_payload():
         "runs": latest_runs(),
         "current_data": current_data_summary(),
         "recent_records": recent_records(),
+        "evaluation": evaluation_summary(limit=50),
         "ai_logic": ai_logic_snapshot(),
         "llm": {
             "config": read_llm_config(mask_key=True),
@@ -1239,6 +1241,19 @@ INDEX_HTML = r"""<!doctype html>
 
       <section>
         <div class="section-head">
+          <h2>策略评测</h2>
+          <span id="evalBadge" class="pill info">读取中</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>策略</th><th>Run</th><th>平均/最高楼层</th><th>结果</th><th>问题</th><th>最近</th></tr></thead>
+            <tbody id="policyEval"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section>
+        <div class="section-head">
           <h2>最近采集记录</h2>
           <span class="fine">最近 12 条</span>
         </div>
@@ -1436,6 +1451,7 @@ function renderStatus(s) {
 
   renderCurrentData(s.current_data);
   renderRuns(s.runs || []);
+  renderPolicyEvaluation(s.evaluation || {});
   renderRecentRecords(s.recent_records || []);
   renderModelHealth(s.models || {}, s.ai_process || {}, s.control || {});
   renderAiLogic(s.ai_logic);
@@ -1549,6 +1565,20 @@ function renderRuns(runs) {
       <td><button onclick="markRun('${run.run_id}', ${!run.discarded})">${run.discarded ? "保留" : "丢弃"}</button></td>
     </tr>`).join("");
   document.getElementById("runs").innerHTML = rows || "<tr><td colspan=9>暂无数据</td></tr>";
+}
+function renderPolicyEvaluation(evaluation) {
+  const policies = evaluation.policies || [];
+  setPill("evalBadge", `${evaluation.total_runs || 0} 个 run`, policies.length ? "info" : "warn");
+  const rows = policies.map(p => `
+    <tr>
+      <td>${p.policy_label || p.policy_name || "-"}</td>
+      <td>${p.runs || 0}<br><span class="fine">保留 ${p.kept_runs || 0} / 丢弃 ${p.discarded_runs || 0}</span></td>
+      <td>${p.avg_floor || 0} / ${p.max_floor || 0}<br><span class="fine">最高 Act ${p.max_act || 0}</span></td>
+      <td>胜 ${p.wins || 0}<br><span class="fine">败 ${p.losses || 0}</span></td>
+      <td>非法 ${p.invalid_actions || 0}<br><span class="fine">卡住 ${p.stuck_count || 0}，缺数据 ${p.data_missing || 0}</span></td>
+      <td><span class="fine">${p.latest_time || "-"}</span></td>
+    </tr>`).join("");
+  document.getElementById("policyEval").innerHTML = rows || "<tr><td colspan=6>暂无可评测 run</td></tr>";
 }
 function renderRecentRecords(records) {
   document.getElementById("recentRecords").innerHTML = records.slice(0, 12).map(r => `

@@ -33,6 +33,16 @@ DEFAULT_CONTROL = {
 
 from train_bc import CombatBCModel
 
+def build_model_version(prefix, metadata_path, metadata):
+    samples = metadata.get("samples", 0)
+    features = metadata.get("features", 0)
+    try:
+        stamp = datetime.fromtimestamp(os.path.getmtime(metadata_path)).strftime("%Y%m%d%H%M%S")
+    except Exception:
+        stamp = "unknown"
+    return f"{prefix}:s{samples}:f{features}:{stamp}"
+
+
 def load_agent(processed_dir):
     vocab_path = os.path.join(processed_dir, 'vocab.json')
     model_path = os.path.join(processed_dir, 'bc_model_best.pth')
@@ -51,6 +61,7 @@ def load_agent(processed_dir):
             metadata = json.load(f)
     except Exception:
         pass
+    metadata["model_version"] = metadata.get("model_version") or build_model_version("bc_combat", metadata_path, metadata)
     state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
     weight_input_dim = int(state_dict.get("net.0.weight").shape[1])
     input_dim = int(metadata.get("features") or weight_input_dim)
@@ -64,7 +75,7 @@ def load_agent(processed_dir):
     model.eval()
     
     print(Fore.CYAN + f"[*] AI Brain Loaded! Action space: {output_dim} | Features: {input_dim} | Device: {device}")
-    return encoded, id_to_action, model, device
+    return encoded, id_to_action, model, device, metadata
 
 
 def align_feature_vector(vector, expected_dim):
@@ -91,6 +102,7 @@ def load_macro_agent(processed_dir):
             metadata = json.load(f)
     except Exception:
         pass
+    metadata["model_version"] = metadata.get("model_version") or build_model_version("macro_bc", metadata_path, metadata)
     input_dim = int(metadata.get("features") or 115)
     output_dim = len(vocab.tables["actions"])
 
@@ -99,7 +111,7 @@ def load_macro_agent(processed_dir):
     model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
     model.eval()
     print(Fore.CYAN + f"[*] Macro Brain Loaded! Action space: {output_dim} | Features: {input_dim} | Device: {device}")
-    return {"vocab": vocab, "id_to_action": id_to_action, "model": model, "device": device, "input_dim": input_dim}
+    return {"vocab": vocab, "id_to_action": id_to_action, "model": model, "device": device, "input_dim": input_dim, "metadata": metadata, "model_version": metadata["model_version"]}
 
 
 def room_type_for_state(state_type):
@@ -681,7 +693,16 @@ def load_control():
     return control
 
 
-def append_ai_action_log(session_id, action_payload, state_before, state_after, ok):
+def payload_with_policy(payload, policy_name, model_version):
+    if not payload:
+        return payload
+    tagged = dict(payload)
+    tagged["policy_name"] = policy_name
+    tagged["model_version"] = model_version
+    return tagged
+
+
+def append_ai_action_log(session_id, action_payload, state_before, state_after, ok, policy_name="", model_version=""):
     control = load_control()
     if not control.get("record_ai_actions", True):
         return
@@ -693,6 +714,8 @@ def append_ai_action_log(session_id, action_payload, state_before, state_after, 
         "run_id": session_id,
         "timestamp": int(time.time() * 1000),
         "source": "ai",
+        "policy_name": policy_name,
+        "model_version": model_version,
         "action_type": action_payload.get("action"),
         "action_data": action_payload,
         "ok": bool(ok),
@@ -744,8 +767,12 @@ def set_data_source(source):
 def run_agent():
     processed_dir = os.path.join(os.path.dirname(__file__), "ProcessedParams")
     macro_processed_dir = os.path.join(os.path.dirname(__file__), "ProcessedMacroParams")
-    encoder, id_to_action, model, device = load_agent(processed_dir)
+    encoder, id_to_action, model, device, combat_metadata = load_agent(processed_dir)
     macro_agent = load_macro_agent(macro_processed_dir)
+    combat_policy_name = "bc_combat"
+    combat_model_version = combat_metadata.get("model_version", "")
+    macro_policy_name = "macro_mixed"
+    macro_model_version = (macro_agent or {}).get("model_version", "rules")
     session_id = f"ai_{datetime.now():%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:8]}"
     
     print(Fore.GREEN + Style.BRIGHT + "\n====== STS2 AI Control System v2 ======")
@@ -798,6 +825,8 @@ def run_agent():
                     "session_id": session_id,
                     "state_type": state_type,
                     "mode": "macro",
+                    "policy_name": macro_policy_name,
+                    "model_version": macro_model_version,
                     "top_actions": [],
                     "chosen_action": None,
                     "payload": None,
@@ -821,6 +850,8 @@ def run_agent():
                     "session_id": session_id,
                     "state_type": state_type,
                     "mode": "macro",
+                    "policy_name": macro_policy_name,
+                    "model_version": macro_model_version,
                     "top_actions": macro_info.get("top_actions", []),
                     "chosen_action": macro_info.get("chosen_action"),
                     "payload": payload,
@@ -832,6 +863,7 @@ def run_agent():
                     if last_data_source != "ai":
                         set_data_source("ai")
                         last_data_source = "ai"
+                    payload = payload_with_policy(payload, macro_policy_name, macro_model_version)
                     success = send_action(payload)
                     last_macro_decision_key = decision_key
                     if not success and last_data_source != "human":
@@ -910,10 +942,13 @@ def run_agent():
                 chosen_candidate_label = chosen_candidate.label if chosen_candidate else chosen_action
                 print(Fore.GREEN + Style.BRIGHT + f"  >>> EXECUTE: {chosen_candidate_label}")
                 payload = chosen_candidate.payload if chosen_candidate else build_play_card_payload_for_card(chosen_card, alive_enemies)
+                payload = payload_with_policy(payload, combat_policy_name, combat_model_version)
                 write_ai_logic_snapshot({
                     "timestamp": int(time.time() * 1000),
                     "session_id": session_id,
                     "state_type": state_type,
+                    "policy_name": combat_policy_name,
+                    "model_version": combat_model_version,
                     "hp": hp,
                     "block": block,
                     "energy": energy,
@@ -935,7 +970,7 @@ def run_agent():
                         last_data_source = "ai"
                     success = send_action(payload)
                     state_after = fetch_game_state()
-                    append_ai_action_log(session_id, payload, state, state_after, success)
+                    append_ai_action_log(session_id, payload, state, state_after, success, combat_policy_name, combat_model_version)
                     if success:
                         time.sleep(1.5)  # 等动画播完
                     else:
@@ -946,10 +981,13 @@ def run_agent():
                 print(Fore.RED + "  [No affordable playable card found, ending turn]")
                 end_turn_candidate = next((c for c in legal_candidates if c.kind == "end_turn"), None)
                 payload = end_turn_candidate.payload if end_turn_candidate else {"action": "end_turn"}
+                payload = payload_with_policy(payload, combat_policy_name, combat_model_version)
                 write_ai_logic_snapshot({
                     "timestamp": int(time.time() * 1000),
                     "session_id": session_id,
                     "state_type": state_type,
+                    "policy_name": combat_policy_name,
+                    "model_version": combat_model_version,
                     "hp": hp,
                     "block": block,
                     "energy": energy,
@@ -968,7 +1006,7 @@ def run_agent():
                     last_data_source = "ai"
                 success = send_action(payload)
                 state_after = fetch_game_state()
-                append_ai_action_log(session_id, payload, state, state_after, success)
+                append_ai_action_log(session_id, payload, state, state_after, success, combat_policy_name, combat_model_version)
                 time.sleep(1.5)
                         
 if __name__ == "__main__":

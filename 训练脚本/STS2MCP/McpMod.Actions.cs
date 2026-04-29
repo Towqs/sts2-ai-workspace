@@ -38,6 +38,13 @@ namespace STS2_MCP;
 
 public static partial class McpMod
 {
+    private static string? OptionalString(Dictionary<string, JsonElement> data, string key)
+    {
+        if (!data.TryGetValue(key, out var elem) || elem.ValueKind == JsonValueKind.Null)
+            return null;
+        return elem.ValueKind == JsonValueKind.String ? elem.GetString() : elem.ToString();
+    }
+
     private static Dictionary<string, object?> ExecuteAction(string action, Dictionary<string, JsonElement> data)
     {
         if (!RunManager.Instance.IsInProgress)
@@ -45,6 +52,7 @@ public static partial class McpMod
 
         // v3: MCP 调用全部标记为 AI 来源（防止与手动操作数据混淆）
         RL_DataCollector.SetDataSource(RL_DataCollector.DataSource.AI);
+        RL_DataCollector.SetPolicyContext(OptionalString(data, "policy_name"), OptionalString(data, "model_version"));
 
         var runState = RunManager.Instance.DebugOnlyGetState()!;
         var player = LocalContext.GetMe(runState);

@@ -357,7 +357,10 @@ LLM 适用场景：
 
 ### P3：长期
 
-- 自动评测多策略表现。
+- 已开始自动评测多策略表现：
+  - `AI_Training/evaluation_summary.py` 会按 run 汇总策略、楼层、胜败、非法动作、卡住/缺数据等指标。
+  - 控制台已增加“策略评测”表，按策略展示最近 run 的平均楼层、最高楼层、胜败和问题数。
+  - AI/LLM payload 会携带 `policy_name` / `model_version`，Mod 会把它写进后续采集记录。
 - 第一章通关率稳定后扩展第二章。
 - 数据量足够后再做 Transformer 或 Actor-Critic。
 - 考虑局部模拟器或战斗重放环境。

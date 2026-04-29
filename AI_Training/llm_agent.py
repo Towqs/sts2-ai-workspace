@@ -95,6 +95,15 @@ def post_game_action(payload):
     return request_json(GAME_API, method="POST", body=payload, timeout=3)
 
 
+def payload_with_policy(payload, policy_name, model_version):
+    if not payload:
+        return payload
+    tagged = dict(payload)
+    tagged["policy_name"] = policy_name
+    tagged["model_version"] = model_version
+    return tagged
+
+
 def card_cost(card, energy):
     cost = card.get("cost", 0)
     if cost == "X":
@@ -767,6 +776,9 @@ def run_agent():
                 decision = call_openai_compatible(cfg, compact, actions)
                 normalized = normalize_decision(decision)
                 payload, validation = validate_and_convert(normalized, state)
+            policy_name = "llm_candidate_id" if selection_mode == "candidate_id" else "llm_catalog_args"
+            model_version = str(cfg.get("model") or "")
+            payload = payload_with_policy(payload, policy_name, model_version)
             execute = should_execute(cfg, payload, state)
             result = None
             ok = None
@@ -784,6 +796,8 @@ def run_agent():
                 "session_id": session_id,
                 "mode": cfg.get("mode"),
                 "action_selection_mode": selection_mode,
+                "policy_name": policy_name,
+                "model_version": model_version,
                 "provider": cfg.get("provider"),
                 "model": cfg.get("model"),
                 "state_type": state.get("state_type"),
