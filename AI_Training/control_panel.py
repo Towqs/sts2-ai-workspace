@@ -555,6 +555,7 @@ def run_training_background():
                 for cmd in [
                     [str(PYTHON_EXE), str(AI_DIR / "data_pipeline.py")],
                     [str(PYTHON_EXE), str(AI_DIR / "train_bc.py")],
+                    [str(PYTHON_EXE), str(AI_DIR / "train_candidate_bc.py")],
                     [str(PYTHON_EXE), str(AI_DIR / "macro_data_pipeline.py")],
                     [str(PYTHON_EXE), str(AI_DIR / "train_macro_bc.py")],
                 ]:
@@ -1153,7 +1154,7 @@ INDEX_HTML = r"""<!doctype html>
           </select>
         </div>
         <div class="row" style="margin-top:12px">
-          <button class="primary" onclick="train()">重建数据 + 重训战斗/宏观 BC</button>
+          <button class="primary" onclick="train()">重建数据 + 重训战斗/候选/宏观 BC</button>
           <button onclick="proceed()">Proceed</button>
         </div>
       </section>

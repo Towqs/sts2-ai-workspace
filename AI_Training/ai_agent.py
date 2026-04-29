@@ -9,6 +9,7 @@ import torch.nn as nn
 import numpy as np
 from colorama import init, Fore, Style
 
+from combat_actions import choose_candidate_for_card, enumerate_combat_actions, public_candidate_catalog
 from data_pipeline import StateEncoder
 from macro_data_pipeline import Vocab as MacroVocab, encode_record as encode_macro_record
 from train_macro_bc import MacroBCModel
@@ -856,6 +857,8 @@ def run_agent():
         energy = player_state.get("energy", 0)
         enemies = battle.get("enemies", [])
         alive_enemies = get_alive_enemies(enemies)
+        legal_candidates = enumerate_combat_actions(state)
+        legal_candidate_catalog = public_candidate_catalog(legal_candidates, limit=24)
             
         # 特征编码 + 模型推理
         state_vec = encoder.encode(state)
@@ -902,9 +905,11 @@ def run_agent():
             chosen_card = choose_card_to_play(sorted_indices, id_to_action, hand_cards, energy)
 
             if chosen_card:
+                chosen_candidate = choose_candidate_for_card(legal_candidates, chosen_card)
                 chosen_action = f"play_card_{chosen_card.get('id')}"
-                print(Fore.GREEN + Style.BRIGHT + f"  >>> EXECUTE: {chosen_action}")
-                payload = build_play_card_payload_for_card(chosen_card, alive_enemies)
+                chosen_candidate_label = chosen_candidate.label if chosen_candidate else chosen_action
+                print(Fore.GREEN + Style.BRIGHT + f"  >>> EXECUTE: {chosen_candidate_label}")
+                payload = chosen_candidate.payload if chosen_candidate else build_play_card_payload_for_card(chosen_card, alive_enemies)
                 write_ai_logic_snapshot({
                     "timestamp": int(time.time() * 1000),
                     "session_id": session_id,
@@ -916,7 +921,9 @@ def run_agent():
                     "playable": playable_card_ids,
                     "enemies": [{"id": get_enemy_target_id(e), "name": e.get("name"), "hp": get_enemy_hp(e)} for e in alive_enemies],
                     "top_actions": top_actions,
+                    "candidate_actions": legal_candidate_catalog,
                     "chosen_action": chosen_action,
+                    "chosen_candidate": chosen_candidate_label,
                     "payload": payload,
                     "reason": "zero-cost first, otherwise model-ranked affordable card",
                 })
@@ -937,7 +944,8 @@ def run_agent():
                     print(Fore.RED + "  [Bug] Could not build payload")
             else:
                 print(Fore.RED + "  [No affordable playable card found, ending turn]")
-                payload = {"action": "end_turn"}
+                end_turn_candidate = next((c for c in legal_candidates if c.kind == "end_turn"), None)
+                payload = end_turn_candidate.payload if end_turn_candidate else {"action": "end_turn"}
                 write_ai_logic_snapshot({
                     "timestamp": int(time.time() * 1000),
                     "session_id": session_id,
@@ -949,7 +957,9 @@ def run_agent():
                     "playable": playable_card_ids,
                     "enemies": [{"id": get_enemy_target_id(e), "name": e.get("name"), "hp": get_enemy_hp(e)} for e in alive_enemies],
                     "top_actions": top_actions,
+                    "candidate_actions": legal_candidate_catalog,
                     "chosen_action": "end_turn",
+                    "chosen_candidate": end_turn_candidate.label if end_turn_candidate else "end_turn",
                     "payload": payload,
                     "reason": "no affordable playable card",
                 })

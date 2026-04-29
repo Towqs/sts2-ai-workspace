@@ -108,7 +108,8 @@ def train(processed_dir):
             torch.save(model.state_dict(), os.path.join(processed_dir, 'bc_model_best.pth'))
             
     print(f"Training complete. Best model saved to bc_model_best.pth (Loss: {best_loss:.4f})")
-    summary = {
+    summary = dict(metadata)
+    summary.update({
         "samples": int(len(Y_train)),
         "features": int(input_dim),
         "actions": int(num_actions),
@@ -116,7 +117,7 @@ def train(processed_dir):
         "best_loss": float(best_loss),
         "device": str(device),
         "model_path": "bc_model_best.pth",
-    }
+    })
     with open(metadata_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
 

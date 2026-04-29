@@ -5,6 +5,13 @@ import numpy as np
 import time
 import re
 
+from combat_actions import (
+    CANDIDATE_FEATURE_DIM,
+    candidate_feature_rows,
+    enumerate_combat_actions,
+    match_logged_action,
+)
+
 # 超参数/常量定义
 MAX_HAND = 10
 MAX_ENEMIES = 5
@@ -490,6 +497,11 @@ def build_dataset(data_dirs, output_dir):
     
     X_data = [] # 状态向量
     Y_data = [] # 动作ID (标签)
+    candidate_X_data = [] # 状态向量 + 候选动作特征
+    candidate_Y_data = [] # 1 表示该候选动作匹配人类记录
+    candidate_group_data = [] # 同一个原始样本下的候选动作分组
+    candidate_groups = 0
+    candidate_match_misses = 0
     
     print("Encoding data into features...")
     start_time = time.time()
@@ -516,23 +528,55 @@ def build_dataset(data_dirs, output_dir):
                     action_id = encoder.encode_action(action)
                     
                     if action_id != 1: # 排除 UNKNOWN
+                        group_id = len(Y_data)
                         X_data.append(state_vec)
                         Y_data.append(action_id)
+
+                        candidates = enumerate_combat_actions(state)
+                        matched_idx = match_logged_action(candidates, action)
+                        if matched_idx >= 0:
+                            for idx, candidate_features in enumerate(candidate_feature_rows(candidates)):
+                                candidate_X_data.append(np.concatenate([
+                                    state_vec,
+                                    np.array(candidate_features, dtype=np.float32),
+                                ]))
+                                candidate_Y_data.append(1 if idx == matched_idx else 0)
+                                candidate_group_data.append(group_id)
+                            candidate_groups += 1
+                        else:
+                            candidate_match_misses += 1
             except Exception as e:
                 pass
                     
     X_data = np.array(X_data, dtype=np.float32)
     Y_data = np.array(Y_data, dtype=np.int64)
+    candidate_feature_total = (X_data.shape[1] if X_data.ndim == 2 else 0) + CANDIDATE_FEATURE_DIM
+    candidate_X_data = (
+        np.array(candidate_X_data, dtype=np.float32)
+        if candidate_X_data
+        else np.zeros((0, candidate_feature_total), dtype=np.float32)
+    )
+    candidate_Y_data = np.array(candidate_Y_data, dtype=np.int64)
+    candidate_group_data = np.array(candidate_group_data, dtype=np.int64)
     
     print(f"Encoded {len(X_data)} samples in {time.time() - start_time:.2f} seconds.")
     
     # 3. 保存 Numpy 数据集
     np.save(os.path.join(output_dir, 'X_train.npy'), X_data)
     np.save(os.path.join(output_dir, 'Y_train.npy'), Y_data)
+    np.save(os.path.join(output_dir, 'candidate_X_train.npy'), candidate_X_data)
+    np.save(os.path.join(output_dir, 'candidate_Y_train.npy'), candidate_Y_data)
+    np.save(os.path.join(output_dir, 'candidate_group_train.npy'), candidate_group_data)
     metadata = {
         "samples": int(len(Y_data)),
         "features": int(X_data.shape[1]) if X_data.ndim == 2 else 0,
         "feature_version": 2,
+        "candidate_rows": int(len(candidate_Y_data)),
+        "candidate_groups": int(candidate_groups),
+        "candidate_positive": int(candidate_Y_data.sum()) if len(candidate_Y_data) else 0,
+        "candidate_match_misses": int(candidate_match_misses),
+        "candidate_feature_dim": int(CANDIDATE_FEATURE_DIM),
+        "candidate_total_features": int(candidate_X_data.shape[1]) if candidate_X_data.ndim == 2 else 0,
         "feature_notes": [
             "act_floor_round",
             "incoming_damage",
@@ -541,11 +585,13 @@ def build_dataset(data_dirs, output_dir):
             "affordable_playable_counts",
             "affordable_attack_block_estimates",
             "lethal_and_threat_flags",
+            "candidate_action_feature_rows_for_future_scorer",
         ],
     }
     with open(os.path.join(output_dir, "metadata.json"), "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2, ensure_ascii=False)
     print(f"Saved matrices. X shape: {X_data.shape}, Y shape: {Y_data.shape}")
+    print(f"Candidate matrices. X shape: {candidate_X_data.shape}, positives: {int(candidate_Y_data.sum()) if len(candidate_Y_data) else 0}, misses: {candidate_match_misses}")
 
 if __name__ == "__main__":
     DATA_DIRS = [
