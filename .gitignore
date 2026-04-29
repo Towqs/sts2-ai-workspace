@@ -38,6 +38,7 @@ RL_Training/
 *.zip
 
 # Runtime logs / temporary files
+RuntimeLogs/
 *.log
 *.tmp
 *.bak

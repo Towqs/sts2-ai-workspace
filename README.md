@@ -9,6 +9,7 @@
 后续 AI 训练大纲、阶段路线、当前模型状态和近期执行清单记录在：
 
 - [`docs/ai_training_roadmap.md`](docs/ai_training_roadmap.md)
+- [`docs/startup.md`](docs/startup.md)：一键启动控制台、日志窗口、BC AI 和 LLM。
 
 ## 仓库结构
 
@@ -36,6 +37,14 @@
 也就是说，GitHub 仓库只放代码和说明；数据、模型、API Key 都留在本机。别人拉仓库后需要自己安装依赖、构建 Mod、采集数据或导入你打包的数据。
 
 ## 本地启动
+
+已经装好依赖和 Mod 后，日常使用可以直接双击：
+
+```text
+一键启动全部.bat
+```
+
+它会打开网页控制台、后台输出窗口、RL 日志窗口，并在模型配置可用时启动 BC AI 和 LLM。详细说明见 [`docs/startup.md`](docs/startup.md)。
 
 ### 1. 安装 Python 依赖
 
