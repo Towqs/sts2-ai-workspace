@@ -126,6 +126,28 @@ public static partial class McpMod
                 failed.Add("RunStateChange");
             }
 
+            try {
+                harmony.Patch(
+                    AccessTools.Method(typeof(MegaCrit.Sts2.Core.Nodes.Screens.MainMenu.NMainMenu), "OnContinueButtonPressed"),
+                    prefix: typeof(RL_DataCollector).GetMethod("Hook_MainMenuContinue_Prefix", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)
+                );
+                Debug.Log("Harmony", "[PATCH] MainMenuContinueIntent OK");
+            } catch (Exception ex) {
+                Debug.Log("Harmony", "[PATCH] MainMenuContinueIntent FAILED: " + ex.Message);
+                failed.Add("MainMenuContinueIntent");
+            }
+
+            try {
+                harmony.Patch(
+                    AccessTools.Method(typeof(MegaCrit.Sts2.Core.Nodes.Screens.CharacterSelect.NCharacterSelectScreen), "BeginRun"),
+                    prefix: typeof(RL_DataCollector).GetMethod("Hook_CharacterSelectBeginRun_Prefix", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)
+                );
+                Debug.Log("Harmony", "[PATCH] CharacterSelectNewRunIntent OK");
+            } catch (Exception ex) {
+                Debug.Log("Harmony", "[PATCH] CharacterSelectNewRunIntent FAILED: " + ex.Message);
+                failed.Add("CharacterSelectNewRunIntent");
+            }
+
             // 2. CombatStateChange
             try {
                 harmony.Patch(

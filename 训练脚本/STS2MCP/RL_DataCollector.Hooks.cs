@@ -32,6 +32,16 @@ namespace STS2_MCP
         //  Harmony Hooks — 拦截游戏事件
         // ============================================================
 
+        public static void Hook_MainMenuContinue_Prefix()
+        {
+            RL_DataCollector.MarkMenuRunIntent("continue");
+        }
+
+        public static void Hook_CharacterSelectBeginRun_Prefix(string seed)
+        {
+            RL_DataCollector.MarkMenuRunIntent("new", seed);
+        }
+
         // Hook_RunStateChange Postfix (called manually via TryApplyHarmonyPatches)
         public static void Hook_RunStateChange_Postfix(RunManager __instance, ref bool __result)
         {

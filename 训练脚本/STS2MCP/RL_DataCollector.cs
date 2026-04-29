@@ -132,6 +132,8 @@ namespace STS2_MCP
         private static DataSource _currentDataSource = DataSource.Human;
         private static string? _currentPolicyName;
         private static string? _currentModelVersion;
+        private static string? _pendingMenuRunIntent;
+        private static string? _pendingMenuRunSeed;
         // v3: MCP 防重复记录（记录上一个动作的哈希）
         private static string? _lastActionHash;
         private static long _lastActionTimestamp = 0;
@@ -185,6 +187,20 @@ namespace STS2_MCP
             _currentModelVersion = string.IsNullOrWhiteSpace(modelVersion) ? null : modelVersion;
         }
 
+        public static void MarkMenuRunIntent(string intent, string? seed = null)
+        {
+            if (!string.Equals(intent, "new", StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(intent, "continue", StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            _pendingMenuRunIntent = intent.ToLowerInvariant();
+            _pendingMenuRunSeed = string.IsNullOrWhiteSpace(seed) ? null : seed;
+            Debug.Log("RunState", $"[MENU INTENT] {_pendingMenuRunIntent}"
+                + (_pendingMenuRunSeed == null ? "" : $" seed={_pendingMenuRunSeed}"));
+        }
+
         public static void StartNewRun()
         {
             // 生成新的 run_id（带来源前缀）
@@ -205,15 +221,33 @@ namespace STS2_MCP
         {
             Initialize();
             GetCurrentProgress(out int act, out int floor);
+            string controlMode = ReadNextRunMode();
 
-            if (ConsumeNewRunRequest())
+            if (string.Equals(controlMode, "new", StringComparison.OrdinalIgnoreCase))
             {
                 Debug.Log("RunState", "[NEW RUN REQUEST] control_state requested a fresh run");
+                ResetNextRunModeToAuto();
                 StartNewRun();
                 return false;
             }
 
-            if (TryResumeActiveRun(act, floor))
+            string? menuIntent = ConsumePendingMenuRunIntent();
+            if (string.Equals(menuIntent, "new", StringComparison.OrdinalIgnoreCase))
+            {
+                Debug.Log("RunState", "[MENU INTENT] Starting a fresh run from character select");
+                StartNewRun();
+                return false;
+            }
+
+            bool forceContinue = string.Equals(controlMode, "continue", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(menuIntent, "continue", StringComparison.OrdinalIgnoreCase);
+            if (forceContinue)
+            {
+                Debug.Log("RunState", "[CONTINUE REQUEST] Trying to resume active run");
+                ResetNextRunModeToAuto();
+            }
+
+            if (TryResumeActiveRun(act, floor, forceContinue))
             {
                 _inCombat = false;
                 _lastRoundNumber = 0;
@@ -245,7 +279,7 @@ namespace STS2_MCP
             catch { }
         }
 
-        private static bool TryResumeActiveRun(int currentAct, int currentFloor)
+        private static bool TryResumeActiveRun(int currentAct, int currentFloor, bool forceContinue = false)
         {
             try
             {
@@ -262,14 +296,19 @@ namespace STS2_MCP
 
                 Debug.Log("RunState", $"[RESUME] Candidate run={runElem.GetString()}, last={lastAct}/{lastFloor}, current={currentAct}/{currentFloor}");
 
-                if (lastFloor > 1 && currentFloor <= 1)
+                if (!forceContinue && lastFloor > 1 && currentFloor <= 1)
                 {
                     Debug.Log("RunState", "[RESUME] Rejected: current floor looks like a fresh run");
                     return false;
                 }
-                if (currentAct < lastAct)
+                if (!forceContinue && currentAct < lastAct)
                 {
                     Debug.Log("RunState", "[RESUME] Rejected: current act is before saved act");
+                    return false;
+                }
+                if (!forceContinue && lastAct <= 1 && lastFloor <= 1 && currentAct <= 1 && currentFloor <= 1)
+                {
+                    Debug.Log("RunState", "[RESUME] Rejected: ambiguous early-floor run without Continue intent");
                     return false;
                 }
 
@@ -306,29 +345,53 @@ namespace STS2_MCP
             }
         }
 
-        private static bool ConsumeNewRunRequest()
+        private static string ConsumePendingMenuRunIntent()
+        {
+            string intent = _pendingMenuRunIntent ?? "";
+            _pendingMenuRunIntent = null;
+            _pendingMenuRunSeed = null;
+            return intent;
+        }
+
+        private static string ReadNextRunMode()
         {
             try
             {
-                if (!File.Exists(_controlPath)) return false;
+                if (!File.Exists(_controlPath)) return "auto";
                 string json = File.ReadAllText(_controlPath);
                 using var doc = System.Text.Json.JsonDocument.Parse(json);
                 var root = doc.RootElement;
-                if (!root.TryGetProperty("next_run_mode", out var modeElem)) return false;
-                if (!string.Equals(modeElem.GetString(), "new", StringComparison.OrdinalIgnoreCase)) return false;
-
-                string updated = System.Text.RegularExpressions.Regex.Replace(
-                    json,
-                    "\"next_run_mode\"\\s*:\\s*\"new\"",
-                    "\"next_run_mode\": \"auto\""
-                );
-                File.WriteAllText(_controlPath, updated);
-                return true;
+                if (!root.TryGetProperty("next_run_mode", out var modeElem)) return "auto";
+                string mode = modeElem.GetString() ?? "auto";
+                return mode.Equals("new", StringComparison.OrdinalIgnoreCase)
+                    || mode.Equals("continue", StringComparison.OrdinalIgnoreCase)
+                    || mode.Equals("auto", StringComparison.OrdinalIgnoreCase)
+                    ? mode.ToLowerInvariant()
+                    : "auto";
             }
             catch (Exception ex)
             {
-                Debug.Log("RunState", $"[NEW RUN REQUEST] Failed to read control_state: {ex.Message}");
-                return false;
+                Debug.Log("RunState", $"[RUN MODE] Failed to read control_state: {ex.Message}");
+                return "auto";
+            }
+        }
+
+        private static void ResetNextRunModeToAuto()
+        {
+            try
+            {
+                if (!File.Exists(_controlPath)) return;
+                string json = File.ReadAllText(_controlPath);
+                string updated = System.Text.RegularExpressions.Regex.Replace(
+                    json,
+                    "\"next_run_mode\"\\s*:\\s*\"(?:new|continue)\"",
+                    "\"next_run_mode\": \"auto\""
+                );
+                File.WriteAllText(_controlPath, updated);
+            }
+            catch (Exception ex)
+            {
+                Debug.Log("RunState", $"[RUN MODE] Failed to reset control_state: {ex.Message}");
             }
         }
 
