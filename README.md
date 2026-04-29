@@ -12,6 +12,7 @@
 - [`docs/startup.md`](docs/startup.md)：一键启动控制台、日志窗口、BC AI 和 LLM。
 - [`docs/llm_combat_decision_mode.md`](docs/llm_combat_decision_mode.md)：LLM 作为战斗大脑、本地代码负责伤害/防御/药水计算的设计稿。
 - [`docs/rewind_training_mode.md`](docs/rewind_training_mode.md)：回溯训练模式，利用虚拟拒绝、外部读档或未来 Mod 快照降低试错成本。
+- [`docs/fair_rewind_training_protocol.md`](docs/fair_rewind_training_protocol.md)：公平回溯训练协议，定义可见信息边界、回溯惩罚、逐步关闭和 no_rewind 评测。
 
 ## 仓库结构
 
