@@ -19,8 +19,10 @@
 公开说明和使用文档记录在：
 
 - [`docs/startup.md`](docs/startup.md)：一键启动控制台、日志窗口、BC AI 和 LLM。
+- [`docs/project_guide.md`](docs/project_guide.md)：项目目标、当前能力、控制台入口和推荐流程。
 - [`docs/data_contribution.md`](docs/data_contribution.md)：如何打包数据并提交给维护者。
 - [`docs/public_roadmap.md`](docs/public_roadmap.md)：当前状态、近期目标和公开发展路线。
+- [`docs/monster_data.md`](docs/monster_data.md)：怪物数据采集字段、用途和后续接入计划。
 
 ## 仓库结构
 

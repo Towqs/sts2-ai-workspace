@@ -29,6 +29,7 @@ AI_DIR = WORKSPACE / "AI_Training"
 DATA_DIR = WORKSPACE / "RL_Datasets"
 EXPORT_DIR = WORKSPACE / "Data_Packages"
 ASSETS_DIR = AI_DIR / "assets"
+DOCS_DIR = WORKSPACE / "docs"
 CONTROL_PATH = AI_DIR / "control_state.json"
 AI_LOGIC_PATH = AI_DIR / "ai_logic_state.json"
 LLM_CONFIG_PATH = AI_DIR / "model_config.json"
@@ -1050,6 +1051,10 @@ INDEX_HTML = r"""<!doctype html>
       background:linear-gradient(135deg, #fff, var(--surface-tint));
       color:var(--primary-strong);
     }
+    .project-button {
+      background:#fff;
+      color:var(--ink);
+    }
     .brand { display:flex; align-items:center; gap:20px; min-width:0; }
     .brand-mark {
       position:relative;
@@ -1579,6 +1584,200 @@ INDEX_HTML = r"""<!doctype html>
       padding:16px;
       box-shadow:0 22px 54px rgba(38,55,58,.24);
     }
+    .project-modal {
+      width:min(1120px, calc(100vw - 32px));
+      height:min(820px, calc(100vh - 32px));
+      padding:0;
+      overflow:hidden;
+      display:grid;
+      grid-template-rows:auto minmax(0, 1fr) auto;
+    }
+    .project-modal-head {
+      display:grid;
+      grid-template-columns:minmax(0, 1.05fr) minmax(260px, .95fr) auto;
+      gap:18px;
+      padding:22px 24px 20px;
+      border-bottom:1px solid var(--line);
+      background:
+        linear-gradient(135deg, rgba(255,255,255,.94), rgba(237,245,242,.92)),
+        radial-gradient(circle at 78% 18%, rgba(209,162,58,.18), transparent 28%);
+    }
+    .project-head-copy { align-self:center; }
+    .project-kicker {
+      color:var(--primary-strong);
+      font-size:12px;
+      font-weight:900;
+      margin-bottom:7px;
+    }
+    .project-title {
+      font-size:26px;
+      line-height:1.15;
+      margin:0;
+      color:var(--ink);
+    }
+    .project-lead {
+      color:var(--muted);
+      line-height:1.65;
+      margin:10px 0 0;
+      max-width:820px;
+    }
+    .project-head-visual {
+      position:relative;
+      min-height:190px;
+      align-self:stretch;
+      border:1px solid rgba(47,111,120,.22);
+      border-radius:18px;
+      overflow:hidden;
+      background:#fff;
+      box-shadow:var(--shadow-soft);
+    }
+    .project-head-visual::after {
+      content:"";
+      position:absolute;
+      right:18px;
+      bottom:14px;
+      width:52px;
+      height:38px;
+      border:1px solid rgba(47,111,120,.18);
+      transform:skew(-18deg);
+      pointer-events:none;
+    }
+    .project-head-visual img {
+      width:100%;
+      height:100%;
+      object-fit:cover;
+      display:block;
+    }
+    .project-modal-body {
+      overflow:auto;
+      padding:22px 24px 26px;
+      background:#fff;
+    }
+    .project-overview {
+      display:grid;
+      grid-template-columns:minmax(0, 1.05fr) minmax(260px, .95fr);
+      gap:16px;
+      align-items:stretch;
+    }
+    .project-section {
+      display:grid;
+      gap:11px;
+      margin-top:18px;
+    }
+    .project-section:first-child { margin-top:0; }
+    .project-section-title {
+      font-weight:900;
+      color:var(--primary-strong);
+      font-size:15px;
+    }
+    .project-panel {
+      border:1px solid var(--line);
+      border-radius:16px;
+      background:linear-gradient(135deg, #fff, var(--surface-soft));
+      padding:15px;
+      overflow:hidden;
+    }
+    .project-panel p {
+      margin:8px 0 0;
+      color:var(--muted);
+      line-height:1.65;
+    }
+    .project-grid {
+      display:grid;
+      grid-template-columns:repeat(auto-fit, minmax(220px, 1fr));
+      gap:10px;
+    }
+    .project-figure {
+      border:1px solid var(--line);
+      border-radius:16px;
+      background:#fff;
+      overflow:hidden;
+      display:grid;
+      align-content:start;
+      box-shadow:var(--shadow-soft);
+    }
+    .project-figure img {
+      width:100%;
+      min-height:170px;
+      object-fit:cover;
+      display:block;
+      background:var(--surface-soft);
+    }
+    .project-figure-caption {
+      padding:10px 12px 12px;
+      color:var(--muted);
+      font-size:12px;
+      line-height:1.5;
+      border-top:1px solid var(--line);
+    }
+    .project-wide-figure {
+      border:1px solid var(--line);
+      border-radius:16px;
+      background:#fff;
+      overflow:hidden;
+      box-shadow:var(--shadow-soft);
+    }
+    .project-wide-figure img {
+      width:100%;
+      display:block;
+      background:var(--surface-soft);
+    }
+    .project-wide-figure .project-figure-caption { background:var(--surface-soft); }
+    .project-doc-list {
+      display:grid;
+      grid-template-columns:repeat(auto-fit, minmax(260px, 1fr));
+      gap:10px;
+    }
+    .project-doc {
+      display:grid;
+      gap:5px;
+      padding:12px;
+      border:1px solid var(--line);
+      border-radius:12px;
+      background:#fff;
+      color:inherit;
+      text-decoration:none;
+    }
+    .project-doc:hover {
+      border-color:rgba(47,111,120,.42);
+      background:var(--surface-tint);
+    }
+    .project-doc b { color:var(--ink); }
+    .project-doc span {
+      color:var(--muted);
+      font-size:12px;
+      line-height:1.5;
+    }
+    .project-doc code { color:var(--primary-strong); font-size:12px; }
+    .project-item {
+      border:1px solid var(--line);
+      border-radius:12px;
+      padding:12px;
+      background:var(--surface-soft);
+      display:grid;
+      gap:5px;
+    }
+    .project-item b { color:var(--ink); }
+    .project-item span {
+      color:var(--muted);
+      font-size:12px;
+      line-height:1.5;
+    }
+    .project-flow {
+      margin:0;
+      padding-left:20px;
+      color:var(--muted);
+      line-height:1.7;
+    }
+    .project-flow li { padding:3px 0; }
+    .project-modal-actions {
+      display:flex;
+      justify-content:flex-end;
+      gap:8px;
+      padding:14px 24px 18px;
+      border-top:1px solid var(--line);
+      background:var(--surface-soft);
+    }
     .guide-overlay {
       position:fixed;
       inset:0;
@@ -1778,6 +1977,16 @@ INDEX_HTML = r"""<!doctype html>
       .status-grid, .metric-grid { grid-template-columns:1fr; }
       .activity-feed { grid-template-columns:1fr; }
       .button-row { grid-template-columns:1fr; }
+      .project-modal {
+        width:calc(100vw - 18px);
+        height:calc(100vh - 18px);
+      }
+      .project-modal-head, .project-modal-body, .project-modal-actions { padding-left:14px; padding-right:14px; }
+      .project-title { font-size:21px; }
+      .project-modal-head { grid-template-columns:1fr auto; }
+      .project-head-visual { grid-column:1 / -1; min-height:150px; }
+      .project-overview { grid-template-columns:1fr; }
+      .project-modal-actions { flex-direction:column; }
       .guide-actions { grid-template-columns:1fr; }
       .fold-panel summary { grid-template-columns:minmax(0, 1fr) 78px 28px; }
       .fold-panel summary .pill { width:78px; }
@@ -1797,6 +2006,7 @@ INDEX_HTML = r"""<!doctype html>
         </div>
       </div>
       <div class="top-actions">
+        <button class="guide-button project-button" onclick="openProjectGuide()">项目说明</button>
         <button class="guide-button" onclick="startGuide()">新手引导</button>
         <span id="lastRefresh" class="pill info">读取中</span>
       </div>
@@ -2208,6 +2418,90 @@ INDEX_HTML = r"""<!doctype html>
       </div>
     </div>
   </div>
+  <div id="projectGuideModal" class="modal-backdrop" onclick="closeProjectGuide(event)">
+    <div class="modal project-modal" onclick="event.stopPropagation()">
+      <div class="project-modal-head">
+        <div class="project-head-copy">
+          <div class="project-kicker">项目说明</div>
+          <h2 class="project-title">STS2 AI 是一个本地杀戮尖塔 2 AI 工作区</h2>
+          <p class="project-lead">它把游戏 Mod、本地网页控制台、数据采集、BC 模型训练和 OpenAI-compatible LLM 接入放在一起。目标不是只做一个按钮脚本，而是逐步形成“玩家数据 -> 模型训练 -> AI 决策 -> 再采集”的闭环。</p>
+        </div>
+        <div class="project-head-visual" aria-hidden="true">
+          <img src="/assets/project_hero.svg" alt="">
+        </div>
+        <button onclick="closeProjectGuide()">关闭</button>
+      </div>
+      <div class="project-modal-body">
+        <div class="project-overview">
+          <div class="project-panel">
+            <div class="project-section-title">这不是单个自动出牌脚本</div>
+            <p>它更像一个本地实验台：游戏状态从 Mod 进入控制台，玩家和 AI 的动作被采集成数据，再用于训练和评估。LLM 在这里负责做高层判断，但推荐模式下只能选择系统给出的合法候选动作。</p>
+          </div>
+          <figure class="project-figure">
+            <img src="/assets/project_cards.svg" alt="STS2 AI card and potion illustration">
+            <figcaption class="project-figure-caption">卡牌、药水、敌人意图和数据日志是这个项目最核心的输入。这里使用自绘项目插图，不抽取游戏原始素材。</figcaption>
+          </figure>
+        </div>
+        <div class="project-section">
+          <div class="project-section-title">现在已经能做什么</div>
+          <div class="project-grid">
+            <div class="project-item"><b>读取游戏状态</b><span>通过 Mod API 读取当前场景、血量、能量、手牌、药水、敌人和 Run 状态。</span></div>
+            <div class="project-item"><b>托管战斗</b><span>基础 AI 可以执行战斗出牌；LLM 可以在合法候选动作中做决策。</span></div>
+            <div class="project-item"><b>采集训练数据</b><span>记录玩家和 AI 的战斗、宏观操作、Run 质量、怪物信息，用于后续训练。</span></div>
+            <div class="project-item"><b>训练和评估</b><span>控制台可以触发重建数据、重训 BC、查看最近 Run、评测策略表现。</span></div>
+          </div>
+        </div>
+        <div class="project-section">
+          <div class="project-section-title">工作流</div>
+          <figure class="project-wide-figure">
+            <img src="/assets/project_loop.svg" alt="Game to data to model workflow">
+            <figcaption class="project-figure-caption">从游戏状态到数据，再到 BC/LLM 决策，最后回到控制台执行和评估。这个闭环决定后续能不能稳定进步。</figcaption>
+          </figure>
+        </div>
+        <div class="project-section">
+          <div class="project-section-title">推荐怎么用</div>
+          <ol class="project-flow">
+            <li>先启动游戏、Mod API 和控制台，确认顶部“游戏连接”不是未连接。</li>
+            <li>正式采数据时打开“采集总开关”；临时测试或调 UI 时可以关闭。</li>
+            <li>演示基础 AI 时打开“允许 AI 出牌”，先不要急着打开宏观操作和商店购买。</li>
+            <li>演示 LLM 时优先使用“只从合法候选动作里选”，再决定是否打开“允许 LLM 自动战斗”。</li>
+            <li>每局结束后看“最近 Run”和质量标记，再决定数据是否保留或打包提交。</li>
+          </ol>
+        </div>
+        <div class="project-section">
+          <div class="project-section-title">关键原则</div>
+          <div class="project-grid">
+            <div class="project-item"><b>LLM 不是直接控制游戏</b><span>推荐模式下，系统先生成合法候选动作，LLM 只能选择其中一个，不能自由编动作参数。</span></div>
+            <div class="project-item"><b>数据质量比数量更重要</b><span>坏数据会污染训练。明显卡住、误操作或异常 Run 应该标记或丢弃。</span></div>
+            <div class="project-item"><b>本地隐私优先</b><span>API Key、数据包、训练产物默认保存在本机，不进入 Git。</span></div>
+            <div class="project-item"><b>当前仍是半成品</b><span>系统已经跑通闭环，但缺少大量高质量样本，AI 稳定性还需要持续验证。</span></div>
+          </div>
+        </div>
+        <div class="project-section">
+          <div class="project-section-title">Git 上公开文档</div>
+          <div class="project-doc-list">
+            <a class="project-doc" href="/docs/project_guide.md" target="_blank" rel="noopener"><b>项目说明</b><span>项目目标、当前能力、推荐流程和限制。</span><code>docs/project_guide.md</code></a>
+            <a class="project-doc" href="/docs/startup.md" target="_blank" rel="noopener"><b>启动说明</b><span>一键启动控制台、日志窗口、BC AI 和 LLM。</span><code>docs/startup.md</code></a>
+            <a class="project-doc" href="/docs/data_contribution.md" target="_blank" rel="noopener"><b>数据贡献</b><span>如何打包本地数据并提交给维护者。</span><code>docs/data_contribution.md</code></a>
+            <a class="project-doc" href="/docs/public_roadmap.md" target="_blank" rel="noopener"><b>公开路线图</b><span>当前状态、近期目标和后续发展方向。</span><code>docs/public_roadmap.md</code></a>
+            <a class="project-doc" href="/docs/monster_data.md" target="_blank" rel="noopener"><b>怪物数据</b><span>怪物采集字段、用途和后续训练接入方式。</span><code>docs/monster_data.md</code></a>
+          </div>
+        </div>
+        <div class="project-section">
+          <div class="project-section-title">这个页面里两个入口的区别</div>
+          <div class="project-grid">
+            <div class="project-item"><b>项目说明</b><span>就是当前这个阅读层，解释整个项目、能力边界、推荐流程和当前限制。</span></div>
+            <div class="project-item"><b>新手引导</b><span>覆盖当前控制台页面，用高亮和箭头逐步指向具体开关，适合第一次上手。</span></div>
+          </div>
+        </div>
+        <div class="fine" style="margin-top:18px">这里只列 Git 上公开文档；本地核心设计草稿仍按约定留在本机，不放到公开仓库。</div>
+      </div>
+      <div class="project-modal-actions">
+        <button class="primary" onclick="closeProjectGuide(); startGuide()">打开新手引导</button>
+        <button onclick="closeProjectGuide()">关闭</button>
+      </div>
+    </div>
+  </div>
   <div id="guideOverlay" class="guide-overlay is-hidden" aria-hidden="true">
     <div id="guideSpotlight" class="guide-spotlight"></div>
     <div id="guideArrow" class="guide-arrow"></div>
@@ -2344,6 +2638,13 @@ const GUIDE_STEPS = [
     text: "这里看最近一次运行、质量标记和是否保留。训练前先检查这里，避免把明显坏数据混进训练。"
   }
 ];
+function openProjectGuide() {
+  document.getElementById("projectGuideModal").classList.add("open");
+}
+function closeProjectGuide(event) {
+  if (event && event.target && event.target.id !== "projectGuideModal") return;
+  document.getElementById("projectGuideModal").classList.remove("open");
+}
 function defaultModuleState() {
   return Object.fromEntries(MODULE_IDS.map(id => [id, {open:true, collapsed:false}]));
 }
@@ -3068,7 +3369,10 @@ setInterval(refresh, 5000);
 window.addEventListener("resize", positionGuide);
 window.addEventListener("scroll", positionGuide, true);
 window.addEventListener("keydown", event => {
-  if (event.key === "Escape") closeGuide();
+  if (event.key === "Escape") {
+    closeGuide();
+    closeProjectGuide();
+  }
 });
 </script>
 </body>
@@ -3121,6 +3425,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._file(path, content_types[path.suffix.lower()], download=False)
             else:
                 self._json(404, {"error": "asset not found"})
+        elif self.path.startswith("/docs/"):
+            name = Path(self.path.split("?", 1)[0].split("/docs/", 1)[1]).name
+            path = DOCS_DIR / name
+            if path.exists() and path.is_file() and path.suffix.lower() == ".md":
+                self._file(path, "text/markdown; charset=utf-8", download=False)
+            else:
+                self._json(404, {"error": "doc not found"})
         elif self.path.startswith("/exports/"):
             name = Path(self.path.split("/exports/", 1)[1]).name
             path = EXPORT_DIR / name
