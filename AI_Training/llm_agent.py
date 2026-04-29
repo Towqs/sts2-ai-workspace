@@ -3,6 +3,7 @@ import os
 import re
 import time
 import uuid
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -189,20 +190,288 @@ def intent_damage(intent):
     return nums[0] if nums else 0
 
 
+def compact_text(value, limit=180):
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    return text[:limit]
+
+
+def item_text(item):
+    parts = [
+        item.get("id"),
+        item.get("name"),
+        item.get("title"),
+        item.get("type"),
+        item.get("description"),
+    ]
+    for keyword in item.get("keywords") or []:
+        if isinstance(keyword, dict):
+            parts.extend([keyword.get("id"), keyword.get("name"), keyword.get("title"), keyword.get("description")])
+        else:
+            parts.append(keyword)
+    return " ".join(compact_text(part, 500) for part in parts if part)
+
+
+def number_hint(item, mode):
+    text = item_text(item)
+    lowered = text.lower()
+    if mode == "damage":
+        keys = ("deal", "damage", "attack", "hp loss", "lose hp", "造成", "伤害", "攻击")
+    else:
+        keys = ("block", "defend", "armor", "shield", "格挡", "护甲", "防御")
+    if not any(key in lowered for key in keys):
+        return 0
+    nums = [int(n) for n in re.findall(r"\d+", text)]
+    if not nums:
+        return 0
+    if (" x " in f" {lowered} " or "×" in text or " times" in lowered) and len(nums) >= 2:
+        return nums[0] * nums[1]
+    return nums[0]
+
+
+def semantic_tags(item):
+    text = item_text(item)
+    lowered = text.lower()
+    item_type = str(item.get("type") or "").lower()
+    tags = set()
+    damage = number_hint(item, "damage")
+    block = number_hint(item, "block")
+    if damage:
+        tags.add("damage")
+    if block:
+        tags.add("block")
+    if "attack" in item_type:
+        tags.add("attack")
+    if "skill" in item_type:
+        tags.add("skill")
+    if "power" in item_type:
+        tags.add("power")
+    checks = [
+        ("draw", ("draw", "抽牌", "抽")),
+        ("discard", ("discard", "弃牌", "弃")),
+        ("exhaust", ("exhaust", "消耗")),
+        ("vulnerable", ("vulnerable", "易伤")),
+        ("weak", ("weak", "虚弱")),
+        ("strength", ("strength", "力量")),
+        ("dexterity", ("dexterity", "敏捷")),
+        ("energy", ("energy", "能量")),
+        ("retain", ("retain", "保留")),
+        ("generate_card", ("add a card", "create", "generate", "随机牌", "生成")),
+        ("status_or_curse", ("status", "curse", "wound", "dazed", "burn", "slime", "状态", "诅咒")),
+    ]
+    for tag, keys in checks:
+        if any(key in lowered for key in keys):
+            tags.add(tag)
+    return sorted(tags)
+
+
+def card_semantics(card, index, energy):
+    tags = semantic_tags(card)
+    return {
+        "index": index,
+        "id": card.get("id"),
+        "name": card.get("name") or card.get("title") or card.get("id"),
+        "type": card.get("type"),
+        "cost": card.get("cost"),
+        "can_play": bool(card.get("can_play", False)),
+        "target_type": card.get("target_type"),
+        "tags": tags,
+        "damage_est": number_hint(card, "damage"),
+        "block_est": number_hint(card, "block"),
+        "effect_note": compact_text(card.get("description"), 180),
+        "affordable": bool(card.get("can_play", False)) and card_cost(card, energy) <= energy,
+    }
+
+
+def bounded_combo_value(cards, energy, value_key):
+    energy = max(0, safe_int(energy, 0) or 0)
+    dp = [0] * (energy + 1)
+    free_value = 0
+    for card in cards:
+        if not card.get("can_play"):
+            continue
+        value = max(0, safe_int(card.get(value_key), 0) or 0)
+        if not value:
+            continue
+        cost = max(0, card_cost(card, energy))
+        if cost == 0:
+            free_value += value
+            continue
+        if cost > energy:
+            continue
+        for spent in range(energy, cost - 1, -1):
+            dp[spent] = max(dp[spent], dp[spent - cost] + value)
+    return max(dp) + free_value
+
+
+def pile_tag_summary(cards):
+    counter = Counter()
+    key_cards = set()
+    for card in cards or []:
+        if not isinstance(card, dict):
+            continue
+        tags = semantic_tags(card)
+        counter.update(tags)
+        if any(tag in tags for tag in ("draw", "energy", "power", "strength", "dexterity", "vulnerable", "weak", "status_or_curse")):
+            name = card.get("name") or card.get("title") or card.get("id")
+            if name:
+                key_cards.add(str(name))
+    public_tags = {key: counter[key] for key in sorted(counter) if counter[key]}
+    return public_tags, sorted(key_cards)[:8]
+
+
+def build_pile_summary(player):
+    draw = player.get("draw_pile") or []
+    discard = player.get("discard_pile") or []
+    exhaust = player.get("exhaust_pile") or []
+    draw_tags, draw_keys = pile_tag_summary(draw)
+    discard_tags, discard_keys = pile_tag_summary(discard)
+    exhaust_tags, exhaust_keys = pile_tag_summary(exhaust)
+    draw_count = safe_int(player.get("draw_pile_count"), len(draw)) or 0
+    discard_count = safe_int(player.get("discard_pile_count"), len(discard)) or 0
+    summary = {
+        "draw_count": draw_count,
+        "discard_count": safe_int(player.get("discard_pile_count"), len(discard)) or 0,
+        "exhaust_count": safe_int(player.get("exhaust_pile_count"), len(exhaust)) or 0,
+        "reshuffle_soon": draw_count <= 3 and discard_count > 0,
+    }
+    if draw:
+        summary["draw_tags"] = draw_tags
+        summary["draw_key_cards_public"] = draw_keys
+    if discard:
+        summary["discard_tags"] = discard_tags
+        summary["discard_key_cards"] = discard_keys
+    if exhaust:
+        summary["exhaust_tags"] = exhaust_tags
+        summary["exhaust_key_cards"] = exhaust_keys
+    return summary
+
+
+def classify_potion(potion):
+    tags = set(semantic_tags(potion))
+    text = item_text(potion).lower()
+    if any(key in text for key in ("potion", "药水")):
+        tags.add("potion")
+    if "fire" in text or number_hint(potion, "damage"):
+        tags.add("damage")
+    if number_hint(potion, "block"):
+        tags.add("block")
+    if "weak" in text or "虚弱" in text:
+        tags.add("weak")
+    if "vulnerable" in text or "易伤" in text:
+        tags.add("vulnerable")
+    if "strength" in text or "力量" in text:
+        tags.add("strength")
+    if "dexterity" in text or "敏捷" in text:
+        tags.add("dexterity")
+    if "energy" in text or "能量" in text:
+        tags.add("energy")
+    return sorted(tags)
+
+
+def evaluate_combat(compact):
+    state_type = str(compact.get("state_type") or "").lower()
+    player = compact.get("player") or {}
+    battle = compact.get("battle") or {}
+    hand = player.get("hand") or []
+    enemies = battle.get("enemies") or []
+    hp = safe_int(player.get("hp"), 0) or 0
+    max_hp = max(safe_int(player.get("max_hp"), hp or 1) or 1, 1)
+    block = safe_int(player.get("block"), 0) or 0
+    energy = safe_int(player.get("energy"), 0) or 0
+    incoming = safe_int(battle.get("incoming_damage"), 0) or 0
+    turn_max_damage = bounded_combo_value(hand, energy, "damage_est")
+    turn_max_block = bounded_combo_value(hand, energy, "block_est")
+    enemy_effective_hps = [
+        (safe_int(enemy.get("hp"), 0) or 0) + (safe_int(enemy.get("block"), 0) or 0)
+        for enemy in enemies
+    ]
+    lowest_enemy_effective_hp = min(enemy_effective_hps) if enemy_effective_hps else None
+    lethal_gap = None if lowest_enemy_effective_hp is None else lowest_enemy_effective_hp - turn_max_damage
+    net_incoming = max(0, incoming - block)
+    hp_after_incoming = hp - net_incoming
+    hp_after_best_block = hp - max(0, incoming - block - turn_max_block)
+    survival_gap = max(0, net_incoming - max(hp - 1, 0))
+    is_boss_or_elite = state_type in ("boss", "elite")
+    if hp_after_incoming <= 0 or hp_after_best_block <= 0:
+        risk_level = "lethal_risk"
+        priority = "survive"
+    elif lethal_gap is not None and lethal_gap <= 0:
+        risk_level = "pressured" if is_boss_or_elite else "safe"
+        priority = "visible_lethal"
+    elif hp_after_incoming <= max_hp * 0.30 or incoming >= max_hp * 0.25:
+        risk_level = "danger"
+        priority = "survive"
+    elif hp_after_incoming <= max_hp * 0.50 or is_boss_or_elite:
+        risk_level = "pressured"
+        priority = "balance"
+    else:
+        risk_level = "safe"
+        priority = "advance"
+
+    potion_opportunities = []
+    for potion in player.get("potions") or []:
+        if not isinstance(potion, dict):
+            continue
+        tags = classify_potion(potion)
+        damage = number_hint(potion, "damage")
+        block_value = number_hint(potion, "block")
+        trigger = ""
+        reason = ""
+        if damage and lethal_gap is not None and lethal_gap > 0 and damage >= lethal_gap:
+            trigger = "lethal_bridge"
+            reason = f"potion damage can cover lethal gap {lethal_gap}"
+        elif block_value and (hp_after_incoming <= 0 or hp_after_incoming <= max_hp * 0.30):
+            trigger = "survival_bridge"
+            reason = "potion block can reduce lethal or danger damage"
+        elif is_boss_or_elite and any(tag in tags for tag in ("strength", "dexterity", "energy", "vulnerable", "weak")):
+            trigger = "elite_boss_resource"
+            reason = "boss/elite fight makes scaling or control potion valuable"
+        if trigger:
+            potion_opportunities.append({
+                "slot": potion.get("slot"),
+                "id": potion.get("id"),
+                "name": potion.get("name") or potion.get("id"),
+                "tags": tags,
+                "damage_est": damage,
+                "block_est": block_value,
+                "trigger": trigger,
+                "reason": reason,
+            })
+    return {
+        "priority": priority,
+        "risk_level": risk_level,
+        "incoming_damage": incoming,
+        "net_incoming_after_block": net_incoming,
+        "hp_after_incoming": hp_after_incoming,
+        "hp_after_best_block": hp_after_best_block,
+        "turn_max_damage": turn_max_damage,
+        "turn_max_block": turn_max_block,
+        "lowest_enemy_effective_hp": lowest_enemy_effective_hp,
+        "lethal_gap": lethal_gap,
+        "survival_gap": survival_gap,
+        "is_boss_or_elite": is_boss_or_elite,
+        "potion_opportunities": potion_opportunities[:6],
+    }
+
+
 def compact_state(state):
     player = state.get("player", {})
     battle = state.get("battle", {})
     run = state.get("run", {})
     hand = []
+    energy = player.get("energy") or 0
     for i, card in enumerate(player.get("hand", [])):
-        hand.append({
-            "index": i,
-            "id": card.get("id"),
-            "name": card.get("name") or card.get("title") or card.get("id"),
-            "cost": card.get("cost"),
-            "can_play": bool(card.get("can_play", False)),
-            "target_type": card.get("target_type"),
-        })
+        hand.append(card_semantics(card, i, energy))
+    potions = []
+    for potion in player.get("potions", []):
+        if not isinstance(potion, dict):
+            continue
+        item = dict(potion)
+        item["tags"] = classify_potion(potion)
+        item["damage_est"] = number_hint(potion, "damage")
+        item["block_est"] = number_hint(potion, "block")
+        item["effect_note"] = compact_text(potion.get("description"), 160)
+        potions.append(item)
     enemies = []
     for enemy in battle.get("enemies", []):
         if enemy_hp(enemy) <= 0:
@@ -220,9 +489,9 @@ def compact_state(state):
     net_incoming = max(0, incoming_damage - block)
     affordable_cards = [
         card for card in hand
-        if card.get("can_play") and card_cost(card, player.get("energy") or 0) <= (player.get("energy") or 0)
+        if card.get("affordable")
     ]
-    return {
+    compact = {
         "state_type": state.get("state_type"),
         "run": {
             "act": run.get("act"),
@@ -240,10 +509,11 @@ def compact_state(state):
             "draw_pile_count": player.get("draw_pile_count"),
             "discard_pile_count": player.get("discard_pile_count"),
             "exhaust_pile_count": player.get("exhaust_pile_count"),
+            "pile_summary": build_pile_summary(player),
             "hand": hand,
             "affordable_cards": [{"index": c["index"], "id": c["id"], "cost": c["cost"]} for c in affordable_cards],
             "relics": player.get("relics", [])[:12],
-            "potions": player.get("potions", []),
+            "potions": potions,
         },
         "battle": {
             "round": battle.get("round"),
@@ -260,6 +530,8 @@ def compact_state(state):
         "screen": state.get("screen", {}),
         "next_options": state.get("next_options", []),
     }
+    compact["combat_eval"] = evaluate_combat(compact)
+    return compact
 
 
 def action_catalog(compact):
@@ -554,9 +826,10 @@ def call_openai_compatible(cfg, compact, actions):
             "For potions, slot must be one listed potion slot; target must be one listed enemy entity_id when required.",
             "Prefer playing useful zero-cost cards before spending energy.",
             "Do not end turn while affordable playable cards remain unless clearly justified.",
-            "Use battle.incoming_damage, battle.net_incoming_after_block, and battle.hp_after_incoming to decide whether blocking is mandatory.",
-            "In boss or elite fights, consider using potions before the player is in lethal danger.",
-            "Use run.act, run.floor, battle.round, relics, potions, and pile counts when explaining risk.",
+            "Use combat_eval.priority, risk_level, lethal_gap, survival_gap, turn_max_damage, and turn_max_block as the main tactical summary.",
+            "Use combat_eval.potion_opportunities before hoarding potions in lethal, danger, boss, or elite situations.",
+            "Use current hand tags/effect_note to understand draw, discard, exhaust, weak, vulnerable, power, strength, dexterity, and energy effects.",
+            "Use pile_summary only as public deck-cycle context; do not assume hidden draw order.",
             "Shop purchases are suggestions unless execution is explicitly enabled.",
         ],
         "state": compact,
@@ -607,7 +880,10 @@ def call_openai_candidate_selector(cfg, compact, candidates):
             "Candidate payloads are read-only; never modify or invent them.",
             "Prefer useful zero-cost cards before spending energy.",
             "Do not choose end_turn while affordable playable cards remain unless clearly justified.",
-            "Use battle.incoming_damage, battle.net_incoming_after_block, and battle.hp_after_incoming to decide whether blocking is mandatory.",
+            "Use combat_eval.priority, risk_level, lethal_gap, survival_gap, turn_max_damage, and turn_max_block as the main tactical summary.",
+            "Use combat_eval.potion_opportunities before hoarding potions in lethal, danger, boss, or elite situations.",
+            "Use current hand tags/effect_note to understand draw, discard, exhaust, weak, vulnerable, power, strength, dexterity, and energy effects.",
+            "Use pile_summary only as public deck-cycle context; do not assume hidden draw order.",
             "Shop purchases are suggestions unless execution is explicitly enabled.",
         ],
         "state": compact,
@@ -944,7 +1220,7 @@ def should_execute(cfg, payload, state):
     if cfg.get("mode") != "combat_auto" or not cfg.get("execute_combat"):
         return False
     state_type = str(state.get("state_type") or "").lower()
-    return state_type in COMBAT_TYPES and payload.get("action") in ("play_card", "end_turn")
+    return state_type in COMBAT_TYPES and payload.get("action") in ("play_card", "use_potion", "end_turn")
 
 
 def error_backoff_seconds(error_text, consecutive_errors):
@@ -1079,6 +1355,9 @@ def run_agent():
                 "selected_candidate": selected_candidate,
                 "payload": payload,
                 "validation": validation,
+                "combat_eval": compact.get("combat_eval"),
+                "pile_summary": (compact.get("player") or {}).get("pile_summary"),
+                "potion_opportunities": (compact.get("combat_eval") or {}).get("potion_opportunities", []),
                 "executed": bool(execute and payload),
                 "ok": ok,
                 "result": result,

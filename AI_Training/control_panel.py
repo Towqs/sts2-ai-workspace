@@ -644,6 +644,10 @@ def llm_logic_snapshot():
         player = compact.get("player", {})
         hand = player.get("hand", [])
         data["hand_summary"] = [c.get("id") for c in hand]
+        data.setdefault("combat_eval", compact.get("combat_eval"))
+        data.setdefault("pile_summary", player.get("pile_summary"))
+        combat_eval = compact.get("combat_eval") if isinstance(compact.get("combat_eval"), dict) else {}
+        data.setdefault("potion_opportunities", combat_eval.get("potion_opportunities", []))
         data.pop("compact_state", None)
     return data
 
@@ -2588,6 +2592,10 @@ function renderLLMLogic(logic, cfg) {
   const suggestion = d.candidate_id || d.action || "-";
   const args = d.candidate_id ? {candidate_id: d.candidate_id} : (d.args || {});
   const raw = logic.raw_response ? escapeHtml(String(logic.raw_response).slice(0, 1200)) : "-";
+  const combatEval = logic.combat_eval || {};
+  const pile = logic.pile_summary || {};
+  const potionOps = logic.potion_opportunities || [];
+  const potionText = potionOps.map(p => `${p.name || p.id || "药水"}:${p.trigger || "-"}`).join(", ") || "-";
   setPill("llmDecisionBadge", logic.executed ? "已执行" : "建议", logic.executed ? "on" : "info");
   document.getElementById("llmLogic").innerHTML = `
     <div class="kv"><span>时间</span><span>${logic.time || "-"}</span></div>
@@ -2597,6 +2605,10 @@ function renderLLMLogic(logic, cfg) {
     <div class="kv"><span>场景</span><span>${logic.state_type || "-"}</span></div>
     <div class="kv"><span>建议</span><span class="strong">${suggestion}</span></div>
     <div class="kv"><span>候选</span><span>${selected.id || "-"} / ${(logic.candidate_actions || []).length} 个</span></div>
+    <div class="kv"><span>战斗判断</span><span>${combatEval.priority || "-"} / ${combatEval.risk_level || "-"}</span></div>
+    <div class="kv"><span>攻防估算</span><span>伤害 ${combatEval.turn_max_damage ?? "-"}，格挡 ${combatEval.turn_max_block ?? "-"}，斩杀差 ${combatEval.lethal_gap ?? "-"}</span></div>
+    <div class="kv"><span>药水机会</span><span>${escapeHtml(potionText)}</span></div>
+    <div class="kv"><span>牌堆</span><span>抽 ${pile.draw_count ?? "-"} / 弃 ${pile.discard_count ?? "-"} / 消耗 ${pile.exhaust_count ?? "-"}</span></div>
     <div class="kv"><span>参数</span><code>${JSON.stringify(args)}</code></div>
     <div class="kv"><span>校验</span><span>${logic.validation || "-"}</span></div>
     <div class="kv"><span>执行</span><span>${logic.executed ? "是" : "否"} ${logic.ok === false ? "(失败)" : ""}</span></div>
