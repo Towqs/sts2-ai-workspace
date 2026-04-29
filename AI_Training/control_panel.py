@@ -679,6 +679,7 @@ def run_training_background():
             output = []
             try:
                 for cmd in [
+                    [str(PYTHON_EXE), str(AI_DIR / "monster_profile_builder.py")],
                     [str(PYTHON_EXE), str(AI_DIR / "data_pipeline.py")],
                     [str(PYTHON_EXE), str(AI_DIR / "train_bc.py")],
                     [str(PYTHON_EXE), str(AI_DIR / "train_candidate_bc.py")],
@@ -708,7 +709,7 @@ def export_database_package():
     filename = f"sts2_dataset_package_{stamp}.zip"
     zip_path = EXPORT_DIR / filename
 
-    include_roots = ["Human", "AI", "Combat", "Macro"]
+    include_roots = ["Human", "AI", "Combat", "Macro", "Monster"]
     include_files = [
         "discarded_runs.json",
         "run_labels.json",
@@ -821,6 +822,36 @@ def models_status():
     }
 
 
+def monster_status():
+    monster_dir = DATA_DIR / "Monster"
+    summary = read_json(monster_dir / "monster_build_summary.json", {})
+    profiles = read_json(monster_dir / "monster_profiles.json", {})
+    monsters = profiles.get("monsters") if isinstance(profiles.get("monsters"), dict) else {}
+    top_monsters = []
+    for key, profile in sorted(
+        monsters.items(),
+        key=lambda item: int((item[1] or {}).get("turn_observations") or 0),
+        reverse=True,
+    )[:8]:
+        top_monsters.append({
+            "key": key,
+            "name": (profile or {}).get("display_name") or key,
+            "turn_observations": (profile or {}).get("turn_observations", 0),
+            "encounters_seen": (profile or {}).get("encounters_seen", 0),
+            "avg_hp_lost": (profile or {}).get("avg_hp_lost"),
+            "max_incoming_damage": (profile or {}).get("max_incoming_damage", 0),
+        })
+    return {
+        "ready": bool(monsters),
+        "dir": file_status(monster_dir),
+        "summary": summary,
+        "profiles": file_status(monster_dir / "monster_profiles.json"),
+        "encounters": file_status(monster_dir / "encounter_profiles.json"),
+        "vocab": file_status(DATA_DIR / "Processed" / "monster_vocab.json"),
+        "top_monsters": top_monsters,
+    }
+
+
 def script_newer_than_start(script_path, started_at):
     if not started_at or not script_path.exists():
         return False
@@ -857,6 +888,7 @@ def status_payload():
         "ai_pid": ai_process.get("pid"),
         "ai_process": ai_process,
         "models": models_status(),
+        "monster_profiles": monster_status(),
         "game": {
             "online": "error" not in game,
             "error": game.get("error"),
@@ -2341,7 +2373,7 @@ function renderStatus(s) {
   renderPolicyEvaluation(s.evaluation || {});
   renderLiveActivity(s.recent_records || []);
   renderRecentRecords(s.recent_records || []);
-  renderModelHealth(s.models || {}, s.ai_process || {}, s.control || {}, s.python_runtime || {});
+  renderModelHealth(s.models || {}, s.ai_process || {}, s.control || {}, s.python_runtime || {}, s.monster_profiles || {});
   renderAiLogic(s.ai_logic);
   renderLLMLogic(s.llm && s.llm.logic, llmCfg);
 
@@ -2404,9 +2436,11 @@ function renderCurrentData(data) {
     <div class="check-list">${checks}</div>
     <div class="warning-list">${warnings || '<div><span class="pill on">正常</span> 最近 run 有数据写入</div>'}</div>`;
 }
-function renderModelHealth(models, aiProcess, control, runtime) {
+function renderModelHealth(models, aiProcess, control, runtime, monsterProfiles) {
   const combat = models.combat || {};
   const macro = models.macro || {};
+  const monster = monsterProfiles || {};
+  const monsterSummary = monster.summary || {};
   const combatMeta = combat.metadata || {};
   const macroSummary = macro.summary || {};
   const macroMeta = macro.metadata || {};
@@ -2431,6 +2465,7 @@ function renderModelHealth(models, aiProcess, control, runtime) {
   document.getElementById("modelHealth").innerHTML = `
     <div class="kv"><span>战斗模型</span><span><span class="pill ${combat.ready ? "on" : "off"}">${combat.ready ? "可用" : "缺失"}</span> 样本 ${combatMeta.samples || "-"}，特征 ${combatMeta.features || "旧版"} ${combat.model && combat.model.mtime ? combat.model.mtime : ""}</span></div>
     <div class="kv"><span>宏观模型</span><span><span class="pill ${macro.ready ? "on" : "off"}">${macro.ready ? "可用" : "缺失"}</span> 样本 ${macroSummary.samples || macroMeta.samples || 0}，动作 ${macroSummary.actions || macroMeta.classes || 0}</span></div>
+    <div class="kv"><span>怪物画像</span><span><span class="pill ${monster.ready ? "on" : "warn"}">${monster.ready ? "可用" : "待生成"}</span> 怪物 ${monsterSummary.monsters || 0}，战斗 ${monsterSummary.encounters || 0}，回合样本 ${monsterSummary.monster_turn_rows || 0}</span></div>
     <div class="kv"><span>Python</span><span><span class="pill ${runtime && runtime.agent_ready ? "on" : "warn"}">${runtime && runtime.agent_ready ? "依赖可用" : "缺依赖"}</span> ${escapeHtml((runtime && runtime.executable) || "-")} ${runtime && runtime.version ? `(${runtime.version})` : ""}</span></div>
     <div class="kv"><span>AI 进程</span><span>${aiProcess.pid ? `PID ${aiProcess.pid}` : "未启动"}${aiProcess.started_at ? `，启动 ${aiProcess.started_at}` : ""}</span></div>
     <div class="kv"><span>宏观执行</span><span><span class="pill ${control.macro_enabled ? "warn" : "info"}">${control.macro_enabled ? "开启" : "关闭"}</span> ${control.macro_enabled ? "会自动点地图/奖励/选卡" : "只显示战斗托管"}</span></div>
