@@ -10,6 +10,7 @@
 
 - [`docs/ai_training_roadmap.md`](docs/ai_training_roadmap.md)
 - [`docs/startup.md`](docs/startup.md)：一键启动控制台、日志窗口、BC AI 和 LLM。
+- [`docs/llm_combat_decision_mode.md`](docs/llm_combat_decision_mode.md)：LLM 作为战斗大脑、本地代码负责伤害/防御/药水计算的设计稿。
 
 ## 仓库结构
 
