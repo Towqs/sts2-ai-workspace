@@ -1,6 +1,7 @@
 import json
 import os
 import signal
+import shutil
 import subprocess
 import sys
 import threading
@@ -34,10 +35,44 @@ LLM_LOGIC_PATH = AI_DIR / "llm_logic_state.json"
 DISCARDED_PATH = DATA_DIR / "discarded_runs.json"
 SERVER_STATE_PATH = AI_DIR / "control_panel_state.json"
 DEFAULT_PYTHON_EXE = WORKSPACE / ".venv" / "Scripts" / "python.exe"
-PYTHON_EXE = Path(os.environ.get("STS2_AI_PYTHON") or (DEFAULT_PYTHON_EXE if DEFAULT_PYTHON_EXE.exists() else sys.executable))
 AGENT_PATH = AI_DIR / "ai_agent.py"
 LLM_AGENT_PATH = AI_DIR / "llm_agent.py"
 API_URL = "http://localhost:15526/api/v1/singleplayer"
+
+
+def python_exe_runs(candidate):
+    if not candidate:
+        return False
+    try:
+        proc = subprocess.run([str(candidate), "--version"], capture_output=True, text=True, timeout=5)
+        return proc.returncode == 0 and "Python" in ((proc.stdout or "") + (proc.stderr or ""))
+    except Exception:
+        return False
+
+
+def resolve_python_exe():
+    candidates = [
+        os.environ.get("STS2_AI_PYTHON"),
+        str(DEFAULT_PYTHON_EXE),
+        str(Path.home() / ".cache" / "codex-runtimes" / "codex-primary-runtime" / "dependencies" / "python" / "python.exe"),
+        sys.executable,
+        shutil.which("python"),
+        shutil.which("py"),
+    ]
+    seen = set()
+    for candidate in candidates:
+        if not candidate:
+            continue
+        key = str(candidate).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        if python_exe_runs(candidate):
+            return Path(candidate)
+    return Path(sys.executable)
+
+
+PYTHON_EXE = resolve_python_exe()
 
 DEFAULT_CONTROL = {
     "ai_enabled": False,
@@ -45,7 +80,7 @@ DEFAULT_CONTROL = {
     "macro_shop_enabled": False,
     "record_ai_actions": True,
     "include_ai_in_training": False,
-    "next_run_mode": "new",
+    "next_run_mode": "auto",
     "collection_enabled": True,
     "collection_disabled_since": None,
     "collection_disabled_ranges": [],
@@ -75,6 +110,9 @@ LAST_TRAIN = {"running": False, "started": None, "finished": None, "output": ""}
 LAST_EXPORT = {"path": None, "filename": None, "created": None, "size": 0, "file_count": 0}
 LLM_TEST_STATE = {"running": False, "last_started": 0.0, "last_finished": 0.0}
 GAME_CACHE = {"state": None, "ts": 0.0}
+PYTHON_RUNTIME_CACHE = {"ts": 0.0, "data": None}
+REQUIRED_AGENT_MODULES = ["requests", "torch", "numpy", "colorama"]
+REQUIRED_TRAINING_MODULES = ["numpy", "torch"]
 
 
 def read_json(path, default):
@@ -102,7 +140,7 @@ def update_control(patch):
     for key in DEFAULT_CONTROL:
         if key in patch:
             if key == "next_run_mode":
-                data[key] = patch[key] if patch[key] in ("new", "continue") else "new"
+                data[key] = patch[key] if patch[key] in ("auto", "new", "continue") else "auto"
             elif key == "min_training_quality":
                 data[key] = patch[key] if patch[key] in QUALITY_ORDER else "unknown"
             elif key == "collection_enabled":
@@ -398,6 +436,63 @@ def ensure_llm_profiles_initialized():
         write_json(LLM_CONFIG_PATH, _upsert_current_llm_profile(data))
 
 
+def python_runtime_status(force=False):
+    now = time.time()
+    cached = PYTHON_RUNTIME_CACHE.get("data")
+    if cached and not force and now - float(PYTHON_RUNTIME_CACHE.get("ts") or 0) < 60:
+        return cached
+
+    modules = sorted(set(REQUIRED_AGENT_MODULES + REQUIRED_TRAINING_MODULES))
+    code = (
+        "import importlib, json, sys;"
+        f"mods={modules!r};"
+        "missing=[];"
+        "\nfor m in mods:\n"
+        "    try:\n"
+        "        importlib.import_module(m)\n"
+        "    except Exception:\n"
+        "        missing.append(m)\n"
+        "print(json.dumps({'executable': sys.executable, 'version': sys.version.split()[0], 'missing': missing}))"
+    )
+    status = {
+        "executable": str(PYTHON_EXE),
+        "version": "",
+        "ok": False,
+        "missing": modules,
+        "agent_ready": False,
+        "training_ready": False,
+        "message": "",
+    }
+    try:
+        proc = subprocess.run(
+            [str(PYTHON_EXE), "-c", code],
+            cwd=str(WORKSPACE),
+            capture_output=True,
+            text=True,
+            timeout=12,
+        )
+        if proc.returncode == 0:
+            payload = json.loads((proc.stdout or "{}").strip().splitlines()[-1])
+            missing = payload.get("missing") or []
+            status.update({
+                "executable": payload.get("executable") or str(PYTHON_EXE),
+                "version": payload.get("version") or "",
+                "ok": True,
+                "missing": missing,
+                "agent_ready": not any(m in missing for m in REQUIRED_AGENT_MODULES),
+                "training_ready": not any(m in missing for m in REQUIRED_TRAINING_MODULES),
+                "message": "ok" if not missing else "缺少模块：" + ", ".join(missing),
+            })
+        else:
+            detail = (proc.stderr or proc.stdout or "").strip()
+            status["message"] = detail[-500:] if detail else f"Python exited {proc.returncode}"
+    except Exception as exc:
+        status["message"] = str(exc)
+
+    PYTHON_RUNTIME_CACHE.update({"ts": now, "data": status})
+    return status
+
+
 def post_game_action(payload):
     req = Request(
         API_URL,
@@ -458,6 +553,14 @@ def start_ai():
     pid = get_ai_pid()
     if pid:
         return {"status": "ok", "message": f"AI already running, pid={pid}", "pid": pid}
+    runtime = python_runtime_status()
+    if not runtime.get("agent_ready"):
+        missing = [m for m in REQUIRED_AGENT_MODULES if m in (runtime.get("missing") or [])] or REQUIRED_AGENT_MODULES
+        return {
+            "status": "error",
+            "message": "AI 未启动：Python 环境缺少 " + ", ".join(missing),
+            "python_runtime": runtime,
+        }
     proc = subprocess.Popen(
         [str(PYTHON_EXE), str(AGENT_PATH)],
         cwd=str(WORKSPACE),
@@ -553,6 +656,18 @@ def ai_logic_snapshot():
 
 
 def run_training_background():
+    runtime = python_runtime_status()
+    if not runtime.get("training_ready"):
+        missing = [m for m in REQUIRED_TRAINING_MODULES if m in (runtime.get("missing") or [])] or REQUIRED_TRAINING_MODULES
+        message = "训练未启动：Python 环境缺少 " + ", ".join(missing)
+        LAST_TRAIN.update({
+            "running": False,
+            "started": None,
+            "finished": datetime.now().isoformat(timespec="seconds"),
+            "output": message,
+        })
+        return {"status": "error", "message": message, "python_runtime": runtime}
+
     def worker():
         with TRAIN_LOCK:
             LAST_TRAIN.update({"running": True, "started": datetime.now().isoformat(timespec="seconds"), "finished": None, "output": ""})
@@ -751,6 +866,7 @@ def status_payload():
         "current_data": current_data_summary(),
         "recent_records": recent_records(),
         "evaluation": evaluation_summary(limit=50),
+        "python_runtime": python_runtime_status(),
         "ai_logic": ai_logic_snapshot(),
         "llm": {
             "config": read_llm_config(mask_key=True),
@@ -887,7 +1003,7 @@ INDEX_HTML = r"""<!doctype html>
     button.bad { background:var(--bad); color:#fff; border-color:var(--bad); }
     .button-row { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
     .button-row button, .field select { width:100%; }
-    .segmented { display:grid; grid-template-columns:1fr 1fr; gap:6px; background:#eef1f5; padding:4px; border-radius:8px; }
+    .segmented { display:grid; grid-template-columns:repeat(auto-fit, minmax(96px, 1fr)); gap:6px; background:#eef1f5; padding:4px; border-radius:8px; }
     .segmented button { border:0; background:transparent; }
     .segmented button.active { background:#fff; color:var(--blue); box-shadow:var(--shadow); }
     .switch {
@@ -979,6 +1095,22 @@ INDEX_HTML = r"""<!doctype html>
     .table-wrap { overflow:auto; border:1px solid #eef1f5; border-radius:8px; }
     .table-wrap table th, .table-wrap table td { white-space:nowrap; }
     .run-id { max-width:260px; white-space:normal; }
+    .compact-card {
+      border:1px solid #eef1f5;
+      border-radius:8px;
+      background:var(--panel-2);
+      padding:12px;
+      display:grid;
+      gap:8px;
+    }
+    .compact-card-title { font-weight:700; overflow-wrap:anywhere; }
+    details.more-panel { margin-top:10px; }
+    details.more-panel summary {
+      cursor:pointer;
+      color:var(--blue);
+      font-weight:700;
+      margin-bottom:10px;
+    }
     .modal-backdrop {
       display:none;
       position:fixed;
@@ -1188,10 +1320,11 @@ INDEX_HTML = r"""<!doctype html>
           <span id="nextRunBadge" class="pill info">-</span>
         </div>
         <div class="segmented">
-          <button id="modeNew" onclick="setRunMode('new')">新游戏</button>
-          <button id="modeContinue" onclick="setRunMode('continue')">继续游戏</button>
+          <button id="modeAuto" onclick="setRunMode('auto')">自动检测</button>
+          <button id="modeNew" onclick="setRunMode('new')">强制新局一次</button>
+          <button id="modeContinue" onclick="setRunMode('continue')">续接旧 Run</button>
         </div>
-        <div class="fine" style="margin-top:10px">这里标记接下来的数据意图，便于区分新 episode 和续接片段。</div>
+        <div class="fine" style="margin-top:10px">推荐用自动检测。手动按钮仍保留：如果你在主菜单明确要重开，点“强制新局一次”；如果是中途接回旧档，点“续接旧 Run”。</div>
       </section>
     </div>
 
@@ -1229,14 +1362,18 @@ INDEX_HTML = r"""<!doctype html>
       <section>
         <div class="section-head">
           <h2>最近 Run</h2>
-          <span class="fine">质量和数据完整度分开看</span>
+          <span id="runsBadge" class="pill info">-</span>
         </div>
-        <div class="table-wrap">
-          <table>
-            <thead><tr><th>Run</th><th>进度</th><th>动作</th><th>来源</th><th>结果</th><th>质量</th><th>数据</th><th>保留</th><th></th></tr></thead>
-            <tbody id="runs"></tbody>
-          </table>
-        </div>
+        <div id="latestRunCard" class="compact-card">读取中</div>
+        <details class="more-panel">
+          <summary>展开更多 Run</summary>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Run</th><th>进度</th><th>动作</th><th>来源</th><th>结果</th><th>质量</th><th>数据</th><th>保留</th><th></th></tr></thead>
+              <tbody id="runs"></tbody>
+            </table>
+          </div>
+        </details>
       </section>
 
       <section>
@@ -1255,11 +1392,12 @@ INDEX_HTML = r"""<!doctype html>
       <section>
         <div class="section-head">
           <h2>最近采集记录</h2>
-          <span class="fine">最近 12 条</span>
+          <span class="fine">原始事件流</span>
         </div>
+        <div class="notice">这里不是“每个 Run 一行”，而是 Mod/AI 写入的原始事件流：战斗开始、回合开始、出牌、回合结束、奖励、地图等都会各占一条。看 run 总结优先看上面的“最近 Run”。</div>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>时间</th><th>类型</th><th>来源</th><th>动作</th><th>文件</th></tr></thead>
+            <thead><tr><th>时间</th><th>记录类型</th><th>来源</th><th>动作/结果</th><th>文件</th></tr></thead>
             <tbody id="recentRecords"></tbody>
           </table>
         </div>
@@ -1444,16 +1582,19 @@ function renderStatus(s) {
   setPill("aiProcessBadge", s.ai_pid ? (s.ai_process && s.ai_process.needs_restart ? "需重启" : "运行中") : "未启动", s.ai_pid ? ((s.ai_process && s.ai_process.needs_restart) ? "warn" : "on") : "warn");
   setPill("llmProcessBadge", s.llm && s.llm.pid ? "运行中" : "未启动", s.llm && s.llm.pid ? "on" : "warn");
   setPill("collectBadge", s.control.collection_enabled ? "启用" : "暂停", s.control.collection_enabled ? "on" : "off");
-  setPill("nextRunBadge", s.control.next_run_mode === "continue" ? "继续游戏" : "新游戏", "info");
-  document.getElementById("modeNew").className = s.control.next_run_mode === "new" ? "active" : "";
-  document.getElementById("modeContinue").className = s.control.next_run_mode === "continue" ? "active" : "";
+  const runMode = s.control.next_run_mode || "auto";
+  const runModeLabel = runMode === "new" ? "强制新局一次" : (runMode === "continue" ? "续接旧 Run" : "自动检测");
+  setPill("nextRunBadge", runModeLabel, runMode === "new" ? "warn" : "info");
+  document.getElementById("modeAuto").className = runMode === "auto" ? "active" : "";
+  document.getElementById("modeNew").className = runMode === "new" ? "active" : "";
+  document.getElementById("modeContinue").className = runMode === "continue" ? "active" : "";
   renderExport(s.export);
 
   renderCurrentData(s.current_data);
   renderRuns(s.runs || []);
   renderPolicyEvaluation(s.evaluation || {});
   renderRecentRecords(s.recent_records || []);
-  renderModelHealth(s.models || {}, s.ai_process || {}, s.control || {});
+  renderModelHealth(s.models || {}, s.ai_process || {}, s.control || {}, s.python_runtime || {});
   renderAiLogic(s.ai_logic);
   renderLLMLogic(s.llm && s.llm.logic, llmCfg);
 
@@ -1516,7 +1657,7 @@ function renderCurrentData(data) {
     <div class="check-list">${checks}</div>
     <div class="warning-list">${warnings || '<div><span class="pill on">正常</span> 最近 run 有数据写入</div>'}</div>`;
 }
-function renderModelHealth(models, aiProcess, control) {
+function renderModelHealth(models, aiProcess, control, runtime) {
   const combat = models.combat || {};
   const macro = models.macro || {};
   const combatMeta = combat.metadata || {};
@@ -1528,6 +1669,7 @@ function renderModelHealth(models, aiProcess, control) {
   if (!combat.ready) warnings.push("战斗 BC 模型缺失，需要重训。");
   if (!macro.ready) warnings.push("宏观 BC 模型缺失，需要先训练宏观模型。");
   if (needsRestart) warnings.push("AI 进程早于当前 ai_agent.py，必须重启 AI 后宏观执行才会生效。");
+  if (runtime && runtime.agent_ready === false) warnings.push(`当前 Python 缺少 AI 依赖：${(runtime.missing || []).join(", ")}。网页能开，但启动 AI / 重训会失败。`);
   if (control.macro_enabled && !macro.ready) warnings.push("宏观开关已打开，但宏观模型不可用。");
   if (control.macro_enabled && !control.macro_shop_enabled) warnings.push("商店保护已开启：AI 不会买东西，也不会自动离开商店。");
   setPill("modelBadge", ready ? (needsRestart ? "需重启" : "可用") : "缺模型", ready ? (needsRestart ? "warn" : "on") : "off");
@@ -1542,6 +1684,7 @@ function renderModelHealth(models, aiProcess, control) {
   document.getElementById("modelHealth").innerHTML = `
     <div class="kv"><span>战斗模型</span><span><span class="pill ${combat.ready ? "on" : "off"}">${combat.ready ? "可用" : "缺失"}</span> 样本 ${combatMeta.samples || "-"}，特征 ${combatMeta.features || "旧版"} ${combat.model && combat.model.mtime ? combat.model.mtime : ""}</span></div>
     <div class="kv"><span>宏观模型</span><span><span class="pill ${macro.ready ? "on" : "off"}">${macro.ready ? "可用" : "缺失"}</span> 样本 ${macroSummary.samples || macroMeta.samples || 0}，动作 ${macroSummary.actions || macroMeta.classes || 0}</span></div>
+    <div class="kv"><span>Python</span><span><span class="pill ${runtime && runtime.agent_ready ? "on" : "warn"}">${runtime && runtime.agent_ready ? "依赖可用" : "缺依赖"}</span> ${escapeHtml((runtime && runtime.executable) || "-")} ${runtime && runtime.version ? `(${runtime.version})` : ""}</span></div>
     <div class="kv"><span>AI 进程</span><span>${aiProcess.pid ? `PID ${aiProcess.pid}` : "未启动"}${aiProcess.started_at ? `，启动 ${aiProcess.started_at}` : ""}</span></div>
     <div class="kv"><span>宏观执行</span><span><span class="pill ${control.macro_enabled ? "warn" : "info"}">${control.macro_enabled ? "开启" : "关闭"}</span> ${control.macro_enabled ? "会自动点地图/奖励/选卡" : "只显示战斗托管"}</span></div>
     <div class="kv"><span>商店保护</span><span><span class="pill ${control.macro_shop_enabled ? "warn" : "on"}">${control.macro_shop_enabled ? "允许购买" : "保护中"}</span> ${control.macro_shop_enabled ? "AI 可买明确商品；不自动删牌" : "AI 不碰商店，避免抢操作"}</span></div>
@@ -1549,6 +1692,22 @@ function renderModelHealth(models, aiProcess, control) {
     ${warningHtml}`;
 }
 function renderRuns(runs) {
+  setPill("runsBadge", `${runs.length || 0} 条`, runs.length ? "info" : "warn");
+  const latest = runs[0];
+  if (!latest) {
+    document.getElementById("latestRunCard").innerHTML = '<div class="muted">暂无 Run 数据</div>';
+    document.getElementById("runs").innerHTML = "<tr><td colspan=9>暂无数据</td></tr>";
+    return;
+  }
+  document.getElementById("latestRunCard").innerHTML = `
+    <div class="compact-card-title"><code>${latest.run_id}</code></div>
+    <div class="row">
+      <span class="pill ${dataHealthClass(latest.data_health)}">${latest.data_health_label || "-"}</span>
+      <span class="pill ${latest.discarded ? "off" : "on"}">${latest.discarded ? "丢弃" : "保留"}</span>
+      <span class="fine">${latest.last_time || ""}</span>
+    </div>
+    <div class="fine">Act ${latest.max_act || 0} / Floor ${latest.max_floor || 0}，记录 ${latest.records || 0}，战斗 ${latest.combat || 0}，宏观 ${latest.macro || 0}</div>
+    <div class="fine">出牌 ${latest.play_card || 0}，结束回合 ${latest.end_turn || 0}，非法动作 ${latest.invalid_actions || 0}</div>`;
   const rows = runs.map(run => `
     <tr>
       <td class="run-id"><code>${run.run_id}</code><br><span class="fine">${run.last_time || ""}</span></td>
@@ -1581,8 +1740,19 @@ function renderPolicyEvaluation(evaluation) {
   document.getElementById("policyEval").innerHTML = rows || "<tr><td colspan=6>暂无可评测 run</td></tr>";
 }
 function renderRecentRecords(records) {
+  const typeLabels = {
+    game_start: "开局",
+    game_resume: "续局",
+    battle_start: "战斗开始",
+    turn_start: "回合开始",
+    action: "战斗动作",
+    macro_action: "宏观动作",
+    turn_end: "回合结束",
+    battle_end: "战斗结算",
+    run_end: "Run 结束"
+  };
   document.getElementById("recentRecords").innerHTML = records.slice(0, 12).map(r => `
-    <tr><td>${r.time || ""}</td><td>${r.type || ""}</td><td>${r.source || ""}</td><td>${r.action_type || r.result || ""}</td><td>${r.file || ""}</td></tr>
+    <tr><td>${r.time || ""}</td><td>${typeLabels[r.type] || r.type || ""}</td><td>${r.source || ""}</td><td>${r.action_type || r.result || ""}</td><td>${r.file || ""}</td></tr>
   `).join("") || "<tr><td colspan=5>暂无记录</td></tr>";
 }
 function renderAiLogic(logic) {

@@ -249,7 +249,11 @@ if (-not $NoAgents -and -not $DryRun) {
     $status = Get-PanelStatus
 
     if (-not $NoAi) {
-        if ((Test-CombatModelReady $status) -or $ForceAi) {
+        $agentReady = [bool]($status -and $status.python_runtime -and $status.python_runtime.agent_ready)
+        if (-not $agentReady -and -not $ForceAi) {
+            $missing = @($status.python_runtime.missing) -join ", "
+            Write-Warning "AI not started: Python dependencies are missing ($missing). Rebuild .venv or use -ForceAi."
+        } elseif ((Test-CombatModelReady $status) -or $ForceAi) {
             $aiResult = Invoke-PanelPost "/api/ai/start"
             if ($aiResult) {
                 Write-Host ("AI:  " + $aiResult.message)

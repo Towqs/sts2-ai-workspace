@@ -320,7 +320,7 @@ namespace STS2_MCP
                 string updated = System.Text.RegularExpressions.Regex.Replace(
                     json,
                     "\"next_run_mode\"\\s*:\\s*\"new\"",
-                    "\"next_run_mode\": \"continue\""
+                    "\"next_run_mode\": \"auto\""
                 );
                 File.WriteAllText(_controlPath, updated);
                 return true;
