@@ -35,6 +35,32 @@ DEFAULT_CONFIG = {
 }
 
 COMBAT_TYPES = {"monster", "elite", "boss"}
+PLACEHOLDER_TARGETS = {
+    "",
+    "enemy",
+    "target",
+    "required enemy entity_id",
+    "one battle.enemies entity_id",
+    "enemy entity_id",
+}
+RAW_TO_CATALOG_ACTION = {
+    "play_card": "combat_play_card",
+    "use_potion": "combat_use_potion",
+    "end_turn": "combat_end_turn",
+    "choose_map_node": "map_choose_node",
+    "claim_reward": "rewards_claim",
+    "select_card_reward": "rewards_pick_card",
+    "skip_card_reward": "rewards_skip_card",
+    "shop_purchase": "shop_purchase",
+    "choose_event_option": "event_choose_option",
+    "choose_rest_option": "rest_choose_option",
+    "advance_dialogue": "event_advance_dialogue",
+    "proceed": "proceed_to_map",
+}
+CATALOG_TO_RAW_ACTION = {v: k for k, v in RAW_TO_CATALOG_ACTION.items()}
+CATALOG_TO_RAW_ACTION.update({
+    "wait": "wait",
+})
 
 
 def read_json(path, default):
@@ -125,8 +151,38 @@ def enemy_id(enemy):
     return enemy.get("entity_id") or enemy.get("id") or enemy.get("name") or ""
 
 
+def safe_int(value, default=None):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def needs_enemy_target(item):
+    target_type = str((item or {}).get("target_type") or "").lower()
+    return target_type in ("anyenemy", "enemy", "singleenemy")
+
+
+def compact_card_by_index(compact, index):
+    for card in ((compact.get("player") or {}).get("hand") or []):
+        if safe_int(card.get("index"), -1) == index:
+            return card
+    return None
+
+
+def compact_potion_by_slot(compact, slot):
+    for potion in ((compact.get("player") or {}).get("potions") or []):
+        if safe_int(potion.get("slot"), -1) == slot:
+            return potion
+    return None
+
+
 def intent_damage(intent):
-    text = str(intent.get("label") or intent.get("description") or "")
+    if isinstance(intent, str):
+        text = intent
+    else:
+        intent = intent or {}
+        text = str(intent.get("label") or intent.get("description") or intent.get("type") or "")
     nums = [int(n) for n in re.findall(r"\d+", text)]
     if ("x" in text.lower() or "×" in text) and len(nums) >= 2:
         return nums[0] * nums[1]
@@ -394,6 +450,42 @@ def candidate_action_catalog(state, compact):
     return candidates
 
 
+def action_catalog_from_candidates(candidates):
+    """Expose exact legal payloads while keeping the action+args prompt shape."""
+    actions = []
+    seen = set()
+    for candidate in candidates:
+        payload = candidate.get("payload")
+        if not payload:
+            item = {
+                "action": "wait",
+                "args": {},
+                "candidate_id": candidate.get("id"),
+                "label": candidate.get("label"),
+            }
+        else:
+            raw_action = payload.get("action")
+            catalog_action = RAW_TO_CATALOG_ACTION.get(raw_action, raw_action)
+            args = {
+                key: value for key, value in payload.items()
+                if key not in ("action", "policy_name", "model_version")
+            }
+            item = {
+                "action": catalog_action,
+                "args": args,
+                "candidate_id": candidate.get("id"),
+                "label": candidate.get("label"),
+            }
+            if candidate.get("detail"):
+                item["detail"] = candidate.get("detail")
+        key = json.dumps(item, sort_keys=True, ensure_ascii=False)
+        if key in seen:
+            continue
+        seen.add(key)
+        actions.append(item)
+    return actions
+
+
 def chat_url(base_url):
     base = (base_url or "").rstrip("/")
     if base.endswith("/chat/completions"):
@@ -450,15 +542,20 @@ def call_openai_compatible(cfg, compact, actions):
         "You are a Slay the Spire 2 decision agent. "
         "Choose exactly one legal action from the provided action catalog. "
         "Return only JSON with keys: action, args, reason, confidence. "
-        "Never invent card indexes or enemy ids. If no useful action is safe, choose wait."
+        "Copy action and args exactly from one available_actions item. "
+        "Never invent card indexes, potion slots, reward indexes, or enemy ids. "
+        "If no useful action is safe, choose wait."
     )
     user = {
         "mode": cfg.get("mode"),
         "rules": [
+            "available_actions already contains exact legal args. Copy one item; do not reinterpret placeholder text.",
             "For enemy-targeted cards, target must be an entity_id from battle.enemies.",
+            "For potions, slot must be one listed potion slot; target must be one listed enemy entity_id when required.",
             "Prefer playing useful zero-cost cards before spending energy.",
             "Do not end turn while affordable playable cards remain unless clearly justified.",
             "Use battle.incoming_damage, battle.net_incoming_after_block, and battle.hp_after_incoming to decide whether blocking is mandatory.",
+            "In boss or elite fights, consider using potions before the player is in lethal danger.",
             "Use run.act, run.floor, battle.round, relics, potions, and pile counts when explaining risk.",
             "Shop purchases are suggestions unless execution is explicitly enabled.",
         ],
@@ -545,12 +642,15 @@ def normalize_decision(decision):
     aliases = {
         "play_card": "combat_play_card",
         "end_turn": "combat_end_turn",
+        "use_potion": "combat_use_potion",
         "claim_reward": "rewards_claim",
         "select_card_reward": "rewards_pick_card",
         "skip_card_reward": "rewards_skip_card",
         "choose_map_node": "map_choose_node",
         "choose_event_option": "event_choose_option",
         "choose_rest_option": "rest_choose_option",
+        "advance_dialogue": "event_advance_dialogue",
+        "proceed": "proceed_to_map",
     }
     action = aliases.get(decision.get("action"), decision.get("action"))
     args = decision.get("args") or {}
@@ -559,6 +659,7 @@ def normalize_decision(decision):
     return {
         "action": action,
         "args": args,
+        "candidate_id": str(decision.get("candidate_id") or decision.get("id") or args.get("candidate_id") or ""),
         "reason": str(decision.get("reason", ""))[:1200],
         "confidence": decision.get("confidence"),
     }
@@ -629,9 +730,37 @@ def validate_and_convert(decision, state):
             payload["target"] = target
         return payload, "ok"
 
+    if action == "combat_use_potion":
+        if state_type not in COMBAT_TYPES or battle.get("turn") != "player" or not battle.get("is_play_phase"):
+            return None, "not_combat_play_phase"
+        try:
+            slot = int(args.get("slot"))
+        except (TypeError, ValueError):
+            return None, "missing_potion_slot"
+        potions = player.get("potions", [])
+        potion = next((item for item in potions if safe_int(item.get("slot"), -1) == slot), None)
+        if not potion:
+            return None, "potion_slot_not_found"
+        if potion.get("can_use_in_combat") is False:
+            return None, "potion_not_usable"
+        payload = {"action": "use_potion", "slot": slot}
+        if needs_enemy_target(potion):
+            target = args.get("target")
+            living_enemies = [e for e in battle.get("enemies", []) if e.get("entity_id")]
+            valid_targets = {e.get("entity_id") for e in living_enemies}
+            if target not in valid_targets:
+                placeholder = str(target or "").strip().lower()
+                if living_enemies and placeholder in PLACEHOLDER_TARGETS:
+                    payload["target"] = min(living_enemies, key=enemy_hp).get("entity_id")
+                    return payload, "auto_targeted_lowest_hp"
+                return None, "missing_or_invalid_target"
+            payload["target"] = target
+        return payload, "ok"
+
     noncombat = {
         "proceed_to_map": {"action": "proceed"},
         "rewards_skip_card": {"action": "skip_card_reward"},
+        "event_advance_dialogue": {"action": "advance_dialogue"},
     }
     indexed = {
         "map_choose_node": ("choose_map_node", "index"),
@@ -652,6 +781,147 @@ def validate_and_convert(decision, state):
         return {"action": raw_action, key: value}, "ok"
 
     return None, f"unknown_action_{action}"
+
+
+def candidate_payload(candidate):
+    payload = candidate.get("payload") if isinstance(candidate, dict) else None
+    return payload if isinstance(payload, dict) else None
+
+
+def payload_field(payload, *names):
+    for name in names:
+        if name in payload:
+            return payload.get(name)
+    return None
+
+
+def find_candidate_for_catalog_decision(normalized, candidates):
+    candidate_id = normalized.get("candidate_id")
+    if candidate_id:
+        for candidate in candidates:
+            if candidate.get("id") == candidate_id:
+                return candidate
+
+    action = normalized.get("action")
+    args = normalized.get("args") or {}
+    raw_action = CATALOG_TO_RAW_ACTION.get(action, action)
+    if raw_action == "wait":
+        return next((item for item in candidates if item.get("id") == "wait"), None)
+
+    wanted_index = safe_int(payload_field(args, "index", "card_index"), None)
+    wanted_slot = safe_int(args.get("slot"), None)
+    wanted_target = str(args.get("target") or args.get("target_id") or "").strip()
+    wanted_target_lower = wanted_target.lower()
+
+    matches = []
+    loose_matches = []
+    for candidate in candidates:
+        payload = candidate_payload(candidate)
+        if not payload or payload.get("action") != raw_action:
+            continue
+        if raw_action == "play_card":
+            card_index = safe_int(payload.get("card_index"), None)
+            if wanted_index is not None and card_index != wanted_index:
+                continue
+            target = str(payload.get("target") or "")
+            if wanted_target and wanted_target_lower not in PLACEHOLDER_TARGETS and target and target != wanted_target:
+                continue
+            (matches if target == wanted_target or not target else loose_matches).append(candidate)
+            continue
+        if raw_action == "use_potion":
+            slot = safe_int(payload.get("slot"), None)
+            if wanted_slot is not None and slot != wanted_slot:
+                continue
+            target = str(payload.get("target") or "")
+            if wanted_target and wanted_target_lower not in PLACEHOLDER_TARGETS and target and target != wanted_target:
+                continue
+            (matches if target == wanted_target or not target else loose_matches).append(candidate)
+            continue
+        if raw_action in ("choose_map_node", "claim_reward", "choose_event_option", "choose_rest_option", "shop_purchase"):
+            if wanted_index is None or safe_int(payload.get("index"), None) == wanted_index:
+                matches.append(candidate)
+            continue
+        if raw_action == "select_card_reward":
+            if wanted_index is None or safe_int(payload.get("card_index"), None) == wanted_index:
+                matches.append(candidate)
+            continue
+        if raw_action in ("end_turn", "skip_card_reward", "advance_dialogue", "proceed"):
+            matches.append(candidate)
+
+    return (matches or loose_matches or [None])[0]
+
+
+def card_for_candidate(compact, candidate):
+    payload = candidate_payload(candidate) or {}
+    return compact_card_by_index(compact, safe_int(payload.get("card_index"), -1)) or {}
+
+
+def choose_demo_progress_candidate(candidates, compact, prefer_zero_cost=False):
+    playable = []
+    potion = []
+    for candidate in candidates:
+        payload = candidate_payload(candidate)
+        if not payload:
+            continue
+        if payload.get("action") == "play_card":
+            playable.append(candidate)
+        elif payload.get("action") == "use_potion":
+            potion.append(candidate)
+    if not playable and not potion:
+        return None
+
+    def score(candidate):
+        payload = candidate_payload(candidate) or {}
+        card = card_for_candidate(compact, candidate)
+        card_id = str(card.get("id") or candidate.get("detail", {}).get("card_id") or "")
+        cost = card_cost(card, (compact.get("player") or {}).get("energy") or 0)
+        card_type = str(card.get("type") or "").lower()
+        score_value = 0
+        if payload.get("action") == "use_potion":
+            score_value += 30
+        if cost == 0:
+            score_value += 50
+        if "attack" in card_type:
+            score_value += 20
+        if "skill" in card_type:
+            score_value += 12
+        if any(key in card_id for key in ("OFFERING", "ANGER", "BULLY", "BREAKTHROUGH")):
+            score_value += 8
+        if prefer_zero_cost and cost != 0:
+            score_value -= 40
+        return -score_value
+
+    pool = playable or potion
+    return sorted(pool, key=score)[0]
+
+
+def catalog_guardrail_payload(normalized, payload, validation, candidates, compact):
+    affordable = (compact.get("player") or {}).get("affordable_cards") or []
+    selected = find_candidate_for_catalog_decision(normalized, candidates)
+    if selected:
+        selected_payload = candidate_payload(selected)
+        if selected_payload:
+            if selected_payload.get("action") == "end_turn" and affordable:
+                fallback = choose_demo_progress_candidate(candidates, compact, prefer_zero_cost=True)
+                if fallback and fallback.get("id") != selected.get("id"):
+                    return candidate_payload(fallback), "guarded_premature_end_turn", fallback
+            if payload != selected_payload or validation != "ok":
+                return selected_payload, f"{validation}->candidate_guardrail", selected
+            return payload, validation, selected
+        return None, "advisor_wait", selected
+
+    if payload is None:
+        fallback = choose_demo_progress_candidate(candidates, compact)
+        if fallback:
+            return candidate_payload(fallback), f"{validation}->demo_progress_fallback", fallback
+        return payload, validation, None
+
+    if payload.get("action") == "end_turn" and affordable:
+        fallback = choose_demo_progress_candidate(candidates, compact, prefer_zero_cost=True)
+        if fallback:
+            return candidate_payload(fallback), "guarded_premature_end_turn", fallback
+
+    return payload, validation, None
 
 
 def append_llm_log(session_id, snapshot):
@@ -766,8 +1036,8 @@ def run_agent():
                 raise RuntimeError("max_actions_per_turn reached")
 
             selection_mode = cfg.get("action_selection_mode", "catalog_args")
-            actions = action_catalog(compact)
             candidates = candidate_action_catalog(state, compact)
+            actions = action_catalog_from_candidates(candidates)
             selected_candidate = None
             if selection_mode == "candidate_id":
                 decision = call_openai_candidate_selector(cfg, compact, candidates)
@@ -776,6 +1046,7 @@ def run_agent():
                 decision = call_openai_compatible(cfg, compact, actions)
                 normalized = normalize_decision(decision)
                 payload, validation = validate_and_convert(normalized, state)
+                payload, validation, selected_candidate = catalog_guardrail_payload(normalized, payload, validation, candidates, compact)
             policy_name = "llm_candidate_id" if selection_mode == "candidate_id" else "llm_catalog_args"
             model_version = str(cfg.get("model") or "")
             payload = payload_with_policy(payload, policy_name, model_version)
@@ -792,6 +1063,7 @@ def run_agent():
 
             snapshot = {
                 "timestamp": int(time.time() * 1000),
+                "time": datetime.now().strftime("%H:%M:%S"),
                 "status": "ok",
                 "session_id": session_id,
                 "mode": cfg.get("mode"),

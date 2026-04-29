@@ -1813,7 +1813,7 @@ INDEX_HTML = r"""<!doctype html>
         <div class="field">
           <span>动作选择</span>
           <select id="llm_action_selection_mode" onchange="saveLLMConfig()">
-            <option value="catalog_args">动作参数：保留旧模式</option>
+            <option value="catalog_args">动作参数：安全兜底</option>
             <option value="candidate_id">候选 ID：只能选列表</option>
           </select>
         </div>
