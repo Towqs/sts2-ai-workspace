@@ -885,6 +885,9 @@ INDEX_HTML = r"""<!doctype html>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>STS2 AI 控制台</title>
+  <link rel="icon" type="image/png" href="/assets/sts2_ai_logo.png">
+  <link rel="shortcut icon" type="image/png" href="/assets/sts2_ai_logo.png">
+  <link rel="apple-touch-icon" href="/assets/sts2_ai_logo.png">
   <style>
     :root {
       color-scheme: light;
