@@ -100,7 +100,7 @@ DEFAULT_LLM_CONFIG = {
     "execute_combat": False,
     "confirm_shop": True,
     "max_actions_per_turn": 12,
-    "action_selection_mode": "catalog_args",
+    "action_selection_mode": "candidate_id",
     "profiles": [],
     "active_profile_id": "",
 }
@@ -170,7 +170,7 @@ def read_llm_config(mask_key=True):
     if data.get("mode") not in ("advisor", "combat_auto"):
         data["mode"] = "advisor"
     if data.get("action_selection_mode") not in ("catalog_args", "candidate_id"):
-        data["action_selection_mode"] = "catalog_args"
+        data["action_selection_mode"] = "candidate_id"
     data["provider"] = "openai_compatible"
     profiles = data.get("profiles") if isinstance(data.get("profiles"), list) else []
     data["profiles"] = [_public_llm_profile(p) for p in profiles]
@@ -249,7 +249,7 @@ def update_llm_config(patch):
         elif key == "mode":
             data[key] = patch[key] if patch[key] in ("advisor", "combat_auto") else "advisor"
         elif key == "action_selection_mode":
-            data[key] = patch[key] if patch[key] in ("catalog_args", "candidate_id") else "catalog_args"
+            data[key] = patch[key] if patch[key] in ("catalog_args", "candidate_id") else "candidate_id"
         elif key in ("temperature", "decision_interval_sec"):
             try:
                 data[key] = float(patch[key])
@@ -2265,7 +2265,7 @@ function isLLMFormEditing() {
 function applyLLMConfigToForm(llmCfg) {
   document.getElementById("llm_enabled").checked = !!llmCfg.enabled;
   document.getElementById("llm_mode").value = llmCfg.mode || "advisor";
-  document.getElementById("llm_action_selection_mode").value = llmCfg.action_selection_mode || "catalog_args";
+  document.getElementById("llm_action_selection_mode").value = llmCfg.action_selection_mode || "candidate_id";
   document.getElementById("llm_execute_combat").checked = !!llmCfg.execute_combat;
   document.getElementById("llm_base_url").value = llmCfg.base_url || "";
   document.getElementById("llm_model").value = llmCfg.model || "";

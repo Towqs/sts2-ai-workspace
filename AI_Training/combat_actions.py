@@ -157,6 +157,7 @@ class CombatCandidate:
             "potion_slot": self.potion_slot,
             "target_id": self.target_id,
             "target_index": self.target_index,
+            "target_effective_hp": self.target_effective_hp,
         }
         if include_features:
             item["features"] = list(self.features)

@@ -32,7 +32,7 @@ DEFAULT_CONFIG = {
     "execute_combat": False,
     "confirm_shop": True,
     "max_actions_per_turn": 12,
-    "action_selection_mode": "catalog_args",
+    "action_selection_mode": "candidate_id",
 }
 
 COMBAT_TYPES = {"monster", "elite", "boss"}
@@ -85,7 +85,7 @@ def load_config():
     cfg.update(read_json(CONFIG_PATH, {}))
     cfg["mode"] = cfg.get("mode") if cfg.get("mode") in ("advisor", "combat_auto") else "advisor"
     if cfg.get("action_selection_mode") not in ("catalog_args", "candidate_id"):
-        cfg["action_selection_mode"] = "catalog_args"
+        cfg["action_selection_mode"] = "candidate_id"
     cfg["provider"] = "openai_compatible"
     cfg["temperature"] = float(cfg.get("temperature", 0.2) or 0.2)
     cfg["max_tokens"] = int(cfg.get("max_tokens", 700) or 700)
@@ -216,10 +216,22 @@ def number_hint(item, mode):
     lowered = text.lower()
     if mode == "damage":
         keys = ("deal", "damage", "attack", "hp loss", "lose hp", "造成", "伤害", "攻击")
+        patterns = [
+            r"(?:deal|deals|dealt|造成)\D{0,18}(\d+)",
+            r"(\d+)\s*(?:damage|伤害)",
+        ]
     else:
         keys = ("block", "defend", "armor", "shield", "格挡", "护甲", "防御")
+        patterns = [
+            r"(?:gain|gains|获得)\D{0,18}(\d+)\s*(?:block|格挡|护甲)?",
+            r"(\d+)\s*(?:block|格挡|护甲)",
+        ]
     if not any(key in lowered for key in keys):
         return 0
+    for pattern in patterns:
+        match = re.search(pattern, lowered)
+        if match:
+            return safe_int(match.group(1), 0) or 0
     nums = [int(n) for n in re.findall(r"\d+", text)]
     if not nums:
         return 0
@@ -606,19 +618,41 @@ def candidate_action_catalog(state, compact):
     if state_type in COMBAT_TYPES and compact.get("battle", {}).get("is_play_phase") and compact.get("battle", {}).get("turn") == "player":
         for candidate in enumerate_combat_actions(state):
             item = candidate.to_dict(include_features=False)
+            payload = candidate.payload if isinstance(candidate.payload, dict) else {}
+            card = compact_card_by_index(compact, safe_int(payload.get("card_index"), -1)) or {}
+            potion = compact_potion_by_slot(compact, safe_int(payload.get("slot"), -1)) or {}
+            detail = {
+                "kind": item.get("kind"),
+                "card_id": item.get("card_id"),
+                "potion_id": item.get("potion_id"),
+                "card_index": item.get("card_index"),
+                "potion_slot": item.get("potion_slot"),
+                "target_id": item.get("target_id"),
+                "target_effective_hp": item.get("target_effective_hp"),
+            }
+            if card:
+                detail.update({
+                    "card_name": card.get("name"),
+                    "card_cost": card.get("cost"),
+                    "card_tags": card.get("tags", []),
+                    "damage_est": card.get("damage_est", 0),
+                    "block_est": card.get("block_est", 0),
+                    "effect_note": card.get("effect_note", ""),
+                })
+            if potion:
+                detail.update({
+                    "potion_name": potion.get("name"),
+                    "potion_tags": potion.get("tags", []),
+                    "damage_est": potion.get("damage_est", 0),
+                    "block_est": potion.get("block_est", 0),
+                    "effect_note": potion.get("effect_note", ""),
+                })
             add_candidate(
                 candidates,
                 candidate.label,
                 candidate.label,
                 candidate.payload,
-                {
-                    "kind": item.get("kind"),
-                    "card_id": item.get("card_id"),
-                    "potion_id": item.get("potion_id"),
-                    "card_index": item.get("card_index"),
-                    "potion_slot": item.get("potion_slot"),
-                    "target_id": item.get("target_id"),
-                },
+                detail,
             )
         return candidates
 
@@ -1171,31 +1205,115 @@ def choose_demo_progress_candidate(candidates, compact, prefer_zero_cost=False):
     return sorted(pool, key=score)[0]
 
 
+def choose_tactical_candidate(candidates, compact, prefer_zero_cost=False):
+    combat_eval = compact.get("combat_eval") or {}
+    risk = combat_eval.get("risk_level")
+    priority = combat_eval.get("priority")
+    potion_opportunities = combat_eval.get("potion_opportunities") or []
+    potion_triggers = {
+        (safe_int(item.get("slot"), -1), item.get("trigger"))
+        for item in potion_opportunities
+        if isinstance(item, dict)
+    }
+    viable = []
+    for candidate in candidates:
+        payload = candidate_payload(candidate)
+        if payload and payload.get("action") in ("play_card", "use_potion"):
+            viable.append(candidate)
+    if not viable:
+        return None
+
+    def score(candidate):
+        payload = candidate_payload(candidate) or {}
+        detail = candidate.get("detail") or {}
+        value = 0
+        urgent_fight = risk in ("lethal_risk", "danger") or bool(combat_eval.get("is_boss_or_elite")) or safe_int(combat_eval.get("incoming_damage"), 0) > 0
+        damage = safe_int(detail.get("damage_est"), 0) or 0
+        block = safe_int(detail.get("block_est"), 0) or 0
+        cost = safe_int(detail.get("card_cost"), 0) or 0
+        target_hp = safe_int(detail.get("target_effective_hp"), 0) or 0
+        card_tags = set(detail.get("card_tags") or [])
+        potion_tags = set(detail.get("potion_tags") or [])
+
+        if payload.get("action") == "use_potion":
+            slot = safe_int(payload.get("slot"), -1)
+            triggers = {trigger for pot_slot, trigger in potion_triggers if pot_slot == slot}
+            if "lethal_bridge" in triggers:
+                value += 220 if urgent_fight else 10
+            if "survival_bridge" in triggers:
+                value += 210
+            if "elite_boss_resource" in triggers:
+                value += 80
+            if risk in ("lethal_risk", "danger") and (block or "weak" in potion_tags):
+                value += 80
+            if priority == "visible_lethal" and damage:
+                value += 60
+            if not urgent_fight:
+                value -= 35
+
+        if payload.get("action") == "play_card":
+            if damage and target_hp and damage >= target_hp:
+                value += 180
+            if priority == "visible_lethal":
+                value += damage * 4
+            elif risk in ("lethal_risk", "danger"):
+                value += block * 5
+                if "weak" in card_tags:
+                    value += 45
+                if damage and target_hp and damage >= target_hp:
+                    value += 120
+            else:
+                value += damage * 3 + block * 2
+            if "vulnerable" in card_tags:
+                value += 35
+            if "draw" in card_tags or "energy" in card_tags:
+                value += 28
+            if "power" in card_tags or "strength" in card_tags or "dexterity" in card_tags:
+                value += 24 if combat_eval.get("is_boss_or_elite") else 8
+            if cost == 0:
+                value += 35
+            if prefer_zero_cost and cost != 0:
+                value -= 60
+
+        return -value
+
+    return sorted(viable, key=score)[0]
+
+
 def catalog_guardrail_payload(normalized, payload, validation, candidates, compact):
     affordable = (compact.get("player") or {}).get("affordable_cards") or []
+    combat_eval = compact.get("combat_eval") or {}
+    dangerous = combat_eval.get("risk_level") in ("danger", "lethal_risk")
     selected = find_candidate_for_catalog_decision(normalized, candidates)
     if selected:
         selected_payload = candidate_payload(selected)
         if selected_payload:
-            if selected_payload.get("action") == "end_turn" and affordable:
-                fallback = choose_demo_progress_candidate(candidates, compact, prefer_zero_cost=True)
+            if selected_payload.get("action") == "end_turn" and (affordable or dangerous):
+                fallback = choose_tactical_candidate(candidates, compact) or choose_demo_progress_candidate(candidates, compact, prefer_zero_cost=True)
                 if fallback and fallback.get("id") != selected.get("id"):
-                    return candidate_payload(fallback), "guarded_premature_end_turn", fallback
+                    reason = "guarded_danger_end_turn" if dangerous else "guarded_premature_end_turn"
+                    return candidate_payload(fallback), reason, fallback
             if payload != selected_payload or validation != "ok":
                 return selected_payload, f"{validation}->candidate_guardrail", selected
             return payload, validation, selected
+        if affordable or dangerous:
+            fallback = choose_tactical_candidate(candidates, compact) or choose_demo_progress_candidate(candidates, compact)
+            if fallback:
+                reason = "guarded_danger_wait" if dangerous else "guarded_premature_wait"
+                return candidate_payload(fallback), reason, fallback
         return None, "advisor_wait", selected
 
     if payload is None:
-        fallback = choose_demo_progress_candidate(candidates, compact)
+        fallback = choose_tactical_candidate(candidates, compact) or choose_demo_progress_candidate(candidates, compact)
         if fallback:
-            return candidate_payload(fallback), f"{validation}->demo_progress_fallback", fallback
+            return candidate_payload(fallback), f"{validation}->tactical_fallback", fallback
         return payload, validation, None
 
-    if payload.get("action") == "end_turn" and affordable:
-        fallback = choose_demo_progress_candidate(candidates, compact, prefer_zero_cost=True)
+    if payload.get("action") == "end_turn" and (affordable or dangerous):
+        fallback = choose_tactical_candidate(candidates, compact) or choose_demo_progress_candidate(candidates, compact, prefer_zero_cost=True)
         if fallback:
-            return candidate_payload(fallback), "guarded_premature_end_turn", fallback
+            reason = "guarded_danger_end_turn" if dangerous else "guarded_premature_end_turn"
+            return candidate_payload(fallback), reason, fallback
 
     return payload, validation, None
 
@@ -1318,6 +1436,7 @@ def run_agent():
             if selection_mode == "candidate_id":
                 decision = call_openai_candidate_selector(cfg, compact, candidates)
                 normalized, payload, validation, selected_candidate = validate_candidate_decision(decision, candidates)
+                payload, validation, selected_candidate = catalog_guardrail_payload(normalized, payload, validation, candidates, compact)
             else:
                 decision = call_openai_compatible(cfg, compact, actions)
                 normalized = normalize_decision(decision)
