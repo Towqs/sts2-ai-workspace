@@ -13,6 +13,15 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from run_summary import (
+    QUALITY_ORDER,
+    current_data_summary,
+    latest_runs,
+    recent_records,
+    set_run_discarded,
+    set_run_label,
+)
+
 WORKSPACE = Path(__file__).resolve().parents[1]
 AI_DIR = WORKSPACE / "AI_Training"
 DATA_DIR = WORKSPACE / "RL_Datasets"
@@ -22,7 +31,6 @@ AI_LOGIC_PATH = AI_DIR / "ai_logic_state.json"
 LLM_CONFIG_PATH = AI_DIR / "model_config.json"
 LLM_LOGIC_PATH = AI_DIR / "llm_logic_state.json"
 DISCARDED_PATH = DATA_DIR / "discarded_runs.json"
-RUN_LABELS_PATH = DATA_DIR / "run_labels.json"
 SERVER_STATE_PATH = AI_DIR / "control_panel_state.json"
 DEFAULT_PYTHON_EXE = WORKSPACE / ".venv" / "Scripts" / "python.exe"
 PYTHON_EXE = Path(os.environ.get("STS2_AI_PYTHON") or (DEFAULT_PYTHON_EXE if DEFAULT_PYTHON_EXE.exists() else sys.executable))
@@ -58,23 +66,6 @@ DEFAULT_LLM_CONFIG = {
     "profiles": [],
     "active_profile_id": "",
 }
-QUALITY_LABELS = {
-    "failed_run": "失败",
-    "unknown": "未知",
-    "before_act1_boss": "一关Boss前",
-    "partial_act1": "一关Boss",
-    "partial_act2": "二关Boss",
-    "perfect_run": "通关完美",
-}
-QUALITY_ORDER = {
-    "failed_run": -1,
-    "unknown": 0,
-    "before_act1_boss": 0,
-    "partial_act1": 1,
-    "partial_act2": 2,
-    "perfect_run": 3,
-}
-
 TRAIN_LOCK = threading.Lock()
 LLM_TEST_LOCK = threading.Lock()
 LLM_TEST_COOLDOWN_SEC = 60
@@ -401,76 +392,6 @@ def ensure_llm_profiles_initialized():
         write_json(LLM_CONFIG_PATH, _upsert_current_llm_profile(data))
 
 
-def read_run_labels():
-    data = read_json(RUN_LABELS_PATH, {"labels": {}})
-    if "labels" not in data:
-        data = {"labels": data if isinstance(data, dict) else {}}
-    return data
-
-
-def infer_quality(item):
-    if item.get("losses", 0) > 0:
-        return "failed_run"
-    if item.get("run_victory") or int(item.get("max_act") or 0) >= 4:
-        return "perfect_run"
-    if int(item.get("max_act") or 0) >= 3:
-        return "partial_act2"
-    if int(item.get("max_act") or 0) >= 2:
-        return "partial_act1"
-    if int(item.get("max_floor") or 0) > 0:
-        return "before_act1_boss"
-    return "unknown"
-
-
-def set_run_label(run_id, quality, note=""):
-    if quality not in QUALITY_ORDER:
-        quality = "unknown"
-    data = read_run_labels()
-    labels = data.setdefault("labels", {})
-    labels[run_id] = {
-        "quality": quality,
-        "note": note,
-        "manual": True,
-        "updated_at": datetime.now().isoformat(timespec="seconds"),
-    }
-    write_json(RUN_LABELS_PATH, data)
-    return labels[run_id]
-
-
-def set_auto_run_label(run_id, quality, note=""):
-    if quality not in QUALITY_ORDER:
-        quality = "unknown"
-    data = read_run_labels()
-    labels = data.setdefault("labels", {})
-    old = labels.get(run_id, {})
-    if old.get("manual"):
-        return old
-    if old.get("quality") == quality and old.get("note", "") == note:
-        return old
-    labels[run_id] = {
-        "quality": quality,
-        "note": note,
-        "manual": False,
-        "updated_at": datetime.now().isoformat(timespec="seconds"),
-    }
-    write_json(RUN_LABELS_PATH, data)
-    return labels[run_id]
-
-
-def safe_int(value, default=0):
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def iter_record_states(rec):
-    for key in ("state", "state_before", "state_after"):
-        state = rec.get(key)
-        if isinstance(state, dict):
-            yield state
-
-
 def post_game_action(payload):
     req = Request(
         API_URL,
@@ -617,283 +538,11 @@ def llm_logic_snapshot():
     return data
 
 
-def latest_runs(limit=12):
-    discarded = set(read_json(DISCARDED_PATH, {"discarded": []}).get("discarded", []))
-    labels = read_run_labels().get("labels", {})
-    files = []
-    for sub in ["Combat", "Human/Combat", "AI/Combat", "AI_Combat", "Macro", "Human/Macro", "AI/Macro"]:
-        root = DATA_DIR / sub
-        if root.exists():
-            files.extend(root.glob("*.jsonl"))
-
-    runs = {}
-    for path in sorted(files, key=lambda p: p.stat().st_mtime, reverse=True):
-        try:
-            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-        except Exception:
-            continue
-        for line in lines:
-            if not line.strip():
-                continue
-            try:
-                rec = json.loads(line)
-            except Exception:
-                continue
-            if not isinstance(rec, dict):
-                continue
-            run_id = rec.get("run_id")
-            if not run_id:
-                continue
-            item = runs.setdefault(
-                run_id,
-                {
-                    "run_id": run_id,
-                    "records": 0,
-                    "combat": 0,
-                    "macro": 0,
-                    "ai": 0,
-                    "human": 0,
-                    "wins": 0,
-                    "losses": 0,
-                    "game_start": 0,
-                    "game_resume": 0,
-                    "battle_start": 0,
-                    "battle_end": 0,
-                    "turn_start": 0,
-                    "turn_end": 0,
-                    "macro_actions": 0,
-                    "play_card": 0,
-                    "end_turn": 0,
-                    "use_potion": 0,
-                    "select_map_node": 0,
-                    "claim_reward": 0,
-                    "choose_card": 0,
-                    "skip_reward": 0,
-                    "choose_event_option": 0,
-                    "choose_rest_option": 0,
-                    "buy_item": 0,
-                    "max_act": 0,
-                    "max_floor": 0,
-                    "run_victory": False,
-                    "last_ts": 0,
-                    "files": set(),
-                },
-            )
-            item["records"] += 1
-            item["files"].add(str(path.relative_to(DATA_DIR)))
-            if "Combat" in str(path):
-                item["combat"] += 1
-            else:
-                item["macro"] += 1
-            if rec.get("source") == "ai":
-                item["ai"] += 1
-            if rec.get("source") == "human":
-                item["human"] += 1
-            rec_type = rec.get("type")
-            if rec_type in ("game_start", "game_resume", "battle_start", "battle_end", "turn_start", "turn_end"):
-                item[rec_type] += 1
-            if rec_type == "macro_action":
-                item["macro_actions"] += 1
-            if rec_type == "battle_end":
-                if rec.get("result") == "win":
-                    item["wins"] += 1
-                if rec.get("result") == "lose":
-                    item["losses"] += 1
-            if rec_type in ("run_end", "game_end", "victory") and rec.get("result") in ("win", "victory", "complete", True):
-                item["run_victory"] = True
-            action_type = rec.get("action_type")
-            if action_type in (
-                "play_card",
-                "end_turn",
-                "use_potion",
-                "select_map_node",
-                "claim_reward",
-                "choose_card",
-                "skip_reward",
-                "choose_event_option",
-                "choose_rest_option",
-                "buy_item",
-            ):
-                item[action_type] += 1
-            for state in iter_record_states(rec):
-                item["max_act"] = max(item["max_act"], safe_int(state.get("act")))
-                item["max_floor"] = max(item["max_floor"], safe_int(state.get("floor")))
-            item["last_ts"] = max(item["last_ts"], int(rec.get("timestamp") or 0))
-
-    result = []
-    for item in runs.values():
-        item["discarded"] = item["run_id"] in discarded
-        inferred_quality = infer_quality(item)
-        inferred_note = f"auto: max_act={item.get('max_act', 0)}, max_floor={item.get('max_floor', 0)}"
-        label = labels.get(item["run_id"])
-        if label and not label.get("manual"):
-            label = set_auto_run_label(item["run_id"], inferred_quality, inferred_note)
-        if label:
-            item["quality"] = label.get("quality", "unknown")
-            item["quality_label"] = QUALITY_LABELS.get(item["quality"], item["quality"])
-            item["quality_manual"] = bool(label.get("manual"))
-            item["quality_note"] = label.get("note", "")
-        else:
-            label = set_auto_run_label(item["run_id"], inferred_quality, inferred_note)
-            item["quality"] = label.get("quality", inferred_quality)
-            item["quality_label"] = QUALITY_LABELS.get(item["quality"], item["quality"])
-            item["quality_manual"] = False
-            item["quality_note"] = label.get("note", inferred_note)
-        item["inferred_quality"] = inferred_quality
-        item["inferred_quality_label"] = QUALITY_LABELS.get(inferred_quality, inferred_quality)
-        item["files"] = sorted(item["files"])
-        checks = run_data_checks(item)
-        item["data_checks"] = checks
-        missing = [c for c in checks if c["status"] == "missing"]
-        warnings = [c for c in checks if c["status"] == "warn"]
-        item["missing_data"] = [c["label"] for c in missing]
-        if missing:
-            item["data_health"] = "missing"
-            item["data_health_label"] = f"缺 {len(missing)} 项"
-        elif warnings:
-            item["data_health"] = "warn"
-            item["data_health_label"] = f"需确认 {len(warnings)} 项"
-        else:
-            item["data_health"] = "ok"
-            item["data_health_label"] = "完整"
-        item["last_time"] = (
-            datetime.fromtimestamp(item["last_ts"] / 1000).strftime("%Y-%m-%d %H:%M:%S")
-            if item["last_ts"]
-            else ""
-        )
-        result.append(item)
-    result.sort(key=lambda x: x["last_ts"], reverse=True)
-    return result[:limit]
-
-
-def run_data_checks(run):
-    checks = []
-
-    def add(label, status, detail, count=None):
-        checks.append({
-            "label": label,
-            "status": status,
-            "detail": detail,
-            "count": count,
-        })
-
-    records = run.get("records", 0)
-    combat = run.get("combat", 0)
-    macro = run.get("macro", 0)
-    battle_count = run.get("battle_start", 0)
-    win_or_loss = run.get("wins", 0) + run.get("losses", 0)
-    reward_actions = run.get("claim_reward", 0) + run.get("choose_card", 0) + run.get("skip_reward", 0)
-
-    add("Run 记录", "ok" if records else "missing", f"{records} 条总记录", records)
-    add("宏观记录", "ok" if macro else "missing", f"{macro} 条；包含开局、地图、奖励、事件等非战斗动作", macro)
-    add("战斗记录", "ok" if combat else "missing", f"{combat} 条；包含战斗开始、回合、动作和结算", combat)
-
-    if run.get("game_start", 0) or run.get("game_resume", 0):
-        add("开局/续局", "ok", f"新游戏 {run.get('game_start', 0)}，继续游戏 {run.get('game_resume', 0)}")
-    else:
-        add("开局/续局", "warn", "未检测到 game_start / game_resume；如果是半路接入可忽略")
-
-    if combat:
-        add("战斗开始", "ok" if battle_count else "missing", f"battle_start {battle_count} 次", battle_count)
-        add("回合快照", "ok" if run.get("turn_start", 0) and run.get("turn_end", 0) else "warn", f"turn_start {run.get('turn_start', 0)}，turn_end {run.get('turn_end', 0)}")
-        add("出牌样本", "ok" if run.get("play_card", 0) else "missing", f"play_card {run.get('play_card', 0)} 次", run.get("play_card", 0))
-        add("结束回合", "ok" if run.get("end_turn", 0) or run.get("turn_end", 0) else "missing", f"end_turn {run.get('end_turn', 0)}，turn_end {run.get('turn_end', 0)}")
-        add("战斗结算", "ok" if win_or_loss else "warn", f"胜 {run.get('wins', 0)}，败 {run.get('losses', 0)}；未结束的战斗可忽略")
-
-    if run.get("max_floor", 0) > 0 or macro:
-        add("地图选择", "ok" if run.get("select_map_node", 0) else "warn", f"select_map_node {run.get('select_map_node', 0)} 次；如果刚开局/未点地图可忽略")
-    if win_or_loss or reward_actions:
-        add("奖励处理", "ok" if reward_actions else "warn", f"领奖 {run.get('claim_reward', 0)}，选卡 {run.get('choose_card', 0)}，跳过 {run.get('skip_reward', 0)}")
-
-    optional = []
-    if run.get("choose_event_option", 0):
-        optional.append(f"事件 {run.get('choose_event_option', 0)}")
-    if run.get("choose_rest_option", 0):
-        optional.append(f"营火 {run.get('choose_rest_option', 0)}")
-    if run.get("buy_item", 0):
-        optional.append(f"商店 {run.get('buy_item', 0)}")
-    add("可选宏观", "ok" if optional else "info", "，".join(optional) if optional else "本 run 暂未出现事件/营火/商店")
-
-    return checks
-
-
-def iter_recent_records(max_files=8):
-    roots = ["Human/Combat", "Human/Macro", "AI/Combat", "AI/Macro", "Combat", "Macro", "AI_Combat", "LLM_Actions"]
-    files = []
-    for sub in roots:
-        root = DATA_DIR / sub
-        if root.exists():
-            files.extend(root.glob("*.jsonl"))
-    for path in sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)[:max_files]:
-        try:
-            for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-                if not line.strip():
-                    continue
-                try:
-                    rec = json.loads(line)
-                except Exception:
-                    continue
-                if isinstance(rec, dict):
-                    rec["_file"] = str(path.relative_to(DATA_DIR))
-                    yield rec
-        except Exception:
-            continue
-
-
-def recent_records(limit=30):
-    records = sorted(iter_recent_records(), key=lambda r: int(r.get("timestamp") or 0), reverse=True)[:limit]
-    out = []
-    for rec in records:
-        ts = int(rec.get("timestamp") or 0)
-        out.append({
-            "time": datetime.fromtimestamp(ts / 1000).strftime("%H:%M:%S") if ts else "",
-            "run_id": rec.get("run_id"),
-            "type": rec.get("type"),
-            "source": rec.get("source"),
-            "action_type": rec.get("action_type") or (rec.get("decision") or {}).get("action"),
-            "result": rec.get("result"),
-            "round": rec.get("round") or (rec.get("state") or {}).get("round"),
-            "file": rec.get("_file"),
-        })
-    return out
-
-
-def current_data_summary():
-    runs = latest_runs(limit=1)
-    if not runs:
-        return {"active_run": None, "warning": "暂无 run 数据。确认采集总开关已打开，并进入一局游戏。"}
-    run = runs[0].copy()
-    warnings = []
-    for check in run.get("data_checks", []):
-        if check.get("status") == "missing":
-            warnings.append(f"未检测到{check.get('label')}：{check.get('detail')}")
-    for check in run.get("data_checks", []):
-        if check.get("status") == "warn":
-            warnings.append(f"需要确认{check.get('label')}：{check.get('detail')}")
-    if run.get("losses", 0) > 0:
-        warnings.append("这个 run 有失败记录，BC 训练前建议确认是否保留。")
-    if run.get("quality") == "perfect_run" and run.get("play_card", 0) == 0:
-        warnings.append("这个 run 已标为完美，但没有 play_card 标签；修好 Hook 后建议再采一局高质量数据。")
-    return {"active_run": run, "warnings": warnings}
-
-
 def ai_logic_snapshot():
     data = read_json(AI_LOGIC_PATH, {})
     ts = int(data.get("timestamp") or 0)
     if ts:
         data["time"] = datetime.fromtimestamp(ts / 1000).strftime("%H:%M:%S")
-    return data
-
-
-def set_run_discarded(run_id, discarded):
-    data = read_json(DISCARDED_PATH, {"discarded": []})
-    items = set(data.get("discarded", []))
-    if discarded:
-        items.add(run_id)
-    else:
-        items.discard(run_id)
-    data["discarded"] = sorted(items)
-    write_json(DISCARDED_PATH, data)
     return data
 
 
@@ -1808,6 +1457,7 @@ function renderCurrentData(data) {
     setPill("currentDataBadge", "无数据", "warn");
     return;
   }
+  const schemaVersions = (run.schema_versions || []).join(",") || "旧";
   const warnings = (data.warnings || []).map(w => `<div><span class="pill off">注意</span> ${w}</div>`).join("");
   const checks = (run.data_checks || []).map(c => `
     <div class="check-item">
@@ -1829,6 +1479,9 @@ function renderCurrentData(data) {
       <div class="metric"><div class="metric-value">${run.play_card || 0}</div><div class="metric-label">出牌样本</div></div>
       <div class="metric"><div class="metric-value">${run.end_turn || 0}</div><div class="metric-label">结束回合</div></div>
       <div class="metric"><div class="metric-value">A${run.max_act || 0}/F${run.max_floor || 0}</div><div class="metric-label">${run.quality_label || "未知"}</div></div>
+      <div class="metric"><div class="metric-value">${run.duration_sec || 0}s</div><div class="metric-label">持续时间</div></div>
+      <div class="metric"><div class="metric-value">${run.invalid_actions || 0}</div><div class="metric-label">非法动作</div></div>
+      <div class="metric"><div class="metric-value">v${schemaVersions}</div><div class="metric-label">Schema</div></div>
     </div>
     <div class="check-list">${checks}</div>
     <div class="warning-list">${warnings || '<div><span class="pill on">正常</span> 最近 run 有数据写入</div>'}</div>`;
@@ -1870,9 +1523,9 @@ function renderRuns(runs) {
     <tr>
       <td class="run-id"><code>${run.run_id}</code><br><span class="fine">${run.last_time || ""}</span></td>
       <td>Act ${run.max_act || 0} / Floor ${run.max_floor || 0}<br><span class="fine">${run.records || 0} 条，C ${run.combat || 0} / M ${run.macro || 0}</span></td>
-      <td>出牌 ${run.play_card || 0}<br><span class="fine">回合 ${run.end_turn || 0}</span></td>
+      <td>出牌 ${run.play_card || 0}<br><span class="fine">回合 ${run.end_turn || 0}，非法 ${run.invalid_actions || 0}</span></td>
       <td>Human ${run.human || 0}<br><span class="fine">AI ${run.ai || 0}</span></td>
-      <td>胜 ${run.wins || 0}<br><span class="fine">败 ${run.losses || 0}</span></td>
+      <td>胜 ${run.wins || 0}<br><span class="fine">败 ${run.losses || 0}，v${(run.schema_versions || []).join("/") || "旧"}</span></td>
       <td>
         <select onchange="setQuality('${run.run_id}', this.value)">${qualityOptions(run.quality)}</select>
         <br><span class="fine">${run.quality_manual ? "手动标签" : "自动推断"}</span>
