@@ -1036,6 +1036,20 @@ INDEX_HTML = r"""<!doctype html>
       align-items:center;
       gap:22px;
     }
+    .top-actions {
+      display:flex;
+      align-items:center;
+      justify-content:flex-end;
+      gap:10px;
+      flex-wrap:wrap;
+    }
+    .guide-button {
+      min-height:32px;
+      padding:7px 12px;
+      border-color:rgba(47,111,120,.36);
+      background:linear-gradient(135deg, #fff, var(--surface-tint));
+      color:var(--primary-strong);
+    }
     .brand { display:flex; align-items:center; gap:20px; min-width:0; }
     .brand-mark {
       position:relative;
@@ -1565,6 +1579,77 @@ INDEX_HTML = r"""<!doctype html>
       padding:16px;
       box-shadow:0 22px 54px rgba(38,55,58,.24);
     }
+    .guide-overlay {
+      position:fixed;
+      inset:0;
+      z-index:30;
+      background:rgba(23,33,38,.42);
+      backdrop-filter:blur(1px);
+    }
+    .guide-overlay.is-hidden { display:none; }
+    .guide-spotlight {
+      position:fixed;
+      border:2px solid var(--accent);
+      border-radius:14px;
+      box-shadow:0 0 0 9999px rgba(23,33,38,.28), 0 0 0 6px rgba(209,162,58,.20);
+      pointer-events:none;
+      transition:left .18s ease, top .18s ease, width .18s ease, height .18s ease;
+    }
+    .guide-arrow {
+      position:fixed;
+      height:2px;
+      background:var(--accent);
+      transform-origin:left center;
+      pointer-events:none;
+      box-shadow:0 1px 4px rgba(38,55,58,.18);
+    }
+    .guide-arrow::after {
+      content:"";
+      position:absolute;
+      right:-1px;
+      top:-5px;
+      width:0;
+      height:0;
+      border-top:6px solid transparent;
+      border-bottom:6px solid transparent;
+      border-left:10px solid var(--accent);
+    }
+    .guide-card {
+      position:fixed;
+      width:min(380px, calc(100vw - 28px));
+      background:#fff;
+      border:1px solid var(--line-strong);
+      border-radius:14px;
+      padding:15px;
+      box-shadow:0 22px 48px rgba(38,55,58,.22);
+    }
+    .guide-kicker {
+      display:flex;
+      justify-content:space-between;
+      gap:12px;
+      color:var(--primary-strong);
+      font-size:12px;
+      font-weight:850;
+      margin-bottom:8px;
+    }
+    .guide-card h2 {
+      font-size:17px;
+      line-height:1.25;
+      margin:0;
+      color:var(--ink);
+    }
+    .guide-card p {
+      margin:9px 0 13px;
+      color:var(--muted);
+      line-height:1.6;
+      font-size:13px;
+    }
+    .guide-actions {
+      display:grid;
+      grid-template-columns:1fr 1fr auto;
+      gap:8px;
+      align-items:center;
+    }
     .module-library {
       padding:0;
       background:linear-gradient(135deg, rgba(255,254,250,.98), rgba(237,245,242,.96));
@@ -1688,10 +1773,12 @@ INDEX_HTML = r"""<!doctype html>
       .brand-mark { width:74px; height:74px; }
       .brand-logo { width:62px; height:62px; padding:7px; border-radius:8px; }
       h1 { font-size:22px; }
-      #lastRefresh { margin-top:10px; }
+      .top-actions { justify-content:flex-start; margin-top:10px; }
+      #lastRefresh { margin-top:0; }
       .status-grid, .metric-grid { grid-template-columns:1fr; }
       .activity-feed { grid-template-columns:1fr; }
       .button-row { grid-template-columns:1fr; }
+      .guide-actions { grid-template-columns:1fr; }
       .fold-panel summary { grid-template-columns:minmax(0, 1fr) 78px 28px; }
       .fold-panel summary .pill { width:78px; }
     }
@@ -1709,7 +1796,10 @@ INDEX_HTML = r"""<!doctype html>
           <div class="subtitle">战斗托管、数据采集、BC 重训和 run 质量管理</div>
         </div>
       </div>
-      <span id="lastRefresh" class="pill info">读取中</span>
+      <div class="top-actions">
+        <button class="guide-button" onclick="startGuide()">新手引导</button>
+        <span id="lastRefresh" class="pill info">读取中</span>
+      </div>
     </div>
     <div class="status-grid">
       <div class="status-card">
@@ -2118,6 +2208,23 @@ INDEX_HTML = r"""<!doctype html>
       </div>
     </div>
   </div>
+  <div id="guideOverlay" class="guide-overlay is-hidden" aria-hidden="true">
+    <div id="guideSpotlight" class="guide-spotlight"></div>
+    <div id="guideArrow" class="guide-arrow"></div>
+    <div id="guideCard" class="guide-card" onclick="event.stopPropagation()">
+      <div class="guide-kicker">
+        <span>新手引导</span>
+        <span id="guideProgress">1/1</span>
+      </div>
+      <h2 id="guideTitle">控制台入口</h2>
+      <p id="guideText">按下一步查看每个区域的作用。</p>
+      <div class="guide-actions">
+        <button onclick="prevGuideStep()">上一步</button>
+        <button id="guideNextButton" class="primary" onclick="nextGuideStep()">下一步</button>
+        <button onclick="closeGuide()">结束</button>
+      </div>
+    </div>
+  </div>
 <script>
 async function api(path, body) {
   const opts = body ? {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)} : {};
@@ -2184,6 +2291,59 @@ function dataHealthClass(health) {
 }
 const MODULE_IDS = ["ai_logic", "llm_logic", "current_data", "runs", "records", "evaluation", "training"];
 const MODULE_STORAGE_KEY = "sts2_control_panel_modules";
+const GUIDE_STEPS = [
+  {
+    target: "#gamePhase",
+    title: "先看游戏是否连接",
+    text: "这里显示当前游戏状态。主菜单、地图、商店、战斗都会分开显示；如果是未连接，先启动游戏和 Mod API。"
+  },
+  {
+    target: "#liveActivity",
+    title: "确认系统正在读数据",
+    text: "这里只显示最近几条采集动态，例如出牌、用药水、选卡和奖励。它不是完整日志，只是让你确认控制台正在跟游戏同步。"
+  },
+  {
+    target: "#ai_enabled",
+    title: "允许 AI 出牌",
+    text: "这是战斗自动出牌总开关。只想看建议时关闭；要让基础 AI 在战斗里代打时打开。"
+  },
+  {
+    target: "#macro_enabled",
+    title: "宏观操作要单独开",
+    text: "这个开关控制地图、奖励、选卡、事件、休息点等战斗外动作。演示时建议先关着，确认战斗稳定后再开。"
+  },
+  {
+    target: "#collection_enabled",
+    title: "采集总开关",
+    text: "打开后才写入训练数据。临时测试、不想污染数据时可以关闭；正式打样本时保持打开。"
+  },
+  {
+    target: "#llm_enabled",
+    title: "启用模型决策",
+    text: "这个开关只决定是否请求大模型。接口、Key、Model 可以保留，关掉后 LLM 进程待机，不会继续消耗请求。"
+  },
+  {
+    target: "#llm_action_selection_mode",
+    title: "动作选择模式",
+    text: "推荐用候选动作模式：系统先生成合法动作，LLM 只能从里面选，不能自由编参数。兼容模式保留给对比和调试。"
+  },
+  {
+    target: "#llm_execute_combat",
+    title: "允许 LLM 自动战斗",
+    text: "打开后 LLM 的战斗建议会被执行；关闭时只显示建议和理由。第一次演示建议先关着看几轮判断。"
+  },
+  {
+    target: ".module-item[data-module-target='ai_logic']",
+    title: "左侧工作区可以管理面板",
+    text: "这些卡片可以点击打开，也可以拖到右侧工作区。右侧面板上的加减按钮用于收起或关闭。"
+  },
+  {
+    target: "#module-runs",
+    module: "runs",
+    title: "最近 Run 和数据检查",
+    text: "这里看最近一次运行、质量标记和是否保留。训练前先检查这里，避免把明显坏数据混进训练。"
+  }
+];
 function defaultModuleState() {
   return Object.fromEntries(MODULE_IDS.map(id => [id, {open:true, collapsed:false}]));
 }
@@ -2258,6 +2418,101 @@ function openModule(id, opts = {}) {
   if (opts.scroll !== false && card) {
     card.scrollIntoView({behavior:"smooth", block:"start"});
   }
+}
+let guideIndex = 0;
+function clampGuide(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+function startGuide() {
+  guideIndex = 0;
+  showGuideStep();
+}
+function closeGuide() {
+  const overlay = document.getElementById("guideOverlay");
+  if (!overlay) return;
+  overlay.classList.add("is-hidden");
+  overlay.setAttribute("aria-hidden", "true");
+}
+function nextGuideStep() {
+  if (guideIndex >= GUIDE_STEPS.length - 1) {
+    closeGuide();
+    return;
+  }
+  guideIndex += 1;
+  showGuideStep();
+}
+function prevGuideStep() {
+  guideIndex = Math.max(0, guideIndex - 1);
+  showGuideStep();
+}
+function revealGuideTarget(step) {
+  if (step.module) openModule(step.module, {scroll:false});
+  const target = document.querySelector(step.target);
+  if (!target) return null;
+  const details = target.closest("details");
+  if (details) details.open = true;
+  target.scrollIntoView({behavior:"smooth", block:"center", inline:"nearest"});
+  return target;
+}
+function showGuideStep() {
+  const overlay = document.getElementById("guideOverlay");
+  const step = GUIDE_STEPS[guideIndex];
+  if (!overlay || !step) return;
+  overlay.classList.remove("is-hidden");
+  overlay.setAttribute("aria-hidden", "false");
+  document.getElementById("guideProgress").textContent = `${guideIndex + 1}/${GUIDE_STEPS.length}`;
+  document.getElementById("guideTitle").textContent = step.title;
+  document.getElementById("guideText").textContent = step.text;
+  document.getElementById("guideNextButton").textContent = guideIndex >= GUIDE_STEPS.length - 1 ? "完成" : "下一步";
+  revealGuideTarget(step);
+  window.setTimeout(positionGuide, 90);
+  window.setTimeout(positionGuide, 360);
+}
+function positionGuide() {
+  const overlay = document.getElementById("guideOverlay");
+  if (!overlay || overlay.classList.contains("is-hidden")) return;
+  const step = GUIDE_STEPS[guideIndex];
+  const target = document.querySelector(step.target);
+  if (!target) return;
+  const rect = target.getBoundingClientRect();
+  const pad = 8;
+  const spot = document.getElementById("guideSpotlight");
+  spot.style.left = `${Math.max(8, rect.left - pad)}px`;
+  spot.style.top = `${Math.max(8, rect.top - pad)}px`;
+  spot.style.width = `${Math.max(28, rect.width + pad * 2)}px`;
+  spot.style.height = `${Math.max(28, rect.height + pad * 2)}px`;
+
+  const card = document.getElementById("guideCard");
+  const viewportW = window.innerWidth;
+  const viewportH = window.innerHeight;
+  const initialCardRect = card.getBoundingClientRect();
+  let left = rect.right + 28;
+  if (left + initialCardRect.width > viewportW - 14) {
+    left = rect.left - initialCardRect.width - 28;
+  }
+  if (left < 14) {
+    left = clampGuide(rect.left, 14, viewportW - initialCardRect.width - 14);
+  }
+  let top = clampGuide(rect.top - 18, 14, viewportH - initialCardRect.height - 14);
+  if (viewportH < initialCardRect.height + 40) top = 14;
+  card.style.left = `${left}px`;
+  card.style.top = `${top}px`;
+  window.requestAnimationFrame(() => positionGuideArrow(rect, card.getBoundingClientRect()));
+}
+function positionGuideArrow(targetRect, cardRect) {
+  const arrow = document.getElementById("guideArrow");
+  const targetX = targetRect.left + targetRect.width / 2;
+  const targetY = targetRect.top + targetRect.height / 2;
+  const startsOnLeft = cardRect.left > targetX;
+  const startX = startsOnLeft ? cardRect.left : cardRect.right;
+  const startY = clampGuide(targetY, cardRect.top + 18, cardRect.bottom - 18);
+  const deltaX = targetX - startX;
+  const deltaY = targetY - startY;
+  const length = Math.max(24, Math.sqrt(deltaX * deltaX + deltaY * deltaY));
+  arrow.style.left = `${startX}px`;
+  arrow.style.top = `${startY}px`;
+  arrow.style.width = `${length}px`;
+  arrow.style.transform = `rotate(${Math.atan2(deltaY, deltaX)}rad)`;
 }
 function closeModule(id) {
   if (!MODULE_IDS.includes(id)) return;
@@ -2810,6 +3065,11 @@ async function exportData(){
 syncModuleUI();
 refresh();
 setInterval(refresh, 5000);
+window.addEventListener("resize", positionGuide);
+window.addEventListener("scroll", positionGuide, true);
+window.addEventListener("keydown", event => {
+  if (event.key === "Escape") closeGuide();
+});
 </script>
 </body>
 </html>"""
