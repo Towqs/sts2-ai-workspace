@@ -4,15 +4,11 @@
 
 当前工作流是：玩家负责宏观判断，AI 可以托管战斗；也可以打开宏观 AI，让模型自动处理地图、奖励、选卡、事件和营火。商店自动购买默认关闭，避免和玩家抢操作。
 
-## 项目记忆入口
+## 使用文档入口
 
-后续 AI 训练大纲、阶段路线、当前模型状态和近期执行清单记录在：
+日常启动、日志窗口和模型进程说明记录在：
 
-- [`docs/ai_training_roadmap.md`](docs/ai_training_roadmap.md)
 - [`docs/startup.md`](docs/startup.md)：一键启动控制台、日志窗口、BC AI 和 LLM。
-- [`docs/llm_combat_decision_mode.md`](docs/llm_combat_decision_mode.md)：LLM 作为战斗大脑、本地代码负责伤害/防御/药水计算的设计稿。
-- [`docs/rewind_training_mode.md`](docs/rewind_training_mode.md)：回溯训练模式，利用虚拟拒绝、外部读档或未来 Mod 快照降低试错成本。
-- [`docs/fair_rewind_training_protocol.md`](docs/fair_rewind_training_protocol.md)：公平回溯训练协议，定义可见信息边界、回溯惩罚、逐步关闭和 no_rewind 评测。
 
 ## 仓库结构
 

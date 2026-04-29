@@ -50,3 +50,9 @@ RuntimeLogs/
 训练脚本/find_*.cs
 训练脚本/STS2MCP/diff.txt
 训练脚本/STS2MCP/original_mcpmod.cs
+
+# Local-only design notes
+docs/ai_training_roadmap.md
+docs/llm_combat_decision_mode.md
+docs/rewind_training_mode.md
+docs/fair_rewind_training_protocol.md
