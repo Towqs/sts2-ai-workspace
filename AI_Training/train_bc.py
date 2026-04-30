@@ -39,6 +39,14 @@ def train(processed_dir):
     
     with open(vocab_path, 'r', encoding='utf-8') as f:
         vocab = json.load(f)
+
+    metadata = {}
+    if os.path.exists(metadata_path):
+        try:
+            with open(metadata_path, 'r', encoding='utf-8') as f:
+                metadata = json.load(f)
+        except Exception:
+            metadata = {}
     
     num_actions = len(vocab['actions'])
     input_dim = X_train.shape[1]

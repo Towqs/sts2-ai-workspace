@@ -167,10 +167,35 @@ def set_auto_run_label(run_id, quality, note=""):
     return labels[run_id]
 
 
+def is_probable_act3_clear(summary):
+    return (
+        safe_int(summary.get("max_act")) >= 3
+        and safe_int(summary.get("max_floor")) >= 48
+        and safe_int(summary.get("losses")) == 0
+        and safe_int(summary.get("wins")) >= 20
+        and safe_int(summary.get("records")) >= 200
+        and safe_int(summary.get("combat")) > 0
+        and safe_int(summary.get("macro")) > 0
+    )
+
+
+def inferred_quality_note(summary):
+    if is_probable_act3_clear(summary) and not summary.get("run_victory"):
+        return (
+            "auto: probable_clear "
+            f"max_act={summary.get('max_act', 0)}, "
+            f"max_floor={summary.get('max_floor', 0)}, "
+            f"wins={summary.get('wins', 0)}, "
+            f"losses={summary.get('losses', 0)}; "
+            "final run_victory hook missing"
+        )
+    return f"auto: max_act={summary.get('max_act', 0)}, max_floor={summary.get('max_floor', 0)}"
+
+
 def infer_quality(summary):
     if summary.get("losses", 0) > 0:
         return "failed_run"
-    if summary.get("run_victory") or safe_int(summary.get("max_act")) >= 4:
+    if summary.get("run_victory") or safe_int(summary.get("max_act")) >= 4 or is_probable_act3_clear(summary):
         return "perfect_run"
     if safe_int(summary.get("max_act")) >= 3:
         return "partial_act2"
@@ -323,6 +348,15 @@ def run_data_checks(run):
     if win_or_loss or reward_actions:
         add("奖励处理", "ok" if reward_actions else "warn", f"领奖 {run.get('claim_reward', 0)}，选卡 {run.get('choose_card', 0)}，跳过 {run.get('skip_reward', 0)}")
 
+    if run.get("run_victory"):
+        add("Run 终局信号", "ok", "已采集到 run_victory")
+    elif is_probable_act3_clear(run):
+        add(
+            "Run 终局信号",
+            "warn",
+            "按 Act 3 / Floor 48 / 胜场 / 0 失败判定为疑似通关，但没有采到 run_end/victory 钩子",
+        )
+
     if run.get("invalid_actions", 0):
         add("非法动作", "warn", f"检测到 {run.get('invalid_actions', 0)} 条错误/非法动作记录", run.get("invalid_actions", 0))
     else:
@@ -348,8 +382,9 @@ def run_data_checks(run):
 
 def finalize_run_summary(item, discarded, labels):
     item["discarded"] = item["run_id"] in discarded
+    item["probable_clear"] = is_probable_act3_clear(item)
     inferred_quality = infer_quality(item)
-    inferred_note = f"auto: max_act={item.get('max_act', 0)}, max_floor={item.get('max_floor', 0)}"
+    inferred_note = inferred_quality_note(item)
     label = labels.get(item["run_id"])
     if label and not label.get("manual"):
         label = set_auto_run_label(item["run_id"], inferred_quality, inferred_note)
