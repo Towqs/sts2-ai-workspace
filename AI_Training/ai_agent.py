@@ -179,8 +179,12 @@ def combat_number_hint(item, mode):
     return nums[0] if nums else 0
 
 
+def card_id_key(card):
+    return str(card.get("id") or card.get("card_id") or "").upper()
+
+
 def known_card_effect_hints(card):
-    card_id = str(card.get("id") or "").upper()
+    card_id = card_id_key(card)
     text = combat_text(card)
     damage = 0.0
     block = 0.0
@@ -194,11 +198,13 @@ def known_card_effect_hints(card):
         "THUNDERCLAP": 4.0,
         "SWORD_BOOMERANG": 9.0,
         "FORGOTTEN_RITUAL": 10.0,
+        "FIGHT_ME": 10.0,
+        "CINDER": 18.0,
+        "SETUP_STRIKE": 6.0,
     }
     known_block = {
         "DEFEND": 5.0,
         "DEFEND_IRONCLAD": 5.0,
-        "DRUM_OF_BATTLE": 5.0,
     }
     if card_id in known_damage:
         damage = known_damage[card_id]
@@ -209,6 +215,20 @@ def known_card_effect_hints(card):
     elif "defend" in text or "防御" in text or "block" in text or "格挡" in text:
         block = 5.0
     return damage, block
+
+
+def known_card_utility_hints(card):
+    card_id = card_id_key(card)
+    text = combat_text(card)
+    scaling_ids = {"FIGHT_ME", "SETUP_STRIKE", "INFLAME", "DEMON_FORM"}
+    energy_ids = {"BLOODLETTING", "FORGOTTEN_RITUAL"}
+    power_ids = {"DRUM_OF_BATTLE"}
+    return {
+        "scaling": card_id in scaling_ids or has_any(text, ("strength", "dexterity", "力量", "敏捷")),
+        "energy": card_id in energy_ids or has_any(text, ("energy", "能量", "ironclad_energy")),
+        "exhaust_synergy": card_id == "FORGOTTEN_RITUAL" or has_any(text, ("本回合消耗", "if you exhausted", "if you exhaust")),
+        "power": card_id in power_ids or "power" in str(card.get("type") or "").lower() or "能力" in str(card.get("type") or ""),
+    }
 
 
 def card_self_damage(card):
@@ -268,6 +288,40 @@ def enemy_incoming_damage(enemies):
     return total
 
 
+def enemy_blob(enemy):
+    parts = []
+    for key in ("id", "entity_id", "name", "description"):
+        value = enemy.get(key)
+        if value is not None:
+            parts.append(str(value))
+    for key in ("status", "statuses", "powers", "buffs", "debuffs"):
+        values = enemy.get(key) or []
+        if isinstance(values, dict):
+            values = [values]
+        for value in values:
+            if isinstance(value, dict):
+                for subkey in ("id", "name", "type", "label", "title", "description"):
+                    subvalue = value.get(subkey)
+                    if subvalue is not None:
+                        parts.append(str(subvalue))
+            else:
+                parts.append(str(value))
+    try:
+        parts.append(json.dumps(enemy.get("intents") or [], ensure_ascii=False))
+    except Exception:
+        parts.append(str(enemy.get("intents") or ""))
+    return " ".join(parts).lower()
+
+
+def enemies_damage_ineffective(enemies):
+    immune_terms = (
+        "intangible", "无形", "虚无", "免疫伤害", "不受伤害", "不会受到伤害",
+        "不会受到任何", "本回合不会受到", "任何伤害",
+        "take no damage", "cannot take damage", "no damage",
+    )
+    return any(has_any(enemy_blob(enemy), immune_terms) for enemy in enemies or [])
+
+
 def card_for_candidate(candidate, state):
     player = (state or {}).get("player") or {}
     hand = player.get("hand") or []
@@ -295,7 +349,7 @@ def potion_for_candidate(candidate, state):
 
 def card_effect_profile(card):
     text = combat_text(card)
-    card_id = str(card.get("id") or "").upper()
+    card_id = card_id_key(card)
     card_type = str(card.get("type") or "").lower()
     damage = combat_number_hint(card, "attack")
     block_gain = combat_number_hint(card, "block")
@@ -304,6 +358,7 @@ def card_effect_profile(card):
         damage = known_damage
     if block_gain <= 0:
         block_gain = known_block
+    utility_hints = known_card_utility_hints(card)
     self_damage = card_self_damage(card)
     status_like_ids = {
         "SLIMED",
@@ -332,7 +387,11 @@ def card_effect_profile(card):
         "block_gain": block_gain,
         "self_damage": self_damage,
         "status_like": status_like,
-        "has_utility": any(term in text for term in utility_terms),
+        "has_utility": any(term in text for term in utility_terms) or any(utility_hints.values()),
+        "scaling": utility_hints["scaling"],
+        "energy": utility_hints["energy"],
+        "exhaust_synergy": utility_hints["exhaust_synergy"],
+        "power_like": utility_hints["power"] or "power" in card_type,
     }
 
 
@@ -444,6 +503,7 @@ def tactical_candidate_adjustment(candidate, state):
     block = safe_num(player.get("block"), 0.0)
     incoming = enemy_incoming_damage(enemies)
     net_incoming = max(0.0, incoming - block)
+    damage_ineffective = enemies_damage_ineffective(enemies)
     adjustment = 0.0
     reasons = []
 
@@ -454,6 +514,14 @@ def tactical_candidate_adjustment(candidate, state):
         block_gain = profile["block_gain"]
         self_damage = profile["self_damage"]
         card_type = profile["card_type"]
+        exhaust_count = safe_num(player.get("exhaust_pile_count") or player.get("exhaust_count"), 0.0)
+        playable_attack_count = sum(
+            1
+            for hand_card in player.get("hand", []) or []
+            if isinstance(hand_card, dict)
+            and str(hand_card.get("type") or "").lower() == "attack"
+            and hand_card.get("can_play", False)
+        )
 
         if profile["status_like"] and damage <= 0 and block_gain <= 0:
             adjustment -= 8.0
@@ -472,6 +540,9 @@ def tactical_candidate_adjustment(candidate, state):
             if block_gain > 0 and damage <= 0:
                 adjustment -= 10.0
                 reasons.append("no_incoming_block_penalty")
+            if profile["power_like"] or profile["scaling"]:
+                adjustment += 5.0
+                reasons.append("safe_turn_setup")
         else:
             if block_gain > 0 and damage <= 0 and net_incoming <= 0:
                 adjustment -= 8.0
@@ -492,6 +563,28 @@ def tactical_candidate_adjustment(candidate, state):
             if hp_ratio <= 0.35 and block_gain > 0:
                 adjustment += 3.0
                 reasons.append("low_hp_block")
+
+        if damage_ineffective:
+            if profile["power_like"] or profile["scaling"] or profile["energy"]:
+                adjustment += 16.0
+                reasons.append("damage_immune_setup")
+            elif damage > 0 and block_gain <= 0 and not profile["has_utility"]:
+                adjustment -= 16.0
+                reasons.append("damage_immune_attack")
+
+        if profile["power_like"] and (safe_int(battle.get("round"), 0) in (0, 1, 2) or damage_ineffective or incoming <= 0):
+            adjustment += 4.0
+            reasons.append("early_power")
+        if profile["scaling"] and (playable_attack_count >= 2 or damage_ineffective or incoming <= 0):
+            adjustment += 4.0
+            reasons.append("scaling_combo")
+        if profile["exhaust_synergy"]:
+            if exhaust_count > 0:
+                adjustment += 7.0
+                reasons.append("exhaust_synergy_ready")
+            else:
+                adjustment -= 4.0
+                reasons.append("exhaust_synergy_not_ready")
 
         if damage > 0 and candidate.target_effective_hp and damage >= candidate.target_effective_hp:
             adjustment += 8.0
@@ -699,6 +792,78 @@ def get_can_proceed(state, state_type):
     return False
 
 
+def rest_option_blob(option):
+    parts = []
+    for key in ("id", "option_id", "title", "name", "description", "option_title"):
+        value = option.get(key)
+        if value is not None:
+            parts.append(str(value))
+    return " ".join(parts).lower()
+
+
+def rest_option_kind(option):
+    text = rest_option_blob(option)
+    if has_any(text, ("smith", "upgrade", "强化", "升级", "锻造")):
+        return "smith"
+    if has_any(text, ("heal", "rest", "sleep", "休息", "治疗", "回复")):
+        return "heal"
+    return "other"
+
+
+def choose_rest_site_rule_action(state):
+    rest_site = state.get("rest_site") or {}
+    options = rest_site.get("options") or []
+    enabled = [o for o in options if o.get("is_enabled", True)]
+    if not enabled:
+        return None, {
+            "top_actions": [],
+            "chosen_action": None,
+            "payload": None,
+            "reason": "rest_no_enabled_option",
+        }
+
+    player = state.get("player") or {}
+    hp = safe_num(player.get("hp"), 0.0)
+    max_hp = max(safe_num(player.get("max_hp"), 1.0), 1.0)
+    hp_ratio = hp / max_hp
+    smith = next((o for o in enabled if rest_option_kind(o) == "smith"), None)
+    heal = next((o for o in enabled if rest_option_kind(o) == "heal"), None)
+
+    if hp_ratio >= 0.62 and smith:
+        chosen = smith
+        reason = f"rest_rule_smith_high_hp hp={hp_ratio:.2f}"
+    elif hp_ratio <= 0.45 and heal:
+        chosen = heal
+        reason = f"rest_rule_heal_low_hp hp={hp_ratio:.2f}"
+    elif smith:
+        chosen = smith
+        reason = f"rest_rule_smith_stable_hp hp={hp_ratio:.2f}"
+    elif heal:
+        chosen = heal
+        reason = f"rest_rule_heal_only hp={hp_ratio:.2f}"
+    else:
+        chosen = enabled[0]
+        reason = "rest_rule_first_enabled"
+
+    index = int(chosen.get("index", enabled.index(chosen)))
+    top_actions = []
+    for option in enabled:
+        kind = rest_option_kind(option)
+        option_index = int(option.get("index", enabled.index(option)))
+        score = 100.0 if option is chosen else (60.0 if kind == "smith" else 40.0)
+        top_actions.append({
+            "action": f"choose_rest_option:index_{option_index}:{kind}",
+            "confidence": score,
+            "marker": f"hp={hp_ratio:.2f}; id={option.get('id') or option.get('option_id') or '-'}",
+        })
+    return {"action": "choose_rest_option", "index": index}, {
+        "top_actions": top_actions,
+        "chosen_action": f"choose_rest_option:index_{index}:{rest_option_kind(chosen)}",
+        "payload": {"action": "choose_rest_option", "index": index},
+        "reason": reason,
+    }
+
+
 def shop_item_matches(item, wanted):
     wanted = str(wanted or "").lower()
     fields = (
@@ -830,11 +995,10 @@ def macro_label_to_payload(label, state, allow_shop=False):
     if label.startswith("choose_rest_option:"):
         if state_type != "rest_site":
             return None, "not_rest_site"
-        options = (state.get("rest_site") or {}).get("options") or []
-        enabled = [o for o in options if o.get("is_enabled", True)]
-        if not enabled:
-            return None, "no_rest_option_enabled"
-        return {"action": "choose_rest_option", "index": int(enabled[0].get("index", 0))}, "first_enabled_rest_option"
+        payload, info = choose_rest_site_rule_action(state)
+        if payload:
+            return payload, info.get("reason", "rest_rule")
+        return None, "no_rest_option_enabled"
 
     if label.startswith("buy_item:"):
         if state_type not in ("shop", "fake_merchant"):
@@ -922,18 +1086,20 @@ def card_traits(card):
     ctype = normalized_card_type(card)
     cost = safe_num(card.get("cost"), 0.0)
     rarity = str(card.get("rarity") or "").lower()
+    known_damage, known_block = known_card_effect_hints(card)
+    utility_hints = known_card_utility_hints(card)
     return {
         "type": ctype,
         "cost": cost,
         "rarity": rarity,
         "is_attack": ctype == "attack",
         "is_skill": ctype == "skill",
-        "is_power": ctype == "power",
-        "damage": ctype == "attack" or has_any(text, ("damage", "伤害")),
-        "block": ctype == "skill" and has_any(text, ("block", "格挡", "防御", "护甲")),
+        "is_power": ctype == "power" or utility_hints["power"],
+        "damage": ctype == "attack" or known_damage > 0 or has_any(text, ("damage", "伤害")),
+        "block": known_block > 0 or (ctype == "skill" and has_any(text, ("block", "格挡", "防御", "护甲"))),
         "draw": has_any(text, ("draw", "抽", "card draw", "抽牌")),
         "aoe": has_any(text, ("all enemies", "aoe", "所有敌人", "全部敌人", "全体", "每个敌人")),
-        "scaling": has_any(text, ("strength", "dexterity", "focus", "力量", "敏捷", "集中", "每回合", "whenever", "永久")),
+        "scaling": utility_hints["scaling"] or has_any(text, ("strength", "dexterity", "focus", "力量", "敏捷", "集中", "每回合", "whenever", "永久")),
     }
 
 
@@ -1165,6 +1331,9 @@ def choose_card_reward_baseline_action(state, card_baseline_weight=1.0):
 def card_attack_hint(card):
     traits = card_traits(card)
     text = combat_core_text(card)
+    known_damage, _known_block = known_card_effect_hints(card)
+    if known_damage > 0:
+        return known_damage
     if not (traits["is_attack"] or has_any(text, ("deal", "attack", "造成", "攻击"))):
         return 0
     nums = combat_numbers(text)
@@ -1177,6 +1346,9 @@ def card_attack_hint(card):
 
 def card_block_hint(card):
     text = combat_core_text(card)
+    _known_damage, known_block = known_card_effect_hints(card)
+    if known_block > 0:
+        return known_block
     if not has_any(text, ("block", "defend", "armor", "格挡", "护甲", "防御")):
         return 0
     nums = combat_numbers(text)
@@ -1198,6 +1370,10 @@ def is_status_or_curse_card(card):
         "curse", "status", "wound", "burn", "dazed", "slimed", "void",
         "诅咒", "状态", "伤口", "灼伤", "晕眩", "黏液", "虚空",
     ))
+
+
+def is_safe_sacrifice_card(card):
+    return is_status_or_curse_card(card) or is_starter_strike_or_defend(card)
 
 
 def card_long_term_value(card):
@@ -1436,6 +1612,7 @@ def choose_card_select_action(state):
             "name": card.get("name"),
             "score": round(score, 3),
             "reasons": reasons,
+            "safe": is_safe_sacrifice_card(card) if operation in ("sacrifice", "transform") else True,
         })
 
     if not scored:
@@ -1453,13 +1630,25 @@ def choose_card_select_action(state):
             "reason": "card_select_waiting_after_memory",
         }
 
+    if operation in ("sacrifice", "transform"):
+        safe_scored = [item for item in scored if item.get("safe")]
+        if safe_scored:
+            scored = safe_scored
+        elif screen.get("can_cancel"):
+            return {"action": "cancel_selection"}, {
+                "top_actions": [{"action": "cancel_selection", "confidence": 100.0, "marker": "no_safe_card_to_remove"}],
+                "chosen_action": "cancel_selection",
+                "payload": {"action": "cancel_selection"},
+                "reason": f"card_select_{operation}_cancel_no_safe_target",
+            }
+
     best = max(scored, key=lambda item: item["score"])
     payload = {"action": "select_card", "index": best["index"]}
     top_actions = [
         {
             "action": f"select_card:index_{item['index']}:{item.get('id') or item.get('name')}",
             "confidence": round(max(item["score"], 0.0) * 20, 2),
-            "marker": f"operation={operation}; score={item['score']:+.2f}; {' / '.join(item['reasons']) or '-'}",
+            "marker": f"operation={operation}; score={item['score']:+.2f}; {'safe' if item.get('safe') else 'unsafe'}; {' / '.join(item['reasons']) or '-'}",
         }
         for item in sorted(scored, key=lambda item: item["score"], reverse=True)[:6]
     ]
@@ -1518,6 +1707,32 @@ def best_deck_sacrifice_candidate(state):
     best = None
     for card in deck:
         if not isinstance(card, dict):
+            continue
+        score, reasons = card_sacrifice_priority(card, state)
+        item = {"card": card, "score": score, "reasons": reasons}
+        if best is None or item["score"] > best["score"]:
+            best = item
+    return best
+
+
+def best_safe_deck_sacrifice_candidate(state):
+    deck = ((state.get("player") or {}).get("deck") or [])
+    best = None
+    for card in deck:
+        if not isinstance(card, dict) or not is_safe_sacrifice_card(card):
+            continue
+        score, reasons = card_sacrifice_priority(card, state)
+        item = {"card": card, "score": score, "reasons": reasons}
+        if best is None or item["score"] > best["score"]:
+            best = item
+    return best
+
+
+def best_shop_removal_candidate(state):
+    deck = ((state.get("player") or {}).get("deck") or [])
+    best = None
+    for card in deck:
+        if not isinstance(card, dict) or not is_status_or_curse_card(card):
             continue
         score, reasons = card_sacrifice_priority(card, state)
         item = {"card": card, "score": score, "reasons": reasons}
@@ -1607,7 +1822,7 @@ def score_shop_potion(item, state):
 def score_shop_removal(item, state):
     profile = deck_profile_from_state(state)
     deck_size = safe_int(profile.get("total"))
-    best = best_deck_sacrifice_candidate(state)
+    best = best_shop_removal_candidate(state)
     price = shop_price(item)
     score = -price / 90.0
     reasons = ["删牌"]
@@ -1622,7 +1837,10 @@ def score_shop_removal(item, state):
     if deck_size >= 24:
         score += 0.8
         reasons.append("压缩牌组")
-    if not best or best["score"] < 2.0:
+    if not best:
+        score -= 99.0
+        reasons.append("无诅咒不花钱删牌")
+    elif best["score"] < 2.0:
         score -= 1.5
         reasons.append("缺少明显垃圾牌")
     return round(score, 3), reasons[:4]
@@ -1649,7 +1867,7 @@ def rank_shop_items(state, state_type, category_filter=None):
         if category_filter and shop_item_category(item) != category_filter:
             continue
         score, reasons = score_shop_item(item, state)
-        if category_filter is None and score < 0.75:
+        if (category_filter is None or category_filter == "card_removal") and score < 0.75:
             continue
         ranked.append({
             "fallback_index": fallback_index,
@@ -2127,6 +2345,10 @@ def choose_macro_action(macro_agent, state, allow_shop=False, card_baseline_weig
         event_payload, event_info = choose_event_option_rule_action(state)
         if event_payload:
             return event_payload, event_info
+    if state_type == "rest_site":
+        rest_payload, rest_info = choose_rest_site_rule_action(state)
+        if rest_payload:
+            return rest_payload, rest_info
     if state_type in ("shop", "fake_merchant") and allow_shop:
         shop_payload, shop_info = choose_shop_rule_action(state, state_type)
         if shop_payload:
