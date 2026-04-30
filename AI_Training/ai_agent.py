@@ -150,14 +150,23 @@ def combat_text(item):
     return " ".join(parts).lower()
 
 
+def combat_core_text(item):
+    parts = []
+    for key in ("id", "name", "type", "description", "target_type"):
+        value = item.get(key)
+        if value is not None:
+            parts.append(str(value))
+    return " ".join(parts).lower()
+
+
 def combat_numbers(text):
     import re
     return [int(n) for n in re.findall(r"\d+", str(text or ""))]
 
 
 def combat_number_hint(item, mode):
-    text = combat_text(item)
-    if mode == "attack" and not any(k in text for k in ("deal", "damage", "attack", "造成", "伤害", "攻击")):
+    text = combat_core_text(item)
+    if mode == "attack" and not any(k in text for k in ("deal", "attack", "造成", "攻击")):
         return 0
     if mode == "block" and not any(k in text for k in ("block", "defend", "armor", "格挡", "护甲", "防御")):
         return 0
@@ -286,8 +295,8 @@ def card_effect_profile(card):
 
 
 def potion_damage_hint(potion):
-    text = combat_text(potion)
-    if not any(k in text for k in ("damage", "伤害", "fire", "火焰", "attack", "攻击")):
+    text = combat_core_text(potion)
+    if not any(k in text for k in ("deal", "attack", "fire", "造成", "攻击", "火焰")):
         return 0
     nums = combat_numbers(text)
     if not nums:
