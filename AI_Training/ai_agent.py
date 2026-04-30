@@ -647,32 +647,23 @@ def choose_shop_item(state, state_type, wanted):
         if item.get("is_stocked", True) and item.get("can_afford", True)
     ]
     if wanted not in ("?", "unknown", ""):
+        wanted_category = wanted if wanted in ("card", "relic", "potion", "card_removal") else None
+        if wanted_category:
+            ranked = rank_shop_items(state, state_type, category_filter=wanted_category)
+            if ranked:
+                best = ranked[0]
+                return best["item"], best["fallback_index"], f"shop_rule_{wanted_category}:{best['score']:+.2f}"
+            return None, None, f"shop_{wanted_category}_unavailable"
         for fallback_index, item in available:
             if shop_item_matches(item, wanted):
                 return item, fallback_index, "available"
         return None, None, "shop_item_unavailable"
 
-    # Ambiguous shop labels come from weak training data. If shop automation is
-    # explicitly enabled, pick a conservative non-removal purchase.
-    priorities = {"relic": 0, "card": 1, "potion": 2}
-    candidates = []
-    for fallback_index, item in available:
-        category = str(item.get("category") or item.get("type") or "").lower()
-        if category == "card_removal":
-            continue
-        if category not in priorities:
-            continue
-        candidates.append((
-            priorities[category],
-            0 if item.get("on_sale") else 1,
-            int(item.get("price") or item.get("cost") or 9999),
-            fallback_index,
-            item,
-        ))
-    if not candidates:
+    ranked = rank_shop_items(state, state_type)
+    if not ranked:
         return None, None, "no_safe_shop_purchase"
-    _, _, _, fallback_index, item = sorted(candidates)[0]
-    return item, fallback_index, "fallback_safe_purchase"
+    best = ranked[0]
+    return best["item"], best["fallback_index"], f"shop_rule_purchase:{best['score']:+.2f}"
 
 
 def macro_label_to_payload(label, state, allow_shop=False):
@@ -774,8 +765,6 @@ def macro_label_to_payload(label, state, allow_shop=False):
         if not allow_shop:
             return None, "shop_protected"
         wanted = label.split(":", 1)[1].lower()
-        if wanted == "card_removal":
-            return None, "card_removal_requires_manual_selection"
         item, fallback_index, status = choose_shop_item(state, state_type, wanted)
         if item:
             return {"action": "shop_purchase", "index": int(item.get("index", fallback_index))}, status
@@ -1377,6 +1366,237 @@ def choose_card_select_action(state):
     }
 
 
+def shop_price(item):
+    return safe_num(item.get("price") or item.get("cost"), 9999.0)
+
+
+def shop_item_category(item):
+    return str(item.get("category") or item.get("type") or "").lower()
+
+
+def card_from_shop_item(item):
+    return {
+        "id": item.get("card_id") or item.get("id"),
+        "name": item.get("card_name") or item.get("name"),
+        "type": item.get("card_type") or item.get("type"),
+        "cost": item.get("card_cost") or item.get("cost"),
+        "star_cost": item.get("card_star_cost"),
+        "description": item.get("card_description") or item.get("description"),
+        "rarity": item.get("card_rarity") or item.get("rarity"),
+        "keywords": item.get("keywords") or [],
+        "is_upgraded": item.get("is_upgraded", False),
+    }
+
+
+def shop_item_blob(item):
+    parts = []
+    for key in (
+        "category", "type", "item_id", "item_name",
+        "card_id", "card_name", "card_description", "card_rarity",
+        "relic_id", "relic_name", "relic_description",
+        "potion_id", "potion_name", "potion_description",
+    ):
+        value = item.get(key)
+        if value is not None:
+            parts.append(str(value))
+    keywords = item.get("keywords")
+    if keywords:
+        try:
+            parts.append(json.dumps(keywords, ensure_ascii=False))
+        except Exception:
+            parts.append(str(keywords))
+    return " ".join(parts).lower()
+
+
+def best_deck_sacrifice_candidate(state):
+    deck = ((state.get("player") or {}).get("deck") or [])
+    best = None
+    for card in deck:
+        if not isinstance(card, dict):
+            continue
+        score, reasons = card_sacrifice_priority(card, state)
+        item = {"card": card, "score": score, "reasons": reasons}
+        if best is None or item["score"] > best["score"]:
+            best = item
+    return best
+
+
+def score_shop_card(item, state):
+    card = card_from_shop_item(item)
+    profile = deck_profile_from_state(state)
+    reward_score, reward_reasons = score_reward_card(card, profile, state)
+    value, value_reasons = card_long_term_value(card)
+    price = shop_price(item)
+    score = reward_score + value * 0.35 - price / 75.0
+    reasons = reward_reasons[:2] + value_reasons[:1]
+    if item.get("on_sale"):
+        score += 0.7
+        reasons.append("打折")
+    if score < 0.4 and safe_int(profile.get("total")) >= 20:
+        score -= 0.8
+        reasons.append("避免牌组变厚")
+    return round(score, 3), reasons[:4]
+
+
+def score_shop_relic(item, state):
+    text = shop_item_blob(item)
+    player = state.get("player") or {}
+    gold = safe_num(player.get("gold"), 0.0)
+    price = shop_price(item)
+    score = 3.2 - price / 115.0
+    reasons = ["遗物收益"]
+
+    if has_any(text, ("energy", "能量")):
+        score += 2.4
+        reasons.append("能量")
+    if has_any(text, ("draw", "card reward", "抽", "抽牌", "卡牌奖励")):
+        score += 1.6
+        reasons.append("过牌/奖励")
+    if has_any(text, ("heal", "recover", "回复", "治疗", "生命")):
+        score += 1.2
+        reasons.append("续航")
+    if has_any(text, ("elite", "boss", "精英", "boss")):
+        score += 1.0
+        reasons.append("关键战收益")
+    if has_any(text, ("strength", "damage", "力量", "伤害")):
+        score += 0.9
+        reasons.append("输出收益")
+    if price <= gold * 0.45:
+        score += 0.5
+        reasons.append("价格可接受")
+    if price > gold * 0.85:
+        score -= 0.8
+        reasons.append("消耗金币过多")
+    return round(score, 3), reasons[:4]
+
+
+def score_shop_potion(item, state):
+    text = shop_item_blob(item)
+    player = state.get("player") or {}
+    potions = player.get("potions") or []
+    hp = safe_num(player.get("hp"), 0.0)
+    max_hp = max(safe_num(player.get("max_hp"), 1.0), 1.0)
+    hp_ratio = hp / max_hp
+    price = shop_price(item)
+    score = 1.0 - price / 55.0
+    reasons = ["药水"]
+
+    if len(potions) >= 3:
+        score -= 3.0
+        reasons.append("药水位可能已满")
+    if has_any(text, ("damage", "attack", "strength", "vulnerable", "伤害", "攻击", "力量", "易伤")):
+        score += 1.8
+        reasons.append("战斗爆发")
+    if has_any(text, ("block", "armor", "格挡", "护甲", "防御")):
+        score += 1.2
+        reasons.append("保命")
+    if has_any(text, ("draw", "energy", "抽牌", "能量")):
+        score += 1.5
+        reasons.append("启动")
+    if hp_ratio < 0.45:
+        score += 0.8
+        reasons.append("低血量备药")
+    return round(score, 3), reasons[:4]
+
+
+def score_shop_removal(item, state):
+    profile = deck_profile_from_state(state)
+    deck_size = safe_int(profile.get("total"))
+    best = best_deck_sacrifice_candidate(state)
+    price = shop_price(item)
+    score = -price / 90.0
+    reasons = ["删牌"]
+
+    if best:
+        score += max(best["score"], 0.0) * 0.9
+        name = (best["card"].get("name") or best["card"].get("id") or "低价值牌")
+        reasons.append(f"可删{name}")
+    if deck_size >= 18:
+        score += 1.0
+        reasons.append("牌组偏厚")
+    if deck_size >= 24:
+        score += 0.8
+        reasons.append("压缩牌组")
+    if not best or best["score"] < 2.0:
+        score -= 1.5
+        reasons.append("缺少明显垃圾牌")
+    return round(score, 3), reasons[:4]
+
+
+def score_shop_item(item, state):
+    category = shop_item_category(item)
+    if category == "card":
+        return score_shop_card(item, state)
+    if category == "relic":
+        return score_shop_relic(item, state)
+    if category == "potion":
+        return score_shop_potion(item, state)
+    if category == "card_removal":
+        return score_shop_removal(item, state)
+    return -99.0, ["未知商品类型"]
+
+
+def rank_shop_items(state, state_type, category_filter=None):
+    ranked = []
+    for fallback_index, item in enumerate(get_items_for_state(state, state_type)):
+        if not item.get("is_stocked", True) or not item.get("can_afford", True):
+            continue
+        if category_filter and shop_item_category(item) != category_filter:
+            continue
+        score, reasons = score_shop_item(item, state)
+        if category_filter is None and score < 0.75:
+            continue
+        ranked.append({
+            "fallback_index": fallback_index,
+            "item": item,
+            "score": score,
+            "reasons": reasons,
+            "category": shop_item_category(item),
+        })
+    ranked.sort(key=lambda row: (
+        row["score"],
+        1 if row["item"].get("on_sale") else 0,
+        -shop_price(row["item"]),
+    ), reverse=True)
+    return ranked
+
+
+def choose_shop_rule_action(state, state_type):
+    ranked = rank_shop_items(state, state_type)
+    if ranked:
+        best = ranked[0]
+        payload = {"action": "shop_purchase", "index": int(best["item"].get("index", best["fallback_index"]))}
+        top_actions = [
+            {
+                "action": f"shop_purchase:index_{int(row['item'].get('index', row['fallback_index']))}:{row['category']}",
+                "confidence": round(max(row["score"], 0.0) * 20, 2),
+                "marker": f"shop_score={row['score']:+.2f}; price={shop_price(row['item']):.0f}; {' / '.join(row['reasons']) or '-'}",
+            }
+            for row in ranked[:6]
+        ]
+        return payload, {
+            "top_actions": top_actions,
+            "chosen_action": f"shop_purchase:index_{payload['index']}:{best['category']}",
+            "payload": payload,
+            "reason": "shop_rule: " + (" / ".join(best["reasons"]) or "highest score"),
+        }
+
+    if get_can_proceed(state, state_type):
+        payload = {"action": "proceed"}
+        return payload, {
+            "top_actions": [{"action": "proceed", "confidence": 100.0, "marker": "no_positive_shop_purchase"}],
+            "chosen_action": "proceed",
+            "payload": payload,
+            "reason": "shop_rule_no_positive_purchase",
+        }
+    return None, {
+        "top_actions": [],
+        "chosen_action": None,
+        "payload": None,
+        "reason": "shop_rule_no_action",
+    }
+
+
 def choose_card_reward_mixed_action(macro_agent, state, outputs, probs, card_baseline_weight):
     baseline_entries, profile = card_reward_baseline_entries(state)
     baseline_by_label = {entry["label"]: entry for entry in baseline_entries}
@@ -1522,9 +1742,11 @@ def score_event_option_rule(option, state):
             score -= 0.6
             reasons.append("只动初始牌")
         else:
-            penalty = 3.5 if hp_ratio >= 0.45 else 1.6
+            best_sacrifice = best_deck_sacrifice_candidate(state)
+            has_obvious_junk = bool(best_sacrifice and best_sacrifice["score"] >= 3.0)
+            penalty = 2.0 if has_obvious_junk else (3.5 if hp_ratio >= 0.45 else 1.6)
             score -= penalty
-            reasons.append("可能损失核心牌")
+            reasons.append("可控删牌" if has_obvious_junk else "可能损失核心牌")
 
     if has_any(text, ("next", "again", "reroll", "下一", "再选", "重抽", "继续选择")):
         score += 0.5
@@ -1792,6 +2014,10 @@ def choose_macro_action(macro_agent, state, allow_shop=False, card_baseline_weig
         event_payload, event_info = choose_event_option_rule_action(state)
         if event_payload:
             return event_payload, event_info
+    if state_type in ("shop", "fake_merchant") and allow_shop:
+        shop_payload, shop_info = choose_shop_rule_action(state, state_type)
+        if shop_payload:
+            return shop_payload, shop_info
 
     if not macro_agent:
         if state_type == "card_reward":
