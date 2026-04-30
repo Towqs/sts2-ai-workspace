@@ -352,17 +352,21 @@ def candidate_should_play_before_end_turn(candidate, state):
     if candidate.kind == "play_card":
         card = card_for_candidate(candidate, state)
         profile = card_effect_profile(card)
+        player = (state or {}).get("player") or {}
+        battle = (state or {}).get("battle") or {}
         hp = safe_num(((state or {}).get("player") or {}).get("hp"), 0.0)
         max_hp = max(safe_num(((state or {}).get("player") or {}).get("max_hp"), 1.0), 1.0)
         hp_ratio = hp / max_hp
-        incoming = enemy_incoming_damage(((state or {}).get("battle") or {}).get("enemies") or [])
+        incoming = enemy_incoming_damage(battle.get("enemies") or [])
+        block = safe_num(player.get("block"), 0.0)
+        net_incoming = max(0.0, incoming - block)
         if profile["self_damage"] > 0 and (hp <= profile["self_damage"] + 1 or hp_ratio <= 0.25):
             return False
         if profile["status_like"] and profile["damage"] <= 0 and profile["block_gain"] <= 0:
             return False
         if profile["damage"] > 0:
             return True
-        if profile["block_gain"] > 0 and incoming > 0:
+        if profile["block_gain"] > 0 and net_incoming > 0:
             return True
         if "power" in profile["card_type"]:
             return True
@@ -432,6 +436,12 @@ def tactical_candidate_adjustment(candidate, state):
                 adjustment -= 10.0
                 reasons.append("no_incoming_block_penalty")
         else:
+            if block_gain > 0 and damage <= 0 and net_incoming <= 0:
+                adjustment -= 8.0
+                reasons.append("already_blocked")
+            elif block_gain > 0 and damage <= 0 and block + block_gain > incoming + 6 and not profile["has_utility"]:
+                adjustment -= 4.0
+                reasons.append("overblock_penalty")
             if net_incoming >= max(8.0, hp * 0.35) and block_gain > 0:
                 adjustment += 5.0
                 reasons.append("high_threat_block")
@@ -457,6 +467,9 @@ def tactical_candidate_adjustment(candidate, state):
         if profile["scaling"] and incoming > 0 and (profile["round_no"] >= 3 or hp_ratio <= 0.55):
             adjustment += 4.0
             reasons.append("scaling_potion_long_fight")
+        if not profile["useful"]:
+            adjustment -= 14.0
+            reasons.append("save_potion")
         if incoming <= 0 and (profile["defensive"] or profile["scaling"]):
             adjustment -= 3.0
             reasons.append("no_incoming_save_potion")
@@ -1317,6 +1330,16 @@ def score_card_select_for_operation(card, operation, state=None):
 def choose_card_select_action(state):
     screen = state.get("card_select") or {}
     operation = detect_card_select_operation(screen)
+    remembered_indices = {
+        safe_int(index, -1)
+        for index in state.get("_card_select_selected_indices", [])
+    }
+    observed_indices = {
+        safe_int(card.get("index"), -1)
+        for card in (screen.get("selected_cards") or [])
+        if isinstance(card, dict)
+    }
+    excluded_indices = {index for index in remembered_indices | observed_indices if index >= 0}
 
     if screen.get("can_confirm"):
         return {"action": "confirm_selection"}, {
@@ -1344,14 +1367,32 @@ def choose_card_select_action(state):
 
     scored = []
     for fallback_index, card in enumerate(cards):
+        index = safe_int(card.get("index"), fallback_index)
+        if index in excluded_indices:
+            continue
         score, reasons = score_card_select_for_operation(card, operation, state)
         scored.append({
-            "index": safe_int(card.get("index"), fallback_index),
+            "index": index,
             "id": card.get("id"),
             "name": card.get("name"),
             "score": round(score, 3),
             "reasons": reasons,
         })
+
+    if not scored:
+        if screen.get("can_confirm"):
+            return {"action": "confirm_selection"}, {
+                "top_actions": [{"action": "confirm_selection", "confidence": 100.0, "marker": "all_remembered_selected"}],
+                "chosen_action": "confirm_selection",
+                "payload": {"action": "confirm_selection"},
+                "reason": "card_select_confirm_after_memory",
+            }
+        return None, {
+            "top_actions": [],
+            "chosen_action": None,
+            "payload": None,
+            "reason": "card_select_waiting_after_memory",
+        }
 
     best = max(scored, key=lambda item: item["score"])
     payload = {"action": "select_card", "index": best["index"]}
@@ -2326,6 +2367,7 @@ def run_agent():
     last_status_print = 0
     last_data_source = None
     last_macro_decision_key = None
+    card_select_memory = {}
 
     while True:
         agent_sleep(0.8)
@@ -2351,6 +2393,8 @@ def run_agent():
             
         battle = state.get("battle", {})
         state_type = state.get("state_type", "unknown")
+        if state_type != "card_select" and card_select_memory:
+            card_select_memory.clear()
         is_play = battle.get("is_play_phase", False)
         turn = battle.get("turn", "unknown")
         player_disabled = battle.get("player_actions_disabled", False)
@@ -2385,6 +2429,10 @@ def run_agent():
             if control.get("macro_enabled", False) and state_type in ("map", "rewards", "card_reward", "card_select", "event", "rest_site", "shop", "fake_merchant", "treasure"):
                 allow_shop = bool(control.get("macro_shop_enabled", False))
                 card_baseline_weight = safe_num(control.get("macro_card_reward_weight"), 0.35)
+                card_select_key = None
+                if state_type == "card_select":
+                    card_select_key = macro_state_signature(state)
+                    state["_card_select_selected_indices"] = sorted(card_select_memory.get(card_select_key, set()))
                 payload, macro_info = choose_macro_action(
                     macro_agent,
                     state,
@@ -2415,8 +2463,16 @@ def run_agent():
                     if last_data_source != "ai":
                         set_data_source("ai")
                         last_data_source = "ai"
+                    raw_payload = payload
                     payload = payload_with_policy(payload, macro_policy_name, macro_model_version)
                     success = send_action(payload)
+                    if state_type == "card_select" and card_select_key and success:
+                        action_name = raw_payload.get("action")
+                        if action_name == "select_card":
+                            selected = card_select_memory.setdefault(card_select_key, set())
+                            selected.add(safe_int(raw_payload.get("index"), -1))
+                        elif action_name in ("confirm_selection", "cancel_selection"):
+                            card_select_memory.pop(card_select_key, None)
                     last_macro_decision_key = decision_key
                     if not success and last_data_source != "human":
                         set_data_source("human")
