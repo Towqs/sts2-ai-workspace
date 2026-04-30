@@ -114,6 +114,7 @@ LAST_EXPORT = {"path": None, "filename": None, "created": None, "size": 0, "file
 LLM_TEST_STATE = {"running": False, "last_started": 0.0, "last_finished": 0.0}
 GAME_CACHE = {"state": None, "ts": 0.0}
 PYTHON_RUNTIME_CACHE = {"ts": 0.0, "data": None}
+APP_VERSION_CACHE = {"ts": 0.0, "data": None}
 REQUIRED_AGENT_MODULES = ["requests", "torch", "numpy", "colorama"]
 REQUIRED_TRAINING_MODULES = ["numpy", "torch"]
 
@@ -798,6 +799,92 @@ def file_status(path):
     return data
 
 
+def app_version_status():
+    now = time.time()
+    cached = APP_VERSION_CACHE.get("data")
+    if cached and now - APP_VERSION_CACHE.get("ts", 0.0) < 30:
+        return cached
+
+    label = ""
+    commit = ""
+    dirty = False
+    try:
+        desc = subprocess.run(
+            ["git", "describe", "--tags", "--always", "--dirty"],
+            cwd=str(WORKSPACE),
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if desc.returncode == 0:
+            label = desc.stdout.strip()
+            dirty = label.endswith("-dirty")
+        rev = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(WORKSPACE),
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if rev.returncode == 0:
+            commit = rev.stdout.strip()
+    except Exception:
+        pass
+
+    if not label:
+        label = f"local-{datetime.fromtimestamp(Path(__file__).stat().st_mtime).strftime('%Y%m%d-%H%M')}"
+    data = {
+        "label": label,
+        "commit": commit,
+        "dirty": dirty,
+        "control_panel_mtime": datetime.fromtimestamp(Path(__file__).stat().st_mtime).isoformat(timespec="seconds"),
+    }
+    APP_VERSION_CACHE.update({"ts": now, "data": data})
+    return data
+
+
+def _parse_iso_ts(value):
+    if not value:
+        return 0.0
+    try:
+        return datetime.fromisoformat(value).timestamp()
+    except Exception:
+        return 0.0
+
+
+def training_version_status(models):
+    combat = models.get("combat", {})
+    candidate = models.get("candidate", {})
+    macro = models.get("macro", {})
+    model_items = [
+        ("combat", combat.get("model", {}), combat.get("metadata", {})),
+        ("candidate", candidate.get("model", {}), candidate.get("metadata", {})),
+        ("macro", macro.get("model", {}), macro.get("summary", {}) or macro.get("metadata", {})),
+    ]
+    ready_items = [item for item in model_items if item[1].get("exists")]
+    if not ready_items:
+        return {"label": "未训练", "detail": "模型文件缺失", "ready": False}
+
+    latest_name, latest_file, _ = max(ready_items, key=lambda item: _parse_iso_ts(item[1].get("mtime")))
+    latest_mtime = latest_file.get("mtime", "")
+    label_time = latest_mtime.replace("-", "").replace(":", "").replace("T", "-")[:13] if latest_mtime else "unknown"
+    combat_meta = combat.get("metadata", {}) or {}
+    candidate_meta = candidate.get("metadata", {}) or {}
+    macro_summary = macro.get("summary", {}) or {}
+    detail = (
+        f"战斗 {combat_meta.get('samples', 0)}/{combat_meta.get('features', '-')}"
+        f"，候选 {candidate_meta.get('samples', 0)}/{candidate_meta.get('features', '-')}"
+        f"，宏观 {macro_summary.get('samples', 0)}/{macro_summary.get('features', '-')}"
+    )
+    return {
+        "label": f"train-{label_time}",
+        "latest_model": latest_name,
+        "latest_mtime": latest_mtime,
+        "detail": detail,
+        "ready": True,
+    }
+
+
 def models_status():
     combat_dir = AI_DIR / "ProcessedParams"
     macro_dir = AI_DIR / "ProcessedMacroParams"
@@ -897,11 +984,14 @@ def status_payload():
     control = read_control()
     game = get_game_state_for_dashboard(control)
     ai_process = ai_process_status()
+    models = models_status()
     return {
         "control": control,
         "ai_pid": ai_process.get("pid"),
         "ai_process": ai_process,
-        "models": models_status(),
+        "app_version": app_version_status(),
+        "training_version": training_version_status(models),
+        "models": models,
         "monster_profiles": monster_status(),
         "game": {
             "online": "error" not in game,
@@ -983,6 +1073,21 @@ INDEX_HTML = r"""<!doctype html>
       line-height:1.45;
       overflow-x:hidden;
     }
+    body.is-dragging-card,
+    body.is-dragging-module,
+    body.is-resizing-module,
+    body.is-dragging-card *,
+    body.is-dragging-module * {
+      cursor:grabbing !important;
+      user-select:none !important;
+      -webkit-user-select:none !important;
+    }
+    body.is-resizing-module,
+    body.is-resizing-module * {
+      cursor:nwse-resize !important;
+      user-select:none !important;
+      -webkit-user-select:none !important;
+    }
     body::before {
       content:"";
       position:fixed;
@@ -1054,11 +1159,66 @@ INDEX_HTML = r"""<!doctype html>
       gap:22px;
     }
     .top-actions {
+      display:grid;
+      justify-items:end;
+      gap:8px;
+      min-width:min(610px, 48vw);
+    }
+    .top-action-row {
       display:flex;
       align-items:center;
       justify-content:flex-end;
       gap:10px;
       flex-wrap:wrap;
+    }
+    .refresh-stack {
+      display:grid;
+      justify-items:end;
+      gap:7px;
+      min-width:0;
+    }
+    .version-info {
+      display:grid;
+      grid-template-columns:repeat(2, minmax(190px, auto));
+      justify-content:end;
+      gap:7px;
+      color:var(--muted);
+      font-size:12px;
+      line-height:1.35;
+      text-align:left;
+      max-width:100%;
+    }
+    .version-item {
+      display:grid;
+      grid-template-columns:auto minmax(0, 1fr);
+      align-items:baseline;
+      gap:6px;
+      min-height:28px;
+      padding:5px 8px;
+      border:1px solid rgba(47,111,120,.16);
+      border-radius:9px;
+      background:rgba(255,254,250,.72);
+      box-shadow:0 4px 14px rgba(38,55,58,.04);
+    }
+    .version-item b {
+      color:var(--primary-strong);
+      font-weight:850;
+      white-space:nowrap;
+    }
+    .version-value {
+      min-width:0;
+      overflow:hidden;
+      text-overflow:ellipsis;
+      white-space:nowrap;
+      font-variant-numeric:tabular-nums;
+    }
+    .version-detail {
+      grid-column:1 / -1;
+      color:var(--soft);
+      overflow:hidden;
+      text-overflow:ellipsis;
+      white-space:nowrap;
+      font-size:11px;
     }
     .guide-button {
       min-height:32px;
@@ -1838,6 +1998,9 @@ INDEX_HTML = r"""<!doctype html>
       background:#fff;
       color:var(--ink);
       border-radius:12px;
+      user-select:none;
+      -webkit-user-select:none;
+      transition:background .15s ease, border-color .15s ease, opacity .15s ease, transform .15s ease;
     }
     .module-item:hover { background:var(--surface-tint); }
     .module-item.active {
@@ -1871,10 +2034,14 @@ INDEX_HTML = r"""<!doctype html>
       border-radius:8px;
     }
     .workspace {
+      position:relative;
+      display:flex;
+      flex-wrap:wrap;
+      gap:16px;
       min-height:0;
       border-radius:18px;
-      grid-template-columns:repeat(12, minmax(0, 1fr));
       align-items:start;
+      align-content:flex-start;
       transition:background .15s ease, outline-color .15s ease;
     }
     .workspace.drop-ready {
@@ -1883,13 +2050,36 @@ INDEX_HTML = r"""<!doctype html>
       background:rgba(229,242,243,.45);
     }
     .module-card {
-      grid-column:1 / -1;
+      flex:0 0 100%;
+      width:100%;
+      max-width:100%;
+      min-width:min(280px, 100%);
+      min-height:96px;
       align-self:start;
-      transition:opacity .15s ease, transform .15s ease, box-shadow .15s ease;
+      will-change:transform;
+      transition:opacity .15s ease, transform .15s ease, box-shadow .15s ease, border-color .15s ease;
     }
-    .module-card[data-size="compact"] { grid-column:span 4; }
-    .module-card[data-size="normal"] { grid-column:span 6; }
-    .module-card[data-size="wide"] { grid-column:1 / -1; }
+    .module-card[data-size="compact"] {
+      flex-basis:calc((100% - 32px) / 3);
+      width:calc((100% - 32px) / 3);
+    }
+    .module-card[data-size="normal"] {
+      flex-basis:calc((100% - 16px) / 2);
+      width:calc((100% - 16px) / 2);
+    }
+    .module-card[data-size="wide"] {
+      flex-basis:100%;
+      width:100%;
+    }
+    .module-card.has-custom-width {
+      flex-basis:min(var(--module-width), 100%);
+      width:min(var(--module-width), 100%);
+    }
+    .module-card.has-custom-height {
+      height:var(--module-height);
+      overflow:auto;
+      padding-bottom:26px;
+    }
     .module-card[data-size="compact"] {
       padding:13px;
     }
@@ -1925,14 +2115,44 @@ INDEX_HTML = r"""<!doctype html>
       box-shadow:0 0 0 3px rgba(209,162,58,.34), var(--shadow-soft);
     }
     .module-card.dragging-card {
-      opacity:.58;
-      transform:scale(.992);
+      opacity:.62;
+      transform:scale(.99);
+      box-shadow:0 18px 40px rgba(38,55,58,.15);
     }
     .module-card.drop-target {
-      box-shadow:0 0 0 3px rgba(47,111,120,.24), var(--shadow-soft);
+      border-color:rgba(47,111,120,.42);
+      box-shadow:0 0 0 3px rgba(47,111,120,.18), var(--shadow-soft);
+    }
+    .module-card.drop-target::before {
+      content:"";
+      position:absolute;
+      left:12px;
+      right:12px;
+      height:4px;
+      border-radius:999px;
+      background:linear-gradient(90deg, var(--primary), var(--accent));
+      box-shadow:0 4px 12px rgba(47,111,120,.18);
+      pointer-events:none;
+      z-index:3;
+    }
+    .module-card.drop-target.drop-before::before {
+      top:-10px;
+    }
+    .module-card.drop-target.drop-after::before {
+      bottom:-10px;
+    }
+    .module-card.is-animating {
+      z-index:2;
+    }
+    .module-card.resizing-card {
+      z-index:4;
+      transition:none;
+      box-shadow:0 0 0 3px rgba(209,162,58,.32), 0 18px 42px rgba(38,55,58,.18);
     }
     .module-card > .section-head {
       cursor:grab;
+      user-select:none;
+      -webkit-user-select:none;
     }
     .module-card > .section-head:active {
       cursor:grabbing;
@@ -1943,6 +2163,8 @@ INDEX_HTML = r"""<!doctype html>
       justify-content:flex-end;
       gap:7px;
       min-width:0;
+      user-select:none;
+      -webkit-user-select:none;
     }
     .module-action {
       min-width:30px;
@@ -1968,6 +2190,8 @@ INDEX_HTML = r"""<!doctype html>
       border:1px solid var(--line);
       border-radius:10px;
       background:#fff;
+      user-select:none;
+      -webkit-user-select:none;
     }
     .module-size-button {
       width:26px;
@@ -1980,10 +2204,61 @@ INDEX_HTML = r"""<!doctype html>
       font-size:12px;
       color:var(--muted);
       background:transparent;
+      transition:background .15s ease, color .15s ease, transform .15s ease;
     }
+    .module-size-button:hover { transform:translateY(-1px); }
     .module-size-button.active {
       color:#fff;
       background:var(--primary);
+    }
+    .module-resize-handle {
+      position:absolute;
+      right:4px;
+      bottom:4px;
+      width:22px;
+      height:22px;
+      border:0;
+      background:
+        linear-gradient(135deg, transparent 0 54%, rgba(47,111,120,.55) 55% 60%, transparent 61%),
+        linear-gradient(135deg, transparent 0 68%, rgba(47,111,120,.36) 69% 74%, transparent 75%);
+      cursor:nwse-resize;
+      opacity:.58;
+      z-index:5;
+      user-select:none;
+      -webkit-user-select:none;
+    }
+    .module-resize-handle:hover {
+      opacity:1;
+    }
+    .drag-ghost {
+      position:fixed;
+      left:-9999px;
+      top:-9999px;
+      z-index:9999;
+      display:grid;
+      gap:2px;
+      min-width:150px;
+      max-width:240px;
+      padding:10px 12px;
+      border:1px solid rgba(47,111,120,.36);
+      border-radius:12px;
+      background:rgba(255,254,250,.96);
+      color:var(--ink);
+      box-shadow:0 18px 38px rgba(38,55,58,.18);
+      pointer-events:none;
+      user-select:none;
+      -webkit-user-select:none;
+    }
+    .drag-ghost b {
+      overflow:hidden;
+      text-overflow:ellipsis;
+      white-space:nowrap;
+      font-size:13px;
+    }
+    .drag-ghost span {
+      color:var(--muted);
+      font-size:12px;
+      font-weight:800;
     }
     .priority-grid { align-items:start; }
     .priority-grid.single-visible { grid-template-columns:1fr; }
@@ -1994,7 +2269,13 @@ INDEX_HTML = r"""<!doctype html>
       .module-card,
       .module-card[data-size="compact"],
       .module-card[data-size="normal"],
-      .module-card[data-size="wide"] { grid-column:1 / -1; }
+      .module-card[data-size="wide"],
+      .module-card.has-custom-width {
+        flex-basis:100%;
+        width:100%;
+      }
+      .module-card.has-custom-height { height:auto; }
+      .module-resize-handle { display:none; }
       .sidebar { max-width:none; }
     }
     @media (max-width: 720px) {
@@ -2005,7 +2286,11 @@ INDEX_HTML = r"""<!doctype html>
       .brand-mark { width:74px; height:74px; }
       .brand-logo { width:62px; height:62px; padding:7px; border-radius:8px; }
       h1 { font-size:22px; }
-      .top-actions { justify-content:flex-start; margin-top:10px; }
+      .top-actions { justify-items:start; min-width:0; margin-top:10px; }
+      .top-action-row { justify-content:flex-start; }
+      .refresh-stack { justify-items:start; }
+      .version-info { grid-template-columns:1fr; width:100%; }
+      .version-item { width:100%; }
       #lastRefresh { margin-top:0; }
       .status-grid, .metric-grid { grid-template-columns:1fr; }
       .activity-feed { grid-template-columns:1fr; }
@@ -2034,9 +2319,17 @@ INDEX_HTML = r"""<!doctype html>
         </div>
       </div>
       <div class="top-actions">
-        <button class="guide-button project-button" onclick="openProjectGuide()">项目说明</button>
-        <button class="guide-button" onclick="startGuide()">新手引导</button>
-        <span id="lastRefresh" class="pill info">读取中</span>
+        <div class="top-action-row">
+          <button class="guide-button project-button" onclick="openProjectGuide()">项目说明</button>
+          <button class="guide-button" onclick="startGuide()">新手引导</button>
+        </div>
+        <div class="refresh-stack">
+          <span id="lastRefresh" class="pill info">读取中</span>
+          <div id="versionInfo" class="version-info">
+            <div class="version-item"><b>当前版本</b><span class="version-value">-</span></div>
+            <div class="version-item"><b>训练版本</b><span class="version-value">-</span></div>
+          </div>
+        </div>
       </div>
     </div>
     <div class="status-grid">
@@ -2646,6 +2939,9 @@ const MODULE_SIZE_LABELS = {
   normal: "中",
   wide: "大"
 };
+const MODULE_MIN_WIDTH = 280;
+const MODULE_MIN_HEIGHT = 96;
+const MODULE_MAX_HEIGHT = 900;
 const MODULE_STORAGE_KEY = "sts2_control_panel_modules";
 const MODULE_ORDER_STORAGE_KEY = "sts2_control_panel_module_order";
 const GUIDE_STEPS = [
@@ -2739,7 +3035,9 @@ function defaultModuleState() {
   return Object.fromEntries(MODULE_IDS.map(id => [id, {
     open:true,
     collapsed:false,
-    size: MODULE_DEFAULT_SIZES[id] || "wide"
+    size: MODULE_DEFAULT_SIZES[id] || "wide",
+    width:null,
+    height:null
   }]));
 }
 function readModuleState() {
@@ -2751,6 +3049,8 @@ function readModuleState() {
         state[id].open = saved[id].open !== false;
         state[id].collapsed = !!saved[id].collapsed;
         if (MODULE_SIZE_LABELS[saved[id].size]) state[id].size = saved[id].size;
+        if (Number.isFinite(saved[id].width)) state[id].width = Math.max(MODULE_MIN_WIDTH, saved[id].width);
+        if (Number.isFinite(saved[id].height)) state[id].height = Math.max(MODULE_MIN_HEIGHT, saved[id].height);
       }
     }
   } catch (_) {}
@@ -2770,6 +3070,11 @@ let moduleState = readModuleState();
 let moduleOrder = readModuleOrder();
 let draggingModuleId = "";
 let draggingCardId = "";
+let dragGhost = null;
+let lastDropTargetId = "";
+let lastDropPlaceAfter = false;
+let resizingModuleId = "";
+let resizeState = null;
 function saveModuleState() {
   localStorage.setItem(MODULE_STORAGE_KEY, JSON.stringify(moduleState));
 }
@@ -2778,6 +3083,110 @@ function saveModuleOrder() {
 }
 function moduleElement(id) {
   return document.querySelector(`.module-card[data-module="${id}"]`);
+}
+function clampNumber(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+function workspaceInnerWidth() {
+  const workspace = document.getElementById("workspace");
+  return workspace ? Math.max(MODULE_MIN_WIDTH, workspace.clientWidth) : 1200;
+}
+function applyModuleLayout(card, state) {
+  if (!card) return;
+  const customWidth = Number.isFinite(state.width);
+  const customHeight = Number.isFinite(state.height) && !state.collapsed;
+  card.classList.toggle("has-custom-width", customWidth);
+  card.classList.toggle("has-custom-height", customHeight);
+  if (customWidth) {
+    const width = clampNumber(state.width, MODULE_MIN_WIDTH, workspaceInnerWidth());
+    card.style.setProperty("--module-width", `${Math.round(width)}px`);
+  } else {
+    card.style.removeProperty("--module-width");
+  }
+  if (customHeight) {
+    const height = clampNumber(state.height, MODULE_MIN_HEIGHT, MODULE_MAX_HEIGHT);
+    card.style.setProperty("--module-height", `${Math.round(height)}px`);
+  } else {
+    card.style.removeProperty("--module-height");
+  }
+}
+function workspaceCards() {
+  return Array.from(document.querySelectorAll("#workspace .module-card"))
+    .filter(card => !card.classList.contains("is-hidden"));
+}
+function captureWorkspaceRects() {
+  const rects = new Map();
+  for (const card of workspaceCards()) {
+    rects.set(card.dataset.module, card.getBoundingClientRect());
+  }
+  return rects;
+}
+function animateWorkspaceFrom(rects) {
+  window.requestAnimationFrame(() => {
+    for (const card of workspaceCards()) {
+      const first = rects.get(card.dataset.module);
+      if (!first) continue;
+      const last = card.getBoundingClientRect();
+      const dx = first.left - last.left;
+      const dy = first.top - last.top;
+      if (Math.abs(dx) < 1 && Math.abs(dy) < 1) continue;
+      card.classList.add("is-animating");
+      const animation = card.animate(
+        [
+          {transform:`translate(${dx}px, ${dy}px)`},
+          {transform:"translate(0, 0)"}
+        ],
+        {duration:230, easing:"cubic-bezier(.2,.8,.2,1)"}
+      );
+      animation.onfinish = () => card.classList.remove("is-animating");
+      animation.oncancel = () => card.classList.remove("is-animating");
+    }
+  });
+}
+function animateWorkspaceChange(mutator) {
+  const rects = captureWorkspaceRects();
+  const result = mutator();
+  animateWorkspaceFrom(rects);
+  return result;
+}
+function clearDragSelection() {
+  const selection = window.getSelection && window.getSelection();
+  if (selection) selection.removeAllRanges();
+}
+function setDragUi(kind) {
+  document.body.classList.toggle("is-dragging-card", kind === "card");
+  document.body.classList.toggle("is-dragging-module", kind === "module");
+}
+function clearDragUi() {
+  setDragUi("");
+  clearDragSelection();
+  removeDropMarkers();
+  if (dragGhost) {
+    dragGhost.remove();
+    dragGhost = null;
+  }
+}
+function moduleDisplayName(id) {
+  const card = moduleElement(id);
+  const title = card && card.querySelector(":scope > .section-head h2");
+  if (title && title.textContent.trim()) return title.textContent.trim();
+  const dock = document.querySelector(`.module-item[data-module-target="${id}"] .module-label`);
+  return dock && dock.textContent.trim() ? dock.textContent.trim() : id;
+}
+function createDragGhost(event, id, actionLabel) {
+  if (!event.dataTransfer || !event.dataTransfer.setDragImage) return;
+  if (dragGhost) dragGhost.remove();
+  const size = (moduleState[id] && moduleState[id].size) || MODULE_DEFAULT_SIZES[id] || "wide";
+  const ghost = document.createElement("div");
+  ghost.className = "drag-ghost";
+  ghost.innerHTML = `<b>${escapeHtml(moduleDisplayName(id))}</b><span>${escapeHtml(actionLabel)} / ${escapeHtml(MODULE_SIZE_LABELS[size] || "")}</span>`;
+  document.body.appendChild(ghost);
+  dragGhost = ghost;
+  event.dataTransfer.setDragImage(ghost, 22, 20);
+  window.setTimeout(() => {
+    if (dragGhost === ghost) dragGhost = null;
+    ghost.remove();
+  }, 0);
 }
 function applyModuleOrder() {
   const workspace = document.getElementById("workspace");
@@ -2798,6 +3207,10 @@ function injectModuleControls() {
       head.draggable = true;
       head.addEventListener("dragstart", event => beginCardDrag(event, id));
       head.addEventListener("dragend", endCardDrag);
+      head.addEventListener("selectstart", event => event.preventDefault());
+      head.addEventListener("mousedown", event => {
+        if (!event.target.closest("button,input,select,a,textarea")) clearDragSelection();
+      });
       head.title = "拖动标题可以调整卡片顺序";
     }
     if (actions && !actions.querySelector(".module-size-controls")) {
@@ -2820,6 +3233,20 @@ function injectModuleControls() {
       const firstActionButton = actions.querySelector(".module-action");
       actions.insertBefore(group, firstActionButton || null);
     }
+    if (!card.querySelector(":scope > .module-resize-handle")) {
+      const handle = document.createElement("span");
+      handle.className = "module-resize-handle";
+      handle.setAttribute("role", "separator");
+      handle.setAttribute("aria-label", "拖动调整卡片大小");
+      handle.title = "拖动调整卡片大小；双击恢复自动高度";
+      handle.addEventListener("pointerdown", event => beginModuleResize(event, id));
+      handle.addEventListener("dblclick", event => {
+        event.preventDefault();
+        event.stopPropagation();
+        resetModuleDimensions(id);
+      });
+      card.appendChild(handle);
+    }
   }
 }
 function syncModuleUI() {
@@ -2833,8 +3260,9 @@ function syncModuleUI() {
       card.classList.toggle("is-hidden", !state.open);
       card.classList.toggle("is-collapsed", !!state.collapsed);
       card.dataset.size = MODULE_SIZE_LABELS[state.size] ? state.size : (MODULE_DEFAULT_SIZES[id] || "wide");
+      applyModuleLayout(card, state);
       for (const button of card.querySelectorAll(".module-size-button")) {
-        button.classList.toggle("active", button.dataset.sizeControl === card.dataset.size);
+        button.classList.toggle("active", !Number.isFinite(state.width) && button.dataset.sizeControl === card.dataset.size);
       }
     }
     const dock = document.querySelector(`.module-item[data-module-target="${id}"]`);
@@ -2866,9 +3294,13 @@ function flashModule(card) {
 }
 function openModule(id, opts = {}) {
   if (!MODULE_IDS.includes(id)) return;
-  moduleState[id] = {...(moduleState[id] || {}), open:true, collapsed:false};
-  saveModuleState();
-  syncModuleUI();
+  const update = () => {
+    moduleState[id] = {...(moduleState[id] || {}), open:true, collapsed:false};
+    saveModuleState();
+    syncModuleUI();
+  };
+  if (opts.animate === false) update();
+  else animateWorkspaceChange(update);
   const card = moduleElement(id);
   flashModule(card);
   if (opts.scroll !== false && card) {
@@ -2877,10 +3309,80 @@ function openModule(id, opts = {}) {
 }
 function setModuleSize(id, size) {
   if (!MODULE_IDS.includes(id) || !MODULE_SIZE_LABELS[size]) return;
-  moduleState[id] = {...(moduleState[id] || {}), open:true, size};
+  animateWorkspaceChange(() => {
+    moduleState[id] = {...(moduleState[id] || {}), open:true, size, width:null};
+    saveModuleState();
+    syncModuleUI();
+  });
+  flashModule(moduleElement(id));
+}
+function resetModuleDimensions(id) {
+  if (!MODULE_IDS.includes(id)) return;
+  animateWorkspaceChange(() => {
+    moduleState[id] = {...(moduleState[id] || {}), width:null, height:null};
+    saveModuleState();
+    syncModuleUI();
+  });
+  flashModule(moduleElement(id));
+}
+function beginModuleResize(event, id) {
+  if (!MODULE_IDS.includes(id) || event.button !== 0) return;
+  const card = moduleElement(id);
+  if (!card || card.classList.contains("is-hidden")) return;
+  event.preventDefault();
+  event.stopPropagation();
+  clearDragSelection();
+  const rect = card.getBoundingClientRect();
+  const workspace = document.getElementById("workspace");
+  const workspaceRect = workspace ? workspace.getBoundingClientRect() : {right:window.innerWidth};
+  resizingModuleId = id;
+  resizeState = {
+    pointerId:event.pointerId,
+    startX:event.clientX,
+    startY:event.clientY,
+    startWidth:rect.width,
+    startHeight:rect.height,
+    maxWidth:Math.max(MODULE_MIN_WIDTH, workspaceRect.right - rect.left)
+  };
+  document.body.classList.add("is-resizing-module");
+  card.classList.add("resizing-card", "has-custom-width", "has-custom-height");
+  card.style.setProperty("--module-width", `${Math.round(rect.width)}px`);
+  card.style.setProperty("--module-height", `${Math.round(rect.height)}px`);
+  event.currentTarget.setPointerCapture && event.currentTarget.setPointerCapture(event.pointerId);
+  document.addEventListener("pointermove", handleModuleResizeMove);
+  document.addEventListener("pointerup", endModuleResize, {once:true});
+  document.addEventListener("pointercancel", endModuleResize, {once:true});
+}
+function handleModuleResizeMove(event) {
+  if (!resizingModuleId || !resizeState) return;
+  event.preventDefault();
+  const card = moduleElement(resizingModuleId);
+  if (!card) return;
+  const width = clampNumber(resizeState.startWidth + event.clientX - resizeState.startX, MODULE_MIN_WIDTH, resizeState.maxWidth);
+  const height = clampNumber(resizeState.startHeight + event.clientY - resizeState.startY, MODULE_MIN_HEIGHT, MODULE_MAX_HEIGHT);
+  card.style.setProperty("--module-width", `${Math.round(width)}px`);
+  card.style.setProperty("--module-height", `${Math.round(height)}px`);
+}
+function endModuleResize() {
+  if (!resizingModuleId || !resizeState) return;
+  document.removeEventListener("pointermove", handleModuleResizeMove);
+  const card = moduleElement(resizingModuleId);
+  if (card) {
+    const rect = card.getBoundingClientRect();
+    moduleState[resizingModuleId] = {
+      ...(moduleState[resizingModuleId] || {}),
+      open:true,
+      width:Math.round(clampNumber(rect.width, MODULE_MIN_WIDTH, workspaceInnerWidth())),
+      height:Math.round(clampNumber(rect.height, MODULE_MIN_HEIGHT, MODULE_MAX_HEIGHT))
+    };
+    card.classList.remove("resizing-card");
+  }
   saveModuleState();
   syncModuleUI();
-  flashModule(moduleElement(id));
+  document.body.classList.remove("is-resizing-module");
+  flashModule(moduleElement(resizingModuleId));
+  resizingModuleId = "";
+  resizeState = null;
 }
 let guideIndex = 0;
 function clampGuide(value, min, max) {
@@ -2993,18 +3495,84 @@ function toggleModuleCollapse(id) {
   syncModuleUI();
   flashModule(moduleElement(id));
 }
+function removeDropMarkers() {
+  document.querySelectorAll(".module-card.drop-target").forEach(item => {
+    item.classList.remove("drop-target", "drop-before", "drop-after");
+  });
+  const workspace = document.getElementById("workspace");
+  if (workspace) {
+    workspace.classList.remove("drop-ready");
+    workspace.removeAttribute("data-drop-size");
+  }
+  lastDropTargetId = "";
+  lastDropPlaceAfter = false;
+}
+function pointerPlacesAfter(event, card) {
+  const rect = card.getBoundingClientRect();
+  const sameRow = event.clientY >= rect.top && event.clientY <= rect.bottom;
+  return sameRow
+    ? event.clientX > rect.left + rect.width / 2
+    : event.clientY > rect.top + rect.height / 2;
+}
+function dropTargetInfo(event, id) {
+  const targetCard = event.target.closest(".module-card");
+  if (!targetCard || targetCard.dataset.module === id || targetCard.classList.contains("is-hidden")) {
+    return {targetCard:null, targetId:"", placeAfter:true};
+  }
+  return {
+    targetCard,
+    targetId:targetCard.dataset.module,
+    placeAfter:pointerPlacesAfter(event, targetCard)
+  };
+}
+function suggestedDropSize(event, id, targetCard) {
+  if (window.matchMedia("(max-width: 1120px)").matches) return "wide";
+  const targetSize = targetCard && targetCard.dataset.size;
+  if (MODULE_SIZE_LABELS[targetSize]) return targetSize;
+  const currentSize = moduleState[id] && moduleState[id].size;
+  if (MODULE_SIZE_LABELS[currentSize]) return currentSize;
+  return MODULE_DEFAULT_SIZES[id] || "wide";
+}
+function suggestedDropDimensions(id, targetCard) {
+  const size = suggestedDropSize(null, id, targetCard);
+  if (!targetCard) return {size, width:null, height:null};
+  const targetState = moduleState[targetCard.dataset.module] || {};
+  return {
+    size,
+    width:Number.isFinite(targetState.width) ? targetState.width : null,
+    height:Number.isFinite(targetState.height) ? targetState.height : null
+  };
+}
+function markDropTarget(event, id) {
+  removeDropMarkers();
+  const workspace = document.getElementById("workspace");
+  if (!workspace) return {targetCard:null, targetId:"", placeAfter:true, size:MODULE_DEFAULT_SIZES[id] || "wide", width:null, height:null};
+  workspace.classList.add("drop-ready");
+  const info = dropTargetInfo(event, id);
+  const dimensions = suggestedDropDimensions(id, info.targetCard);
+  workspace.dataset.dropSize = dimensions.size;
+  if (info.targetCard) {
+    info.targetCard.classList.add("drop-target", info.placeAfter ? "drop-after" : "drop-before");
+    lastDropTargetId = info.targetId;
+    lastDropPlaceAfter = info.placeAfter;
+  }
+  return {...info, ...dimensions};
+}
 function beginModuleDrag(event, id) {
   draggingModuleId = id;
+  draggingCardId = "";
+  clearDragSelection();
+  setDragUi("module");
   event.dataTransfer.setData("text/plain", id);
   event.dataTransfer.setData("application/x-sts2-module-open", id);
   event.dataTransfer.effectAllowed = "copy";
+  createDragGhost(event, id, "打开卡片");
   event.currentTarget.classList.add("dragging");
 }
 function endModuleDrag(event) {
   draggingModuleId = "";
-  event.currentTarget.classList.remove("dragging");
-  const workspace = document.getElementById("workspace");
-  if (workspace) workspace.classList.remove("drop-ready");
+  if (event && event.currentTarget) event.currentTarget.classList.remove("dragging");
+  clearDragUi();
 }
 function beginCardDrag(event, id) {
   if (!MODULE_IDS.includes(id)) return;
@@ -3013,9 +3581,13 @@ function beginCardDrag(event, id) {
     return;
   }
   draggingCardId = id;
+  draggingModuleId = "";
+  clearDragSelection();
+  setDragUi("card");
   event.dataTransfer.setData("text/plain", id);
   event.dataTransfer.setData("application/x-sts2-module-card", id);
   event.dataTransfer.effectAllowed = "move";
+  createDragGhost(event, id, "移动卡片");
   const card = moduleElement(id);
   if (card) card.classList.add("dragging-card");
 }
@@ -3023,9 +3595,7 @@ function endCardDrag() {
   const card = moduleElement(draggingCardId);
   if (card) card.classList.remove("dragging-card");
   draggingCardId = "";
-  document.querySelectorAll(".module-card.drop-target").forEach(item => item.classList.remove("drop-target"));
-  const workspace = document.getElementById("workspace");
-  if (workspace) workspace.classList.remove("drop-ready");
+  clearDragUi();
 }
 function reorderModuleCard(id, targetId, placeAfter) {
   if (!MODULE_IDS.includes(id)) return;
@@ -3045,48 +3615,52 @@ function handleWorkspaceDragOver(event) {
   if (!MODULE_IDS.includes(id)) return;
   event.preventDefault();
   event.dataTransfer.dropEffect = draggingCardId ? "move" : "copy";
-  event.currentTarget.classList.add("drop-ready");
-  document.querySelectorAll(".module-card.drop-target").forEach(item => item.classList.remove("drop-target"));
-  if (draggingCardId) {
-    const targetCard = event.target.closest(".module-card");
-    if (targetCard && targetCard.dataset.module !== draggingCardId) {
-      targetCard.classList.add("drop-target");
-    }
-  }
+  markDropTarget(event, id);
 }
 function handleWorkspaceDragLeave(event) {
-  if (!event.currentTarget.contains(event.relatedTarget)) {
-    event.currentTarget.classList.remove("drop-ready");
+  const rect = event.currentTarget.getBoundingClientRect();
+  const inside = event.clientX >= rect.left && event.clientX <= rect.right && event.clientY >= rect.top && event.clientY <= rect.bottom;
+  if (!inside) {
+    removeDropMarkers();
   }
 }
 function handleWorkspaceDrop(event) {
   const id = draggingModuleId || draggingCardId || event.dataTransfer.getData("text/plain");
   if (!MODULE_IDS.includes(id)) return;
   event.preventDefault();
-  event.currentTarget.classList.remove("drop-ready");
-  document.querySelectorAll(".module-card.drop-target").forEach(item => item.classList.remove("drop-target"));
+  const info = markDropTarget(event, id);
+  removeDropMarkers();
   if (draggingCardId) {
-    const targetCard = event.target.closest(".module-card");
-    if (targetCard && targetCard.dataset.module !== draggingCardId) {
-      const rect = targetCard.getBoundingClientRect();
-      const sameRow = event.clientY >= rect.top && event.clientY <= rect.bottom;
-      const placeAfter = sameRow
-        ? event.clientX > rect.left + rect.width / 2
-        : event.clientY > rect.top + rect.height / 2;
-      reorderModuleCard(draggingCardId, targetCard.dataset.module, placeAfter);
-    } else {
-      reorderModuleCard(draggingCardId, "", true);
-    }
     const movedId = draggingCardId;
-    const movedCard = moduleElement(movedId);
-    if (movedCard) movedCard.classList.remove("dragging-card");
-    draggingCardId = "";
-    syncModuleUI();
+    animateWorkspaceChange(() => {
+      if (info.targetId) reorderModuleCard(movedId, info.targetId, info.placeAfter);
+      else reorderModuleCard(movedId, "", true);
+      const movedCard = moduleElement(movedId);
+      if (movedCard) movedCard.classList.remove("dragging-card");
+      draggingCardId = "";
+      syncModuleUI();
+    });
+    clearDragUi();
     flashModule(moduleElement(movedId));
     return;
   }
   draggingModuleId = "";
-  openModule(id, {scroll:false});
+  animateWorkspaceChange(() => {
+    moduleState[id] = {
+      ...(moduleState[id] || {}),
+      open:true,
+      collapsed:false,
+      size:info.size,
+      width:info.width,
+      height:info.height
+    };
+    saveModuleState();
+    if (info.targetId) reorderModuleCard(id, info.targetId, info.placeAfter);
+    else reorderModuleCard(id, "", true);
+    syncModuleUI();
+  });
+  clearDragUi();
+  flashModule(moduleElement(id));
 }
 let llmFormDirty = false;
 let llmProfilesCache = [];
@@ -3107,6 +3681,15 @@ function applyLLMConfigToForm(llmCfg) {
   document.getElementById("llm_base_url").value = llmCfg.base_url || "";
   document.getElementById("llm_model").value = llmCfg.model || "";
   document.getElementById("llm_api_key").placeholder = llmCfg.has_api_key ? "已保存，留空不修改" : "未配置 API Key";
+}
+function compactAppVersion(label, commit, dirty) {
+  if (commit) return `${commit}${dirty ? "*" : ""}`;
+  const text = String(label || "-");
+  return text.length > 18 ? `${text.slice(0, 15)}...` : text;
+}
+function compactTrainingDetail(detail) {
+  const text = String(detail || "");
+  return text.replace(/，/g, " / ");
 }
 async function refresh() {
   if (refreshInFlight) {
@@ -3132,6 +3715,8 @@ async function refresh() {
 function renderStatus(s) {
   const active = s.current_data && s.current_data.active_run;
   const phase = phaseInfo(s.game, active);
+  const appVersion = s.app_version || {};
+  const trainingVersion = s.training_version || {};
 
   document.getElementById("ai_enabled").checked = !!s.control.ai_enabled;
   document.getElementById("macro_enabled").checked = !!s.control.macro_enabled;
@@ -3162,6 +3747,30 @@ function renderStatus(s) {
   document.getElementById("runDetail").textContent = active ? `Act ${active.max_act || 0} / Floor ${active.max_floor || 0}，${active.records || 0} 条` : "尚未读取到采集数据";
 
   setPill("lastRefresh", `已刷新 ${new Date().toLocaleTimeString()}`, "info");
+  const versionInfo = document.getElementById("versionInfo");
+  if (versionInfo) {
+    const appFull = appVersion.label || "-";
+    const appShort = compactAppVersion(appFull, appVersion.commit, appVersion.dirty);
+    const trainLabel = trainingVersion.label || "-";
+    const trainDetail = compactTrainingDetail(trainingVersion.detail || "");
+    versionInfo.innerHTML = `
+      <div class="version-item">
+        <b>当前版本</b><span class="version-value">${escapeHtml(appShort)}</span>
+        <span class="version-detail">${escapeHtml(appVersion.dirty ? "本地有修改" : "工作区干净")}</span>
+      </div>
+      <div class="version-item">
+        <b>训练版本</b><span class="version-value">${escapeHtml(trainLabel)}</span>
+        <span class="version-detail">${escapeHtml(trainDetail || "暂无训练摘要")}</span>
+      </div>`;
+    versionInfo.title = [
+      `当前版本：${appFull}`,
+      appVersion.control_panel_mtime ? `控制台文件：${appVersion.control_panel_mtime}` : "",
+      `训练版本：${trainingVersion.label || "-"}`,
+      trainingVersion.latest_model ? `最新模型：${trainingVersion.latest_model}` : "",
+      trainingVersion.latest_mtime ? `训练时间：${trainingVersion.latest_mtime}` : "",
+      trainingVersion.detail || ""
+    ].filter(Boolean).join("\n");
+  }
   setPill("aiProcessBadge", s.ai_pid ? (s.ai_process && s.ai_process.needs_restart ? "需重启" : "运行中") : "未启动", s.ai_pid ? ((s.ai_process && s.ai_process.needs_restart) ? "warn" : "on") : "warn");
   setPill("llmProcessBadge", s.llm && s.llm.pid ? "运行中" : "未启动", s.llm && s.llm.pid ? "on" : "warn");
   setPill("collectBadge", s.control.collection_enabled ? "启用" : "暂停", s.control.collection_enabled ? "on" : "off");
@@ -3602,6 +4211,15 @@ async function exportData(){
     document.getElementById("exportInfo").textContent = result.error || "导出失败";
   }
 }
+document.addEventListener("selectstart", event => {
+  const target = event.target;
+  const noSelectTarget = target && target.closest && target.closest(".module-card > .section-head, .module-item, .module-actions");
+  if (draggingCardId || draggingModuleId || noSelectTarget) {
+    event.preventDefault();
+  }
+});
+document.addEventListener("dragstart", clearDragSelection, true);
+document.addEventListener("dragend", clearDragUi, true);
 syncModuleUI();
 refresh();
 setInterval(refresh, 5000);
