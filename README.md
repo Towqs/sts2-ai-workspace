@@ -4,39 +4,211 @@
   <img src="AI_Training/assets/sts2_ai_logo.png" alt="STS2 AI Logo" width="180">
 </p>
 
-这是一个 Slay the Spire 2 半自动 AI 工作区，用于本地数据采集、网页控制台、BC 模型训练，以及 OpenAI-compatible 大模型接入。
+STS2 AI Workspace 是一个面向 **Slay the Spire 2** 的本地 AI 工作区。它把游戏状态读取、数据采集、网页控制台、行为克隆训练、模型切换和 OpenAI-compatible LLM 接入放在同一个工作流里。
 
-当前工作流是：玩家负责宏观判断，AI 可以托管战斗；也可以打开宏观 AI，让模型自动处理地图、奖励、选卡、事件和营火。商店自动购买默认关闭，避免和玩家抢操作。
+项目当前是半成品，但已经可以跑通一条完整闭环：
 
-## 当前状态
+```text
+游戏 Mod 读取状态 -> 控制台展示和写日志 -> 数据管线生成样本 -> 训练 BC 模型 -> AI/LLM 决策 -> 继续回收数据
+```
 
-这个项目仍处于早期阶段。控制台、数据采集、基础训练和 LLM 接入已经跑通，但自动 AI 还不是稳定成品，尤其缺少大量高质量实战数据。
+## 当前能做什么
 
-如果你愿意帮忙，最有价值的贡献是采集数据并提交给维护者。请优先使用控制台的“一键打包数据库”，把生成的 zip 数据包发给项目维护者，或在 GitHub Issue 中附上数据包链接。
+| 能力 | 当前状态 |
+| --- | --- |
+| 游戏状态读取 | 已接入本地 Mod API，可读取战斗、奖励、地图、事件、营火、商店等状态。 |
+| 网页控制台 | 已可用，地址为 `http://127.0.0.1:8765/`。 |
+| 战斗 AI | 初版可用，支持战斗出牌和候选动作评分。 |
+| 宏观 AI | 初版可用，支持地图、奖励、选卡、事件和营火；商店购买默认保护。 |
+| 训练数据采集 | 支持 Human / AI / LLM 来源，按 run_id 汇总和体检。 |
+| 数据重构与训练 | 支持战斗 BC、候选动作 BC、宏观 BC。 |
+| LLM 接入 | 支持 OpenAI-compatible Chat Completions；推荐只从合法候选动作中选择。 |
+| 模型包切换 | 已支持 `AI_Training/ModelZoo/` 下的可切换模型包。 |
 
-## 说明文档入口
+## 当前限制
 
-公开说明和使用文档记录在：
+这个项目不是稳定成品 AI。现在的模型主要用于演示、采样和迭代，不应宣传为稳定通关工具。
 
-- [`docs/startup.md`](docs/startup.md)：一键启动控制台、日志窗口、BC AI 和 LLM。
-- [`docs/project_guide.md`](docs/project_guide.md)：项目目标、当前能力、控制台入口和推荐流程。
-- [`docs/data_contribution.md`](docs/data_contribution.md)：如何打包数据并提交给维护者。
-- [`docs/public_roadmap.md`](docs/public_roadmap.md)：当前状态、近期目标和公开发展路线。
-- [`docs/monster_data.md`](docs/monster_data.md)：怪物数据采集字段、用途和后续接入计划。
+主要短板：
+
+- 高质量人类数据仍然太少。
+- 宏观选择还需要更多路线、奖励、事件、营火和商店样本。
+- AI 数据已经可以筛选入训，但仍需要人工复核失败原因。
+- LLM 更适合作为“大脑”和解释器，自动执行必须继续受合法动作校验约束。
+
+## 快速开始
+
+### 1. 克隆仓库
+
+```powershell
+git clone https://github.com/Towqs/sts2-ai-workspace.git
+cd sts2-ai-workspace
+```
+
+### 2. 安装 Python 依赖
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+如果 PyTorch 安装失败，请按自己的 CUDA / 显卡环境从 PyTorch 官方命令安装 `torch`，再安装：
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install numpy requests colorama
+```
+
+### 3. 构建并安装 Mod
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\训练脚本\STS2MCP\build.ps1 -GameDir "<Slay the Spire 2 安装目录>"
+```
+
+把构建产物放进游戏 `mods` 目录：
+
+- `训练脚本/STS2MCP/out/STS2_MCP/STS2_MCP.dll`
+- `训练脚本/STS2MCP/out/STS2_MCP/mod_manifest.json`
+
+### 4. 启动控制台
+
+推荐直接双击：
+
+```text
+start_all.bat
+```
+
+它会启动控制台、日志窗口和本地 AI 流程。中文文件名的 `一键启动全部.bat` 也保留，但如果 Windows 对中文路径处理不稳定，优先使用 `start_all.bat`。
+
+手动启动：
+
+```powershell
+.\.venv\Scripts\python.exe .\AI_Training\control_panel.py
+```
+
+控制台地址：
+
+```text
+http://127.0.0.1:8765/
+```
+
+游戏 Mod API 默认地址：
+
+```text
+http://localhost:15526/api/v1/singleplayer
+```
+
+## 试用模型包
+
+仓库现在包含一个可直接试用的演示模型包：
+
+```text
+AI_Training/ModelZoo/demo_local_20260430/
+```
+
+模型包内容：
+
+| 模型 | 样本规模 |
+| --- | --- |
+| 战斗 BC | 642 条样本 |
+| 候选动作评分 | 2948 行候选动作 |
+| 宏观 BC | 528 条样本 |
+
+数据来源摘要：
+
+| 数据集 | Human | AI |
+| --- | ---: | ---: |
+| 战斗 | 448 | 194 |
+| 宏观 | 359 | 169 |
+
+控制台启动时，如果当前运行目录没有模型，会自动从完整模型包恢复。也可以在控制台的 **AI 模型状态 -> 训练模型切换** 中手动选择模型包并切换。切换后需要重启 AI 进程，运行时才会重新加载模型。
+
+## 推荐演示方式
+
+1. 启动游戏并确认 Mod 已加载。
+2. 打开控制台，看顶部“游戏连接”是否在线。
+3. 在 **AI 模型状态** 中确认 `demo_local_20260430` 完整可用。
+4. 只演示战斗 AI 时，打开“允许 AI 出牌”，先关闭“允许 AI 宏观操作”和“允许 AI 商店购买”。
+5. 演示宏观 AI 时，再打开“允许 AI 宏观操作”。商店购买建议保持关闭，避免抢玩家操作。
+6. 演示 LLM 时，先配置 Base URL / API Key / Model，再使用“只从合法候选动作里选”的推荐模式。
+
+## 控制台主要开关
+
+| 开关 | 含义 |
+| --- | --- |
+| 采集总开关 | 开启后写入新数据；关闭后暂停采集。 |
+| 启动 AI / 停止 AI | 启停本地 BC Agent 进程。 |
+| 允许 AI 出牌 | 只影响战斗自动出牌。 |
+| 允许 AI 宏观操作 | 地图、奖励、选卡、事件、营火等战斗外行为。 |
+| 允许 AI 商店购买 | 默认关闭；打开后 AI 才能买明确商品。 |
+| 记录 AI 战斗动作 | 写入 AI 战斗日志，便于复盘和后续入训。 |
+| AI 数据进入 BC | 默认关闭；打开后只允许合格 AI 样本进入训练数据。 |
+| 最低训练质量 | 过滤低质量 run，例如只使用一关 Boss 后或更高质量数据。 |
 
 ## 仓库结构
 
 | 路径 | 用途 |
 | --- | --- |
-| `训练脚本/STS2MCP/` | 游戏 Mod 源码，提供 HTTP/MCP 接口，并写入 run 数据。 |
-| `AI_Training/` | 控制台、战斗 BC、宏观 BC、LLM Agent、训练数据管线。 |
-| `sts2_mcp_player/` | MCP 客户端辅助脚本和玩法说明。 |
-| `RL_Datasets/` | 本机采集的原始数据，默认不提交 Git。 |
-| `Data_Packages/` | 一键打包出来的数据包，默认不提交 Git。 |
+| `训练脚本/STS2MCP/` | 游戏 Mod 源码，提供本地 API、执行动作并写入 run 数据。 |
+| `AI_Training/control_panel.py` | 本地网页控制台。 |
+| `AI_Training/ai_agent.py` | BC Agent，负责战斗和宏观动作执行。 |
+| `AI_Training/llm_agent.py` | LLM Agent，负责模型建议和受约束执行。 |
+| `AI_Training/data_pipeline.py` | 战斗数据管线。 |
+| `AI_Training/macro_data_pipeline.py` | 宏观数据管线。 |
+| `AI_Training/ModelZoo/` | 可提交到 GitHub 的演示模型包。 |
+| `RL_Datasets/` | 本机原始采集数据，默认不提交 Git。 |
+| `Data_Packages/` | 控制台一键打包出来的数据包，默认不提交 Git。 |
+| `docs/` | 公开说明和使用文档。 |
 
-## 不提交到 Git 的内容
+## 文档入口
 
-`.gitignore` 已排除这些本机文件：
+- [`docs/project_guide.md`](docs/project_guide.md)：项目说明和控制台读法。
+- [`docs/startup.md`](docs/startup.md)：一键启动脚本说明。
+- [`docs/data_contribution.md`](docs/data_contribution.md)：如何打包数据并提交给维护者。
+- [`docs/public_roadmap.md`](docs/public_roadmap.md)：公开路线图。
+- [`docs/monster_data.md`](docs/monster_data.md)：怪物数据采集和后续用途。
+- [`AI_Training/ModelZoo/README.md`](AI_Training/ModelZoo/README.md)：模型包结构和切换说明。
+
+## 训练
+
+控制台可以点“一键训练”。命令行方式：
+
+```powershell
+.\.venv\Scripts\python.exe .\AI_Training\data_pipeline.py
+.\.venv\Scripts\python.exe .\AI_Training\train_bc.py
+.\.venv\Scripts\python.exe .\AI_Training\train_candidate_bc.py
+.\.venv\Scripts\python.exe .\AI_Training\macro_data_pipeline.py
+.\.venv\Scripts\python.exe .\AI_Training\train_macro_bc.py
+```
+
+训练输出默认在：
+
+- `AI_Training/ProcessedParams/`
+- `AI_Training/ProcessedMacroParams/`
+
+这两个目录默认不提交 Git。如果要分享可试用模型，请整理成 `AI_Training/ModelZoo/<model_id>/` 结构，并附上 `manifest.json`。
+
+## 数据贡献
+
+最需要的贡献仍然是高质量真实数据。推荐通过控制台点击“一键打包数据库”，把 `Data_Packages/` 下生成的 zip 发给维护者，或在 GitHub Issue 中提供下载链接。
+
+提交数据时请说明：
+
+```text
+游戏版本：
+Mod 版本或提交号：
+采集日期：
+大概 run 数：
+主要角色：
+是否包含 AI/LLM 自动操作：
+是否手动丢弃过坏 run：
+备注：
+```
+
+不要提交 API Key、本地账号信息、游戏本体文件、`.venv/`、无关日志或私人路径。
+
+## Git 忽略策略
+
+默认不提交：
 
 - `.venv/`
 - `RL_Datasets/`
@@ -47,165 +219,15 @@
 - `AI_Training/control_state.json`
 - Mod 编译产物，如 `out/`、`bin/`、`obj/`、`*.dll`
 
-也就是说，GitHub 仓库只放代码和说明；数据、模型、API Key 都留在本机。别人拉仓库后需要自己安装依赖、构建 Mod、采集数据或导入你打包的数据。
+允许提交：
 
-## 本地启动
+- 公开说明文档。
+- 控制台和训练代码。
+- `AI_Training/assets/` 下的项目图标。
+- `AI_Training/ModelZoo/` 下明确整理过的演示模型包。
 
-已经装好依赖和 Mod 后，日常使用可以直接双击：
-
-```text
-start_all.bat
-```
-
-它会打开网页控制台、后台输出窗口、RL 日志窗口，并在模型配置可用时启动 BC AI 和 LLM。中文名的 `一键启动全部.bat` 也保留，但如果路径或快捷方式有中文兼容问题，优先用 `start_all.bat`。详细说明见 [`docs/startup.md`](docs/startup.md)。
-
-### 1. 安装 Python 依赖
-
-推荐使用仓库根目录下的虚拟环境：
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-```
-
-如果 PyTorch 安装失败，按自己的显卡/CUDA 环境从 PyTorch 官方命令单独安装 `torch`，再安装 `numpy requests colorama`。
-
-### 2. 构建并安装 Mod
-
-如果采集目录不使用默认位置，可以先设置：
-
-```powershell
-$env:STS2_RL_DATA_DIR = "D:\path\to\RL_Datasets"
-```
-
-构建：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\训练脚本\STS2MCP\build.ps1 -GameDir "<Slay the Spire 2 安装目录>"
-```
-
-然后把以下文件放到游戏 `mods` 目录：
-
-- `训练脚本/STS2MCP/out/STS2_MCP/STS2_MCP.dll`
-- `训练脚本/STS2MCP/out/STS2_MCP/mod_manifest.json`
-
-### 3. 启动控制台
-
-双击：
-
-```text
-启动AI控制台.bat
-```
-
-或手动运行：
-
-```powershell
-.\.venv\Scripts\python.exe .\AI_Training\control_panel.py
-```
-
-浏览器打开：
-
-```text
-http://127.0.0.1:8765/
-```
-
-游戏 Mod 的本地 API 默认是：
-
-```text
-http://localhost:15526/api/v1/singleplayer
-```
-
-控制台显示“未连接”时，通常是游戏没开、Mod 没加载、或本地 API 超时。
-
-## 控制台开关
-
-| 开关 | 含义 |
-| --- | --- |
-| 采集总开关 | 开启时写入新数据；关闭时暂停采集，并记录关闭时间段。 |
-| 启动 AI / 停止 AI | 启停 BC Agent 进程。 |
-| 允许 AI 出牌 | 只影响战斗自动出牌。 |
-| 允许 AI 宏观操作 | 地图、奖励、选卡、事件、营火等宏观操作。 |
-| 允许商店购买 | 默认关闭；打开后 AI 才能在商店购买明确商品。 |
-| 记录 AI 战斗动作 | 控制台镜像写入 `RL_Datasets/AI_Combat`，方便复盘。Mod 的正式 AI 战斗记录写入 `RL_Datasets/AI/Combat`。 |
-| AI 数据进入 BC | 默认关闭；打开后训练会使用 `source=ai` 的样本。 |
-| 最低训练质量 | 过滤低质量 run，例如只训练一关 Boss 后或更高质量数据。 |
-
-## 数据目录说明
-
-| 路径 | 数据来源 |
-| --- | --- |
-| `RL_Datasets/Human/Combat` | 玩家手动战斗动作。 |
-| `RL_Datasets/Human/Macro` | 玩家手动宏观动作。 |
-| `RL_Datasets/AI/Combat` | Mod 记录的 AI 战斗动作，和当前 run_id 对齐。 |
-| `RL_Datasets/AI/Macro` | Mod 记录的 AI 宏观动作。 |
-| `RL_Datasets/AI_Combat` | 控制台额外镜像的 AI 战斗动作，主要用于复盘。 |
-| `RL_Datasets/LLM_Actions` | 大模型建议、校验和执行日志。 |
-
-如果你是“人选宏观、AI 打战斗”，完整 run 会由 `Human/Macro` 和 `AI/Combat` 合并统计。控制台的 Run 体检会按 `run_id` 汇总这些文件。
-
-## 训练
-
-控制台里可以点“一键训练”，也可以用命令行：
-
-```powershell
-.\.venv\Scripts\python.exe .\AI_Training\data_pipeline.py
-.\.venv\Scripts\python.exe .\AI_Training\train_bc.py
-.\.venv\Scripts\python.exe .\AI_Training\macro_data_pipeline.py
-.\.venv\Scripts\python.exe .\AI_Training\train_macro_bc.py
-```
-
-输出位置：
-
-- 战斗 BC：`AI_Training/ProcessedParams/`
-- 宏观 BC：`AI_Training/ProcessedMacroParams/`
-
-这些输出不会提交 Git。换机器后需要重新训练，或用数据包重新生成。
-
-## LLM 接入
-
-控制台支持 OpenAI-compatible Chat Completions 接口：
-
-- `Advisor`：只给建议，不执行动作。
-- `Combat Auto`：只允许在玩家战斗出牌阶段执行 `play_card` / `end_turn`。
-- API Key 只保存到本机 `AI_Training/model_config.json`，不会进 Git。
-- 已保存的 API 配置会显示在控制台表格里，可以切换、修改、删除。
-- 连接测试有冷却，避免连续点击烧请求。
-
-当前 LLM 的优势适合做高层判断和复杂解释；战斗自动执行仍受动作校验限制，不会越过可用动作列表强行操作。
-
-## 数据打包
-
-控制台提供“一键打包数据库”。打包文件会放在：
-
-```text
-Data_Packages/
-```
-
-数据包包含原始 jsonl、run 标签、丢弃列表和摘要；不包含训练后的 numpy 矩阵和模型权重。别人收到 zip 后可以用于复盘或重新训练。
-
-## 当前已知限制
-
-- GitHub 不包含本机模型和数据，拉库后不能直接启动可用 AI，需要先训练或导入数据。
-- 宏观 BC 样本量还偏小，地图选择目前加入了规则评分来降低“一直走同一边”的数据偏差。
-- 商店自动购买默认保护；如果不打开“允许商店购买”，AI 不会买东西，也不会主动离开商店。
-- 战斗数据里 `battle_start` / `turn_start` 仍依赖 Mod Hook 是否触发；即使缺少这些快照，`play_card`、`end_turn`、`battle_end` 仍可用于 BC。
-- 修改 Python 或前端代码后，需要重启控制台；修改 Mod 后需要重新构建并重启游戏。
-
-## GitHub
-
-远程仓库：
+## 远程仓库
 
 ```text
 https://github.com/Towqs/sts2-ai-workspace.git
 ```
-
-常用提交流程：
-
-```powershell
-git status
-git add README.md requirements.txt AI_Training/data_pipeline.py AI_Training/control_panel.py "训练脚本/STS2MCP/RL_DataCollector.cs"
-git commit -m "Update docs"
-git push origin main
-```
-
-实际提交时不要照抄上面的 `git add`，应按本次改动选择文件。
