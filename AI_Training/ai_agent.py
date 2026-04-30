@@ -135,7 +135,181 @@ def align_feature_vector(vector, expected_dim):
     return np.pad(vector, (0, expected_dim - len(vector)), mode="constant")
 
 
-def score_combat_candidates(candidate_agent, state_vec, candidates):
+def combat_text(item):
+    parts = []
+    for key in ("id", "name", "type", "description", "target_type"):
+        value = item.get(key)
+        if value is not None:
+            parts.append(str(value))
+    keywords = item.get("keywords")
+    if keywords:
+        try:
+            parts.append(json.dumps(keywords, ensure_ascii=False))
+        except Exception:
+            parts.append(str(keywords))
+    return " ".join(parts).lower()
+
+
+def combat_numbers(text):
+    import re
+    return [int(n) for n in re.findall(r"\d+", str(text or ""))]
+
+
+def combat_number_hint(item, mode):
+    text = combat_text(item)
+    if mode == "attack" and not any(k in text for k in ("deal", "damage", "attack", "造成", "伤害", "攻击")):
+        return 0
+    if mode == "block" and not any(k in text for k in ("block", "defend", "armor", "格挡", "护甲", "防御")):
+        return 0
+    nums = combat_numbers(text)
+    return nums[0] if nums else 0
+
+
+def card_self_damage(card):
+    text = combat_text(card)
+    card_key = f"{card.get('id') or ''} {card.get('name') or ''} {text}".lower()
+    known_self_damage = {
+        "bloodletting": 3.0,
+        "放血": 3.0,
+        "offering": 6.0,
+        "祭品": 6.0,
+        "hemokinesis": 2.0,
+        "御血术": 2.0,
+        "combust": 1.0,
+        "燃烧": 1.0,
+        "brutality": 1.0,
+        "残暴": 1.0,
+        "残虐": 1.0,
+        "jax": 3.0,
+        "j.a.x": 3.0,
+        "neows_fury": 7.0,
+        "涅奥之怒": 7.0,
+    }
+    for key, value in known_self_damage.items():
+        if key in card_key:
+            return value
+    import re
+    patterns = (
+        r"失去\s*(\d+)\s*点?生命",
+        r"lose\s*(\d+)\s*(?:hp|health|life)",
+        r"take\s*(\d+)\s*damage",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return safe_num(match.group(1), 0.0)
+    return 0.0
+
+
+def enemy_incoming_damage(enemies):
+    total = 0.0
+    for enemy in enemies or []:
+        for intent in enemy.get("intents", []) or []:
+            if isinstance(intent, dict):
+                text = " ".join(str(intent.get(k) or "") for k in ("label", "description", "type", "title"))
+            else:
+                text = str(intent or "")
+            lowered = text.lower()
+            if not any(k in lowered for k in ("attack", "damage", "攻击", "伤害", "攻势")):
+                continue
+            nums = combat_numbers(text)
+            if ("x" in text.lower() or "×" in text or "脳" in text) and len(nums) >= 2:
+                total += nums[0] * nums[1]
+            elif nums:
+                total += nums[0]
+            else:
+                total += 6.0
+    return total
+
+
+def card_for_candidate(candidate, state):
+    player = (state or {}).get("player") or {}
+    hand = player.get("hand") or []
+    if 0 <= candidate.card_index < len(hand) and isinstance(hand[candidate.card_index], dict):
+        return hand[candidate.card_index]
+    for card in hand:
+        if isinstance(card, dict) and str(card.get("id") or card.get("name") or "") == candidate.card_id:
+            return card
+    return {}
+
+
+def potion_for_candidate(candidate, state):
+    player = (state or {}).get("player") or {}
+    potions = player.get("potions") or []
+    for potion in potions:
+        if isinstance(potion, dict) and safe_int(potion.get("slot"), -1) == candidate.potion_slot:
+            return potion
+    return {}
+
+
+def tactical_candidate_adjustment(candidate, state):
+    if not state:
+        return 0.0, ""
+    player = state.get("player") or {}
+    battle = state.get("battle") or {}
+    enemies = battle.get("enemies") or []
+    hp = safe_num(player.get("hp"), 0.0)
+    max_hp = max(safe_num(player.get("max_hp"), 1.0), 1.0)
+    hp_ratio = hp / max_hp
+    block = safe_num(player.get("block"), 0.0)
+    incoming = enemy_incoming_damage(enemies)
+    net_incoming = max(0.0, incoming - block)
+    adjustment = 0.0
+    reasons = []
+
+    if candidate.kind == "play_card":
+        card = card_for_candidate(candidate, state)
+        damage = combat_number_hint(card, "attack")
+        block_gain = combat_number_hint(card, "block")
+        self_damage = card_self_damage(card)
+        card_type = str(card.get("type") or "").lower()
+
+        if self_damage > 0:
+            if hp <= self_damage + 1 or hp_ratio <= 0.25:
+                return -100.0, f"blocked_self_damage hp={hp:g} cost={self_damage:g}"
+            adjustment -= 2.0
+            reasons.append(f"self_damage={self_damage:g}")
+
+        if incoming <= 0:
+            if damage > 0 or "attack" in card_type:
+                adjustment += 2.0
+                reasons.append("no_incoming_attack")
+            if block_gain > 0 and damage <= 0:
+                adjustment -= 6.0
+                reasons.append("no_incoming_block_penalty")
+        else:
+            if net_incoming >= max(8.0, hp * 0.35) and block_gain > 0:
+                adjustment += 2.5
+                reasons.append("high_threat_block")
+            if hp_ratio <= 0.35 and block_gain > 0:
+                adjustment += 1.0
+                reasons.append("low_hp_block")
+
+        if damage > 0 and candidate.target_effective_hp and damage >= candidate.target_effective_hp:
+            adjustment += 4.0
+            reasons.append("lethal")
+
+    elif candidate.kind == "use_potion":
+        potion = potion_for_candidate(candidate, state)
+        text = combat_text(potion)
+        if hp_ratio <= 0.35 and incoming > 0 and any(k in text for k in ("block", "格挡", "weak", "虚弱")):
+            adjustment += 4.0
+            reasons.append("low_hp_defensive_potion")
+        if incoming <= 0 and any(k in text for k in ("block", "格挡", "weak", "虚弱")):
+            adjustment -= 3.0
+            reasons.append("no_incoming_save_potion")
+
+    elif candidate.kind == "end_turn":
+        if incoming <= 0:
+            adjustment += 0.5
+        if net_incoming >= hp and hp > 0:
+            adjustment -= 4.0
+            reasons.append("lethal_incoming")
+
+    return adjustment, ",".join(reasons)
+
+
+def score_combat_candidates(candidate_agent, state_vec, candidates, state=None):
     if not candidate_agent or not candidates:
         return None, [], "candidate_model_unavailable"
     model = candidate_agent["model"]
@@ -153,20 +327,21 @@ def score_combat_candidates(candidate_agent, state_vec, candidates):
     with torch.no_grad():
         logits = model(x)
         probs = torch.sigmoid(logits).detach().cpu().numpy()
-    ranked = sorted(
-        [
-            {"candidate": candidate, "score": float(logit), "confidence": float(prob)}
-            for candidate, logit, prob in zip(candidates, logits.detach().cpu().numpy(), probs)
-        ],
-        key=lambda item: item["score"],
-        reverse=True,
-    )
-    playable_exists = any(item["candidate"].kind == "play_card" for item in ranked)
+    ranked = []
+    for candidate, logit, prob in zip(candidates, logits.detach().cpu().numpy(), probs):
+        adjustment, marker = tactical_candidate_adjustment(candidate, state)
+        base_score = float(logit)
+        ranked.append({
+            "candidate": candidate,
+            "base_score": base_score,
+            "score": base_score + adjustment,
+            "adjustment": adjustment,
+            "confidence": float(prob),
+            "marker": marker,
+        })
+    ranked.sort(key=lambda item: item["score"], reverse=True)
     for item in ranked:
-        candidate = item["candidate"]
-        if candidate.kind == "end_turn" and playable_exists:
-            continue
-        return item, ranked, "candidate_scorer"
+        return item, ranked, "candidate_scorer_tactical"
     return (ranked[0] if ranked else None), ranked, "candidate_scorer_all_end_turn"
 
 
@@ -177,7 +352,7 @@ def candidate_top_actions(ranked, limit=5):
         top_actions.append({
             "action": candidate.label,
             "confidence": round(item["confidence"] * 100.0, 2),
-            "marker": candidate.kind,
+            "marker": " / ".join(x for x in [candidate.kind, item.get("marker")] if x),
         })
     return top_actions
 
@@ -925,24 +1100,40 @@ def route_type_score(node_type, hp_ratio, gold):
     if "boss" in node_type:
         return 0.0
     if "elite" in node_type:
+        if hp_ratio < 0.40:
+            return -10.0
         if hp_ratio >= 0.70:
             return 5.0
         if hp_ratio >= 0.55:
             return 1.5
         return -6.0
     if "rest" in node_type or "camp" in node_type:
-        return 5.0 if hp_ratio < 0.55 else 1.0
+        if hp_ratio < 0.35:
+            return 10.0
+        return 6.0 if hp_ratio < 0.55 else 1.0
     if "shop" in node_type or "merchant" in node_type:
+        if hp_ratio < 0.35:
+            return 4.0 if gold >= 75 else 1.5
         if gold >= 180:
             return 3.5
         if gold >= 110:
             return 1.0
         return -3.0
     if "treasure" in node_type:
-        return 2.5
-    if "event" in node_type or "unknown" in node_type or "ancient" in node_type:
-        return 1.5
+        return 4.0 if hp_ratio < 0.45 else 2.5
+    if "event" in node_type or "unknown" in node_type or "ancient" in node_type or "?" in node_type:
+        if hp_ratio < 0.35:
+            return 6.0
+        if hp_ratio < 0.55:
+            return 3.5
+        return 2.0
     if "monster" in node_type:
+        if hp_ratio < 0.25:
+            return -8.0
+        if hp_ratio < 0.35:
+            return -5.0
+        if hp_ratio < 0.55:
+            return -1.5
         return 2.0
     return 0.5
 
@@ -1518,7 +1709,7 @@ def run_agent():
                     top_printed += 1
 
             legacy_top_actions = list(top_actions)
-            candidate_decision, ranked_candidates, decision_source = score_combat_candidates(candidate_agent, state_vec, legal_candidates)
+            candidate_decision, ranked_candidates, decision_source = score_combat_candidates(candidate_agent, state_vec, legal_candidates, state)
             
             # === 选择最佳合法动作 ===
             if candidate_decision:
@@ -1554,7 +1745,7 @@ def run_agent():
                     "chosen_action": chosen_action,
                     "chosen_candidate": chosen_candidate_label,
                     "payload": payload,
-                    "reason": "candidate scorer chose the highest scoring legal action; end_turn is skipped while playable cards exist",
+                    "reason": "candidate scorer plus tactical guards chose the highest scoring legal action",
                 })
                 if payload:
                     print(Fore.WHITE + f"  Sending: {json.dumps(payload)}")
