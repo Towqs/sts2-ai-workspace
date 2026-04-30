@@ -1858,6 +1858,8 @@ INDEX_HTML = r"""<!doctype html>
     .workspace {
       min-height:0;
       border-radius:18px;
+      grid-template-columns:repeat(12, minmax(0, 1fr));
+      align-items:start;
       transition:background .15s ease, outline-color .15s ease;
     }
     .workspace.drop-ready {
@@ -1866,8 +1868,37 @@ INDEX_HTML = r"""<!doctype html>
       background:rgba(229,242,243,.45);
     }
     .module-card {
+      grid-column:1 / -1;
       align-self:start;
       transition:opacity .15s ease, transform .15s ease, box-shadow .15s ease;
+    }
+    .module-card[data-size="compact"] { grid-column:span 4; }
+    .module-card[data-size="normal"] { grid-column:span 6; }
+    .module-card[data-size="wide"] { grid-column:1 / -1; }
+    .module-card[data-size="compact"] {
+      padding:13px;
+    }
+    .module-card[data-size="compact"] .section-head {
+      gap:8px;
+      margin-bottom:9px;
+    }
+    .module-card[data-size="compact"] h2 {
+      font-size:14px;
+    }
+    .module-card[data-size="compact"] .kv {
+      grid-template-columns:86px minmax(0, 1fr);
+      gap:8px;
+      padding:7px 0;
+    }
+    .module-card[data-size="compact"] .table-wrap,
+    .module-card[data-size="compact"] pre {
+      max-height:220px;
+    }
+    .module-card[data-size="wide"] .table-wrap {
+      max-height:520px;
+    }
+    .module-card[data-size="wide"] pre {
+      max-height:420px;
     }
     .module-card.is-hidden { display:none; }
     .module-card.is-collapsed {
@@ -1877,6 +1908,19 @@ INDEX_HTML = r"""<!doctype html>
     .module-card.is-collapsed > :not(.section-head) { display:none; }
     .module-card.flash {
       box-shadow:0 0 0 3px rgba(209,162,58,.34), var(--shadow-soft);
+    }
+    .module-card.dragging-card {
+      opacity:.58;
+      transform:scale(.992);
+    }
+    .module-card.drop-target {
+      box-shadow:0 0 0 3px rgba(47,111,120,.24), var(--shadow-soft);
+    }
+    .module-card > .section-head {
+      cursor:grab;
+    }
+    .module-card > .section-head:active {
+      cursor:grabbing;
     }
     .module-actions {
       display:flex;
@@ -1901,12 +1945,41 @@ INDEX_HTML = r"""<!doctype html>
       background:#fff;
     }
     .module-action:hover { background:var(--primary-bg); }
+    .module-size-controls {
+      display:flex;
+      align-items:center;
+      gap:3px;
+      padding:2px;
+      border:1px solid var(--line);
+      border-radius:10px;
+      background:#fff;
+    }
+    .module-size-button {
+      width:26px;
+      min-width:26px;
+      height:26px;
+      min-height:26px;
+      border:0;
+      border-radius:7px;
+      padding:0;
+      font-size:12px;
+      color:var(--muted);
+      background:transparent;
+    }
+    .module-size-button.active {
+      color:#fff;
+      background:var(--primary);
+    }
     .priority-grid { align-items:start; }
     .priority-grid.single-visible { grid-template-columns:1fr; }
     @media (max-width: 1120px) {
       .status-grid { grid-template-columns:repeat(2, minmax(160px, 1fr)); }
       main { grid-template-columns:1fr; }
       .priority-grid { grid-template-columns:1fr; }
+      .module-card,
+      .module-card[data-size="compact"],
+      .module-card[data-size="normal"],
+      .module-card[data-size="wide"] { grid-column:1 / -1; }
       .sidebar { max-width:none; }
     }
     @media (max-width: 720px) {
@@ -2002,6 +2075,9 @@ INDEX_HTML = r"""<!doctype html>
                 <button class="module-item" data-module-target="llm_logic" draggable="true" onclick="openModule('llm_logic')" ondragstart="beginModuleDrag(event, 'llm_logic')" ondragend="endModuleDrag(event)">
                   <span class="module-glyph"></span><span class="module-label">LLM 决策</span><span class="module-state">+</span>
                 </button>
+                <button class="module-item" data-module-target="model_status" draggable="true" onclick="openModule('model_status')" ondragstart="beginModuleDrag(event, 'model_status')" ondragend="endModuleDrag(event)">
+                  <span class="module-glyph"></span><span class="module-label">AI 模型状态</span><span class="module-state">+</span>
+                </button>
               </div>
               <div class="module-group">
                 <div class="module-group-title">数据</div>
@@ -2063,18 +2139,6 @@ INDEX_HTML = r"""<!doctype html>
           <div><div class="switch-title">AI 数据进入 BC</div><div class="switch-note">默认关闭，避免自举污染</div></div>
           <input id="include_ai_in_training" type="checkbox" onchange="saveControl()">
         </div>
-          </div>
-        </details>
-      </section>
-
-      <section class="fold-panel">
-        <details open>
-          <summary>
-            <span class="fold-title">AI 模型状态</span>
-            <span id="modelBadge" class="pill">-</span>
-          </summary>
-          <div class="fold-body">
-            <div id="modelHealth">读取中</div>
           </div>
         </details>
       </section>
@@ -2213,8 +2277,7 @@ INDEX_HTML = r"""<!doctype html>
     </div>
 
     <div id="workspace" class="stack content workspace" ondragover="handleWorkspaceDragOver(event)" ondragleave="handleWorkspaceDragLeave(event)" ondrop="handleWorkspaceDrop(event)">
-      <div class="priority-grid">
-        <section id="module-ai-logic" class="module-card" data-module="ai_logic">
+      <section id="module-ai-logic" class="module-card" data-module="ai_logic">
           <div class="section-head">
             <h2>AI 出牌逻辑</h2>
             <div class="module-actions">
@@ -2230,9 +2293,9 @@ INDEX_HTML = r"""<!doctype html>
               <tbody id="aiTopActions"></tbody>
             </table>
           </div>
-        </section>
+      </section>
 
-        <section id="module-llm-logic" class="module-card" data-module="llm_logic">
+      <section id="module-llm-logic" class="module-card" data-module="llm_logic">
           <div class="section-head">
             <h2>LLM 决策</h2>
             <div class="module-actions">
@@ -2242,8 +2305,19 @@ INDEX_HTML = r"""<!doctype html>
             </div>
           </div>
           <div id="llmLogic" class="muted">暂无 LLM 决策</div>
-        </section>
-      </div>
+      </section>
+
+      <section id="module-model-status" class="module-card" data-module="model_status">
+        <div class="section-head">
+          <h2>AI 模型状态</h2>
+          <div class="module-actions">
+            <span id="modelBadge" class="pill">-</span>
+            <button class="module-action" onclick="toggleModuleCollapse('model_status')" data-collapse-for="model_status" title="收起">-</button>
+            <button class="module-action" onclick="closeModule('model_status')" title="关闭">×</button>
+          </div>
+        </div>
+        <div id="modelHealth">读取中</div>
+      </section>
 
       <section id="module-current-data" class="module-card" data-module="current_data">
         <div class="section-head">
@@ -2532,8 +2606,24 @@ function dataHealthClass(health) {
   if (health === "warn") return "warn";
   return "info";
 }
-const MODULE_IDS = ["ai_logic", "llm_logic", "current_data", "runs", "records", "evaluation", "training"];
+const MODULE_IDS = ["ai_logic", "llm_logic", "model_status", "current_data", "runs", "records", "evaluation", "training"];
+const MODULE_DEFAULT_SIZES = {
+  ai_logic: "normal",
+  llm_logic: "normal",
+  model_status: "normal",
+  current_data: "wide",
+  runs: "wide",
+  records: "wide",
+  evaluation: "wide",
+  training: "wide"
+};
+const MODULE_SIZE_LABELS = {
+  compact: "小",
+  normal: "中",
+  wide: "大"
+};
 const MODULE_STORAGE_KEY = "sts2_control_panel_modules";
+const MODULE_ORDER_STORAGE_KEY = "sts2_control_panel_module_order";
 const GUIDE_STEPS = [
   {
     target: "#gamePhase",
@@ -2578,7 +2668,12 @@ const GUIDE_STEPS = [
   {
     target: ".module-item[data-module-target='ai_logic']",
     title: "左侧工作区可以管理面板",
-    text: "这些卡片可以点击打开，也可以拖到右侧工作区。右侧面板上的加减按钮用于收起或关闭。"
+    text: "这些卡片可以点击打开，也可以拖到右侧工作区。右侧卡片的标题可以拖动排序，小/中/大按钮可以调整宽度。"
+  },
+  {
+    target: ".module-item[data-module-target='model_status']",
+    title: "模型状态也在决策区",
+    text: "AI 模型状态现在归到决策分类里。打开后可以直接看到战斗模型、候选动作模型、宏观模型和 Python 依赖是否齐。"
   },
   {
     target: "#module-runs",
@@ -2617,7 +2712,11 @@ function updateModalLock() {
   document.body.classList.toggle("modal-lock", locked);
 }
 function defaultModuleState() {
-  return Object.fromEntries(MODULE_IDS.map(id => [id, {open:true, collapsed:false}]));
+  return Object.fromEntries(MODULE_IDS.map(id => [id, {
+    open:true,
+    collapsed:false,
+    size: MODULE_DEFAULT_SIZES[id] || "wide"
+  }]));
 }
 function readModuleState() {
   const state = defaultModuleState();
@@ -2627,28 +2726,92 @@ function readModuleState() {
       if (saved[id]) {
         state[id].open = saved[id].open !== false;
         state[id].collapsed = !!saved[id].collapsed;
+        if (MODULE_SIZE_LABELS[saved[id].size]) state[id].size = saved[id].size;
       }
     }
   } catch (_) {}
   return state;
 }
+function readModuleOrder() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(MODULE_ORDER_STORAGE_KEY) || "[]");
+    if (Array.isArray(saved)) {
+      const filtered = saved.filter(id => MODULE_IDS.includes(id));
+      return [...filtered, ...MODULE_IDS.filter(id => !filtered.includes(id))];
+    }
+  } catch (_) {}
+  return [...MODULE_IDS];
+}
 let moduleState = readModuleState();
+let moduleOrder = readModuleOrder();
 let draggingModuleId = "";
+let draggingCardId = "";
 function saveModuleState() {
   localStorage.setItem(MODULE_STORAGE_KEY, JSON.stringify(moduleState));
+}
+function saveModuleOrder() {
+  localStorage.setItem(MODULE_ORDER_STORAGE_KEY, JSON.stringify(moduleOrder));
 }
 function moduleElement(id) {
   return document.querySelector(`.module-card[data-module="${id}"]`);
 }
+function applyModuleOrder() {
+  const workspace = document.getElementById("workspace");
+  if (!workspace) return;
+  for (const id of moduleOrder) {
+    const card = moduleElement(id);
+    if (card) workspace.appendChild(card);
+  }
+}
+function injectModuleControls() {
+  for (const id of MODULE_IDS) {
+    const card = moduleElement(id);
+    if (!card) continue;
+    const head = card.querySelector(":scope > .section-head");
+    const actions = card.querySelector(":scope > .section-head .module-actions");
+    if (head && !head.dataset.dragReady) {
+      head.dataset.dragReady = "1";
+      head.draggable = true;
+      head.addEventListener("dragstart", event => beginCardDrag(event, id));
+      head.addEventListener("dragend", endCardDrag);
+      head.title = "拖动标题可以调整卡片顺序";
+    }
+    if (actions && !actions.querySelector(".module-size-controls")) {
+      const group = document.createElement("span");
+      group.className = "module-size-controls";
+      group.setAttribute("aria-label", "卡片大小");
+      for (const size of Object.keys(MODULE_SIZE_LABELS)) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "module-size-button";
+        button.dataset.sizeControl = size;
+        button.textContent = MODULE_SIZE_LABELS[size];
+        button.title = `切到${MODULE_SIZE_LABELS[size]}卡片`;
+        button.onclick = event => {
+          event.stopPropagation();
+          setModuleSize(id, size);
+        };
+        group.appendChild(button);
+      }
+      const firstActionButton = actions.querySelector(".module-action");
+      actions.insertBefore(group, firstActionButton || null);
+    }
+  }
+}
 function syncModuleUI() {
   let openCount = 0;
-  let visibleDecisionCards = 0;
+  applyModuleOrder();
+  injectModuleControls();
   for (const id of MODULE_IDS) {
     const state = moduleState[id] || {open:true, collapsed:false};
     const card = moduleElement(id);
     if (card) {
       card.classList.toggle("is-hidden", !state.open);
       card.classList.toggle("is-collapsed", !!state.collapsed);
+      card.dataset.size = MODULE_SIZE_LABELS[state.size] ? state.size : (MODULE_DEFAULT_SIZES[id] || "wide");
+      for (const button of card.querySelectorAll(".module-size-button")) {
+        button.classList.toggle("active", button.dataset.sizeControl === card.dataset.size);
+      }
     }
     const dock = document.querySelector(`.module-item[data-module-target="${id}"]`);
     if (dock) {
@@ -2665,11 +2828,8 @@ function syncModuleUI() {
     }
     if (state.open) {
       openCount++;
-      if (id === "ai_logic" || id === "llm_logic") visibleDecisionCards++;
     }
   }
-  const decisionGrid = document.querySelector(".priority-grid");
-  if (decisionGrid) decisionGrid.classList.toggle("single-visible", visibleDecisionCards === 1);
   const count = document.getElementById("openModuleCount");
   if (count) count.textContent = `${openCount}/${MODULE_IDS.length}`;
 }
@@ -2682,7 +2842,7 @@ function flashModule(card) {
 }
 function openModule(id, opts = {}) {
   if (!MODULE_IDS.includes(id)) return;
-  moduleState[id] = {open:true, collapsed:false};
+  moduleState[id] = {...(moduleState[id] || {}), open:true, collapsed:false};
   saveModuleState();
   syncModuleUI();
   const card = moduleElement(id);
@@ -2690,6 +2850,13 @@ function openModule(id, opts = {}) {
   if (opts.scroll !== false && card) {
     card.scrollIntoView({behavior:"smooth", block:"start"});
   }
+}
+function setModuleSize(id, size) {
+  if (!MODULE_IDS.includes(id) || !MODULE_SIZE_LABELS[size]) return;
+  moduleState[id] = {...(moduleState[id] || {}), open:true, size};
+  saveModuleState();
+  syncModuleUI();
+  flashModule(moduleElement(id));
 }
 let guideIndex = 0;
 function clampGuide(value, min, max) {
@@ -2797,7 +2964,7 @@ function closeModule(id) {
 function toggleModuleCollapse(id) {
   if (!MODULE_IDS.includes(id)) return;
   const current = moduleState[id] || {open:true, collapsed:false};
-  moduleState[id] = {open:true, collapsed:!current.collapsed};
+  moduleState[id] = {...current, open:true, collapsed:!current.collapsed};
   saveModuleState();
   syncModuleUI();
   flashModule(moduleElement(id));
@@ -2805,6 +2972,7 @@ function toggleModuleCollapse(id) {
 function beginModuleDrag(event, id) {
   draggingModuleId = id;
   event.dataTransfer.setData("text/plain", id);
+  event.dataTransfer.setData("application/x-sts2-module-open", id);
   event.dataTransfer.effectAllowed = "copy";
   event.currentTarget.classList.add("dragging");
 }
@@ -2814,12 +2982,53 @@ function endModuleDrag(event) {
   const workspace = document.getElementById("workspace");
   if (workspace) workspace.classList.remove("drop-ready");
 }
+function beginCardDrag(event, id) {
+  if (!MODULE_IDS.includes(id)) return;
+  if (event.target.closest("button,input,select,a,textarea")) {
+    event.preventDefault();
+    return;
+  }
+  draggingCardId = id;
+  event.dataTransfer.setData("text/plain", id);
+  event.dataTransfer.setData("application/x-sts2-module-card", id);
+  event.dataTransfer.effectAllowed = "move";
+  const card = moduleElement(id);
+  if (card) card.classList.add("dragging-card");
+}
+function endCardDrag() {
+  const card = moduleElement(draggingCardId);
+  if (card) card.classList.remove("dragging-card");
+  draggingCardId = "";
+  document.querySelectorAll(".module-card.drop-target").forEach(item => item.classList.remove("drop-target"));
+  const workspace = document.getElementById("workspace");
+  if (workspace) workspace.classList.remove("drop-ready");
+}
+function reorderModuleCard(id, targetId, placeAfter) {
+  if (!MODULE_IDS.includes(id)) return;
+  const nextOrder = moduleOrder.filter(item => item !== id);
+  const targetIndex = nextOrder.indexOf(targetId);
+  if (targetIndex < 0) {
+    nextOrder.push(id);
+  } else {
+    nextOrder.splice(targetIndex + (placeAfter ? 1 : 0), 0, id);
+  }
+  moduleOrder = nextOrder;
+  saveModuleOrder();
+  applyModuleOrder();
+}
 function handleWorkspaceDragOver(event) {
-  const id = draggingModuleId || event.dataTransfer.getData("text/plain");
+  const id = draggingModuleId || draggingCardId || event.dataTransfer.getData("text/plain");
   if (!MODULE_IDS.includes(id)) return;
   event.preventDefault();
-  event.dataTransfer.dropEffect = "copy";
+  event.dataTransfer.dropEffect = draggingCardId ? "move" : "copy";
   event.currentTarget.classList.add("drop-ready");
+  document.querySelectorAll(".module-card.drop-target").forEach(item => item.classList.remove("drop-target"));
+  if (draggingCardId) {
+    const targetCard = event.target.closest(".module-card");
+    if (targetCard && targetCard.dataset.module !== draggingCardId) {
+      targetCard.classList.add("drop-target");
+    }
+  }
 }
 function handleWorkspaceDragLeave(event) {
   if (!event.currentTarget.contains(event.relatedTarget)) {
@@ -2827,10 +3036,31 @@ function handleWorkspaceDragLeave(event) {
   }
 }
 function handleWorkspaceDrop(event) {
-  const id = draggingModuleId || event.dataTransfer.getData("text/plain");
+  const id = draggingModuleId || draggingCardId || event.dataTransfer.getData("text/plain");
   if (!MODULE_IDS.includes(id)) return;
   event.preventDefault();
   event.currentTarget.classList.remove("drop-ready");
+  document.querySelectorAll(".module-card.drop-target").forEach(item => item.classList.remove("drop-target"));
+  if (draggingCardId) {
+    const targetCard = event.target.closest(".module-card");
+    if (targetCard && targetCard.dataset.module !== draggingCardId) {
+      const rect = targetCard.getBoundingClientRect();
+      const sameRow = event.clientY >= rect.top && event.clientY <= rect.bottom;
+      const placeAfter = sameRow
+        ? event.clientX > rect.left + rect.width / 2
+        : event.clientY > rect.top + rect.height / 2;
+      reorderModuleCard(draggingCardId, targetCard.dataset.module, placeAfter);
+    } else {
+      reorderModuleCard(draggingCardId, "", true);
+    }
+    const movedId = draggingCardId;
+    const movedCard = moduleElement(movedId);
+    if (movedCard) movedCard.classList.remove("dragging-card");
+    draggingCardId = "";
+    syncModuleUI();
+    flashModule(moduleElement(movedId));
+    return;
+  }
   draggingModuleId = "";
   openModule(id, {scroll:false});
 }
