@@ -1096,44 +1096,233 @@ def choose_card_reward_baseline_action(state, card_baseline_weight=1.0):
     }
 
 
-def tactical_card_select_score(card):
+def card_attack_hint(card):
+    traits = card_traits(card)
+    text = combat_core_text(card)
+    if not (traits["is_attack"] or has_any(text, ("deal", "attack", "造成", "攻击"))):
+        return 0
+    nums = combat_numbers(text)
+    if not nums:
+        return 0
+    if len(nums) >= 2 and nums[1] <= 8 and has_any(text, ("times", "×", "次", "多次")):
+        return nums[0] * nums[1]
+    return nums[0]
+
+
+def card_block_hint(card):
+    text = combat_core_text(card)
+    if not has_any(text, ("block", "defend", "armor", "格挡", "护甲", "防御")):
+        return 0
+    nums = combat_numbers(text)
+    return nums[0] if nums else 0
+
+
+def is_starter_strike_or_defend(card):
+    card_id = str(card.get("id") or card.get("card_id") or "").upper()
+    name = str(card.get("name") or card.get("card_name") or "")
+    return card_id in ("STRIKE_IRONCLAD", "DEFEND_IRONCLAD") or name in ("打击", "防御", "Strike", "Defend") or name.lower() in ("strike", "defend")
+
+
+def is_status_or_curse_card(card):
     traits = card_traits(card)
     text = card_blob(card)
+    if traits["type"] in ("curse", "status"):
+        return True
+    return has_any(text, (
+        "curse", "status", "wound", "burn", "dazed", "slimed", "void",
+        "诅咒", "状态", "伤口", "灼伤", "晕眩", "黏液", "虚空",
+    ))
+
+
+def card_long_term_value(card):
+    traits = card_traits(card)
+    text = card_blob(card)
+    attack = card_attack_hint(card)
+    block = card_block_hint(card)
     score = 0.0
     reasons = []
 
+    if is_status_or_curse_card(card):
+        score -= 6.0
+        reasons.append("负面牌")
+
+    if is_starter_strike_or_defend(card):
+        score -= 1.8
+        reasons.append("基础打防")
+    elif "basic" in traits["rarity"]:
+        score -= 0.5
+        reasons.append("基础牌")
+
     if traits["is_attack"]:
-        score += 2.0
+        score += 1.8 + min(attack / 10.0, 2.4)
         reasons.append("攻击牌")
+        if attack >= 10:
+            score += 0.7
+            reasons.append("高伤害")
     if "vulnerable" in text or "易伤" in text:
         score += 1.2
         reasons.append("易伤")
-    if traits["block"]:
-        score += 0.8
+    if traits["block"] or block:
+        score += 0.8 + min(block / 12.0, 1.1)
         reasons.append("格挡")
     if traits["draw"]:
         score += 1.0
         reasons.append("过牌")
     if traits["scaling"] or traits["is_power"]:
-        score += 1.0
+        score += 1.3
         reasons.append("成长")
+    if traits["aoe"]:
+        score += 1.0
+        reasons.append("AOE")
     if "energy" in text or "能量" in text:
         score += 0.6
         reasons.append("能量")
     if "exhaust" in text or "消耗" in text:
         score -= 0.4
         reasons.append("消耗")
-    if "basic" in traits["rarity"]:
-        score -= 0.2
+    if card.get("is_upgraded"):
+        score += 0.8
+        reasons.append("已升级")
     if "rare" in traits["rarity"]:
         score += 0.4
+        reasons.append("稀有牌")
+    elif "uncommon" in traits["rarity"]:
+        score += 0.2
+        reasons.append("罕见牌")
     score -= max(traits["cost"] - 2.0, 0.0) * 0.35
     return round(score, 3), reasons[:3]
 
 
+def card_sacrifice_priority(card, state=None):
+    value, value_reasons = card_long_term_value(card)
+    traits = card_traits(card)
+    text = card_blob(card)
+    score = -value
+    reasons = ["低长期价值"] + value_reasons[:1]
+
+    if is_status_or_curse_card(card):
+        score += 8.0
+        reasons = ["优先清理负面牌"]
+    elif is_starter_strike_or_defend(card):
+        score += 5.0
+        reasons = ["优先处理基础打防"]
+
+    if state:
+        profile = deck_profile_from_state(state)
+        if is_starter_strike_or_defend(card):
+            attack_ratio = safe_num(profile.get("attack_ratio"))
+            skill_ratio = safe_num(profile.get("skill_ratio"))
+            if traits["is_attack"] and attack_ratio >= skill_ratio:
+                score += 0.6
+                reasons.append("攻击牌偏多")
+            if traits["is_skill"] and skill_ratio > attack_ratio + 0.08:
+                score += 0.6
+                reasons.append("技能牌偏多")
+
+    if card.get("is_upgraded"):
+        score -= 2.0
+        reasons.append("保护已升级牌")
+    if traits["is_power"] or traits["draw"] or traits["scaling"] or traits["aoe"]:
+        score -= 2.0
+        reasons.append("保护功能牌")
+    if traits["is_attack"] and card_attack_hint(card) >= 10:
+        score -= 2.5
+        reasons.append("保护核心输出")
+    if "rare" in traits["rarity"] or "uncommon" in traits["rarity"]:
+        score -= 0.8
+        reasons.append("保护高稀有度")
+    if has_any(text, ("vulnerable", "易伤", "weak", "虚弱")):
+        score -= 1.2
+        reasons.append("保护关键状态牌")
+    if value >= 4.0:
+        score -= 3.0
+        reasons.append("禁止牺牲强牌")
+
+    return round(score, 3), reasons[:3]
+
+
+def detect_card_select_operation(screen):
+    screen_type = str(screen.get("screen_type") or "").lower()
+    prompt = " ".join(
+        str(screen.get(key) or "").lower()
+        for key in ("prompt", "instructions_title", "instructions_description")
+    )
+    text = f"{screen_type} {prompt}"
+
+    if has_any(text, ("draw pile", "top of", "抽牌堆顶", "抽牌堆顶部", "牌堆顶", "放到抽牌堆")):
+        return "topdeck"
+    if "upgrade" in screen_type or has_any(text, ("upgrade", "升级", "强化")):
+        return "upgrade"
+    if "transform" in screen_type or has_any(text, ("transform", "变换", "变化", "变形", "转化")):
+        return "transform"
+    if has_any(text, (
+        "remove", "delete", "sell", "sold", "sacrifice", "lose a card", "exhaust",
+        "移除", "删除", "出售", "卖", "献祭", "失去一张", "失去1张", "消耗", "抛弃", "弃掉",
+    )):
+        return "sacrifice"
+    if "discard" in text and "discard pile" not in text and "弃牌堆" not in text:
+        return "sacrifice"
+    if "丢弃" in text and "弃牌堆" not in text:
+        return "sacrifice"
+    return "choose"
+
+
+def score_card_select_for_operation(card, operation, state=None):
+    value, value_reasons = card_long_term_value(card)
+    traits = card_traits(card)
+    text = card_blob(card)
+
+    if operation == "upgrade":
+        if card.get("is_upgraded"):
+            return -5.0, ["已升级，跳过"]
+        score = value
+        reasons = ["升级高价值牌"] + value_reasons[:2]
+        if has_any(text, ("vulnerable", "易伤", "strength", "力量")):
+            score += 1.0
+            reasons.append("升级关键状态/成长")
+        if card_attack_hint(card) >= 8:
+            score += 0.8
+            reasons.append("升级输出")
+        if card_block_hint(card) >= 10:
+            score += 0.5
+            reasons.append("升级防御")
+        if is_starter_strike_or_defend(card):
+            score -= 0.6
+            reasons.append("基础牌优先级低")
+        return round(score, 3), reasons[:3]
+
+    if operation == "topdeck":
+        score = value
+        reasons = ["放到抽牌堆顶"] + value_reasons[:2]
+        if traits["is_attack"]:
+            score += min(card_attack_hint(card) / 8.0, 1.8)
+            reasons.append("下回合输出")
+        if traits["draw"] or "energy" in text or "能量" in text:
+            score += 0.8
+            reasons.append("下回合启动")
+        if traits["is_power"]:
+            score -= 0.5
+            reasons.append("能力牌偏慢")
+        return round(score, 3), reasons[:3]
+
+    if operation in ("sacrifice", "transform"):
+        score, reasons = card_sacrifice_priority(card, state)
+        if operation == "transform":
+            reasons = ["变换低价值牌"] + reasons[:2]
+            if is_starter_strike_or_defend(card):
+                score += 0.8
+            if is_status_or_curse_card(card):
+                score += 0.4
+        else:
+            reasons = ["移除/卖掉低价值牌"] + reasons[:2]
+        return round(score, 3), reasons[:3]
+
+    return value, ["选择高价值牌"] + value_reasons[:2]
+
+
 def choose_card_select_action(state):
     screen = state.get("card_select") or {}
-    prompt = str(screen.get("prompt") or "").lower()
+    operation = detect_card_select_operation(screen)
 
     if screen.get("can_confirm"):
         return {"action": "confirm_selection"}, {
@@ -1159,16 +1348,9 @@ def choose_card_select_action(state):
             "reason": "card_select_no_cards",
         }
 
-    invert = any(token in prompt for token in ("discard", "丢弃", "exhaust", "消耗", "remove", "移除"))
-    topdeck = any(token in prompt for token in ("draw pile", "抽牌堆顶", "抽牌堆顶部", "牌堆顶"))
     scored = []
     for fallback_index, card in enumerate(cards):
-        score, reasons = tactical_card_select_score(card)
-        if invert:
-            score = -score
-            reasons = ["选择低价值牌"] + reasons[:2]
-        elif topdeck:
-            reasons = ["放到抽牌堆顶"] + reasons[:2]
+        score, reasons = score_card_select_for_operation(card, operation, state)
         scored.append({
             "index": safe_int(card.get("index"), fallback_index),
             "id": card.get("id"),
@@ -1183,7 +1365,7 @@ def choose_card_select_action(state):
         {
             "action": f"select_card:index_{item['index']}:{item.get('id') or item.get('name')}",
             "confidence": round(max(item["score"], 0.0) * 20, 2),
-            "marker": f"score={item['score']:+.2f}; {' / '.join(item['reasons']) or '-'}",
+            "marker": f"operation={operation}; score={item['score']:+.2f}; {' / '.join(item['reasons']) or '-'}",
         }
         for item in sorted(scored, key=lambda item: item["score"], reverse=True)[:6]
     ]
@@ -1191,7 +1373,7 @@ def choose_card_select_action(state):
         "top_actions": top_actions,
         "chosen_action": f"select_card:index_{best['index']}:{best.get('id') or best.get('name')}",
         "payload": payload,
-        "reason": "card_select: " + (" / ".join(best["reasons"]) or "highest score"),
+        "reason": f"card_select_{operation}: " + (" / ".join(best["reasons"]) or "highest score"),
     }
 
 
@@ -1253,6 +1435,173 @@ def choose_card_reward_mixed_action(macro_agent, state, outputs, probs, card_bas
             "chosen_mixed_score": round(best["adjusted"], 3),
             "chosen_reason": best["reasons"],
         },
+    }
+
+
+def event_option_blob(option):
+    parts = []
+    for key in ("title", "description", "relic_name", "relic_description"):
+        value = option.get(key)
+        if value is not None:
+            parts.append(str(value))
+    keywords = option.get("keywords")
+    if keywords:
+        try:
+            parts.append(json.dumps(keywords, ensure_ascii=False))
+        except Exception:
+            parts.append(str(keywords))
+    return " ".join(parts).lower()
+
+
+def estimate_event_hp_cost(text):
+    if not has_any(text, ("hp", "health", "生命", "血")):
+        return 0
+    if not has_any(text, ("lose", "loss", "失去", "扣", "支付", "花费", "付出", "take", "受到")):
+        return 0
+    nums = combat_numbers(text)
+    return nums[0] if nums else 0
+
+
+def score_event_option_rule(option, state):
+    text = event_option_blob(option)
+    player = state.get("player") or {}
+    hp = safe_num(player.get("hp"), 0.0)
+    max_hp = max(safe_num(player.get("max_hp"), 1.0), 1.0)
+    hp_ratio = hp / max_hp
+    gold = safe_num(player.get("gold"), 0.0)
+    score = 0.0
+    reasons = []
+
+    if option.get("is_proceed"):
+        score += 12.0
+        reasons.append("继续")
+
+    if has_any(text, ("relic", "遗物")):
+        score += 3.0
+        reasons.append("遗物收益")
+    if has_any(text, ("potion", "药水")):
+        score += 1.2
+        reasons.append("药水收益")
+    if has_any(text, ("gold", "金币", "金钱")) and has_any(text, ("gain", "获得", "拾起")):
+        score += 1.5
+        reasons.append("金币收益")
+    if has_any(text, ("max hp", "最大生命")) and has_any(text, ("gain", "获得", "提升", "增加")):
+        score += 2.0
+        reasons.append("最大生命收益")
+    if has_any(text, ("upgrade", "升级", "强化", "附魔")):
+        score += 1.6
+        reasons.append("卡牌强化")
+    if has_any(text, ("choose", "选择", "add", "加入", "card pack", "卡牌包")) and has_any(text, ("card", "牌")):
+        score += 1.0
+        reasons.append("卡牌收益")
+
+    hp_cost = estimate_event_hp_cost(text)
+    if hp_cost:
+        penalty = hp_cost / max_hp * (3.0 if hp_ratio < 0.45 else 1.4)
+        if hp - hp_cost <= max(6.0, max_hp * 0.12):
+            penalty += 8.0
+        elif hp_ratio < 0.35:
+            penalty += 3.0
+        score -= penalty
+        reasons.append(f"扣血成本{hp_cost}")
+
+    if has_any(text, ("max hp", "最大生命")) and has_any(text, ("lose", "失去", "降低", "减少")):
+        score -= 4.0
+        reasons.append("最大生命损失")
+    if has_any(text, ("lose all gold", "失去所有金币", "失去全部金币")):
+        score -= min(4.0, gold / 80.0)
+        reasons.append("失去金币")
+
+    card_loss = has_any(text, (
+        "remove", "lose a card", "lose 1 card", "sell", "sacrifice",
+        "移除", "失去一张牌", "失去1张牌", "出售", "卖掉", "卖出", "献祭", "discard", "丢弃", "抛弃", "弃掉",
+    ))
+    transform = has_any(text, ("transform", "变换", "变化为", "变形", "转化"))
+    if card_loss or transform:
+        if has_any(text, ("starter", "初始牌", "打击", "防御", "strike", "defend")):
+            score -= 0.6
+            reasons.append("只动初始牌")
+        else:
+            penalty = 3.5 if hp_ratio >= 0.45 else 1.6
+            score -= penalty
+            reasons.append("可能损失核心牌")
+
+    if has_any(text, ("next", "again", "reroll", "下一", "再选", "重抽", "继续选择")):
+        score += 0.5
+        reasons.append("可继续选择")
+    if has_any(text, ("leave", "ignore", "skip", "离开", "无视", "跳过")):
+        score += 0.2
+        reasons.append("安全离开")
+
+    return round(score, 3), reasons[:4]
+
+
+def event_option_has_cost_risk(option):
+    text = event_option_blob(option)
+    if has_any(text, (
+        "lose", "loss", "失去", "remove", "移除", "sell", "出售", "卖", "sacrifice", "献祭",
+        "hp", "生命", "血", "支付", "花费", "付出", "discard", "丢弃", "抛弃", "弃掉",
+    )):
+        return True
+    if has_any(text, ("transform", "变换", "变化为", "变形", "转化")) and not has_any(text, ("starter", "初始牌", "打击", "防御", "strike", "defend")):
+        return True
+    return False
+
+
+def choose_event_option_rule_action(state):
+    event = state.get("event") or {}
+    if event.get("in_dialogue"):
+        return {"action": "advance_dialogue"}, {
+            "top_actions": [{"action": "advance_dialogue", "confidence": 100.0, "marker": "event_dialogue"}],
+            "chosen_action": "advance_dialogue",
+            "payload": {"action": "advance_dialogue"},
+            "reason": "event_dialogue",
+        }
+
+    options = event.get("options") or []
+    available = [o for o in options if not o.get("is_locked") and not o.get("was_chosen")]
+    if len(available) == 1:
+        index = safe_int(available[0].get("index"), 0)
+        payload = {"action": "choose_event_option", "index": index}
+        return payload, {
+            "top_actions": [{"action": f"choose_event_option:index_{index}", "confidence": 100.0, "marker": "single_option"}],
+            "chosen_action": f"choose_event_option:index_{index}",
+            "payload": payload,
+            "reason": "event_single_option",
+        }
+    if not available:
+        return None, None
+
+    needs_rule = any(event_option_has_cost_risk(o) for o in available)
+    if not needs_rule:
+        return None, None
+
+    scored = []
+    for fallback_index, option in enumerate(available):
+        index = safe_int(option.get("index"), fallback_index)
+        score, reasons = score_event_option_rule(option, state)
+        scored.append({
+            "index": index,
+            "title": option.get("title"),
+            "score": score,
+            "reasons": reasons,
+        })
+
+    best = max(scored, key=lambda item: item["score"])
+    payload = {"action": "choose_event_option", "index": best["index"]}
+    top_actions = [
+        {
+            "action": f"choose_event_option:index_{item['index']}:{item.get('title')}",
+            "confidence": round(max(item["score"], 0.0) * 20, 2),
+            "marker": f"rule_score={item['score']:+.2f}; {' / '.join(item['reasons']) or '-'}",
+        }
+        for item in sorted(scored, key=lambda item: item["score"], reverse=True)[:6]
+    ]
+    return payload, {
+        "top_actions": top_actions,
+        "chosen_action": f"choose_event_option:index_{best['index']}:{best.get('title')}",
+        "payload": payload,
+        "reason": "event_cost_rule: " + (" / ".join(best["reasons"]) or "highest score"),
     }
 
 
@@ -1439,6 +1788,10 @@ def choose_macro_action(macro_agent, state, allow_shop=False, card_baseline_weig
         return choose_map_route_action(state)
     if state_type == "card_select":
         return choose_card_select_action(state)
+    if state_type == "event":
+        event_payload, event_info = choose_event_option_rule_action(state)
+        if event_payload:
+            return event_payload, event_info
 
     if not macro_agent:
         if state_type == "card_reward":
