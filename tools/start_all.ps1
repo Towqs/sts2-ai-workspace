@@ -50,6 +50,22 @@ function Test-PythonExe {
     }
 }
 
+function Get-VenvBasePython {
+    $cfg = Join-Path $Root ".venv\pyvenv.cfg"
+    if (-not (Test-Path -LiteralPath $cfg)) {
+        return ""
+    }
+    try {
+        foreach ($line in Get-Content -LiteralPath $cfg -Encoding UTF8) {
+            if ($line -match "^\s*executable\s*=\s*(.+?)\s*$") {
+                return $Matches[1]
+            }
+        }
+    } catch {
+    }
+    return ""
+}
+
 function Resolve-PythonExe {
     $candidates = New-Object System.Collections.Generic.List[string]
 
@@ -57,6 +73,10 @@ function Resolve-PythonExe {
         $candidates.Add($env:STS2_AI_PYTHON)
     }
     $candidates.Add((Join-Path $Root ".venv\Scripts\python.exe"))
+    $venvBase = Get-VenvBasePython
+    if ($venvBase) {
+        $candidates.Add($venvBase)
+    }
     if ($env:USERPROFILE) {
         $candidates.Add((Join-Path $env:USERPROFILE ".cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe"))
     }
@@ -87,6 +107,19 @@ function Resolve-PythonExe {
     }
 
     throw "No runnable Python found. Rebuild .venv or set STS2_AI_PYTHON to a working python.exe."
+}
+
+function Should-UseVenvSitePackages {
+    param([string]$PythonExe)
+    $venvPython = Join-Path $Root ".venv\Scripts\python.exe"
+    $venvBase = Get-VenvBasePython
+    foreach ($candidate in @($venvPython, $venvBase)) {
+        if (-not [string]::IsNullOrWhiteSpace($candidate) -and
+            $PythonExe.Equals($candidate, [StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+        }
+    }
+    return $false
 }
 
 function Start-ConsoleWindow {
@@ -236,13 +269,20 @@ Write-Host "Panel:    $PanelUrl"
 Write-Host ""
 
 $PythonExe = Resolve-PythonExe
+$VenvSitePackages = Join-Path $Root ".venv\Lib\site-packages"
+$UseVenvSitePackages = (Should-UseVenvSitePackages $PythonExe) -and (Test-Path -LiteralPath $VenvSitePackages)
 Write-Host "Python:   $PythonExe"
+if ($UseVenvSitePackages) {
+    Write-Host "Packages: $VenvSitePackages"
+}
 Write-Host ""
 
 $rootQ = Quote-PSLiteral $Root
 $pythonQ = Quote-PSLiteral $PythonExe
+$venvSiteQ = Quote-PSLiteral $VenvSitePackages
 $panelQ = Quote-PSLiteral $ControlPanel
 $controlLogQ = Quote-PSLiteral $ControlLog
+$venvPathCommand = if ($UseVenvSitePackages) { "`$env:PYTHONPATH = $venvSiteQ" } else { "" }
 
 if (Test-PanelReady) {
     Write-Host "Control panel is already running."
@@ -252,6 +292,7 @@ Set-Location -LiteralPath $rootQ
 `$env:PYTHONIOENCODING = 'utf-8'
 `$env:PYTHONUTF8 = '1'
 `$env:STS2_AI_PYTHON = $pythonQ
+$venvPathCommand
 & $pythonQ -X utf8 $panelQ 2>&1 | Tee-Object -FilePath $controlLogQ -Append
 "@
     Write-Host "Starting control panel..."

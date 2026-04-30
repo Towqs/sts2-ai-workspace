@@ -798,6 +798,8 @@ def models_status():
     combat_model = combat_dir / "bc_model_best.pth"
     combat_vocab = combat_dir / "vocab.json"
     combat_metadata = read_json(combat_dir / "metadata.json", {})
+    candidate_model = combat_dir / "candidate_bc_model_best.pth"
+    candidate_metadata = read_json(combat_dir / "candidate_metadata.json", {})
     macro_model = macro_dir / "macro_bc_model_best.pth"
     macro_vocab = macro_dir / "vocab.json"
     macro_summary = read_json(macro_dir / "training_summary.json", {})
@@ -808,6 +810,11 @@ def models_status():
             "model": file_status(combat_model),
             "vocab": file_status(combat_vocab),
             "metadata": combat_metadata,
+        },
+        "candidate": {
+            "ready": candidate_model.exists(),
+            "model": file_status(candidate_model),
+            "metadata": candidate_metadata,
         },
         "macro": {
             "ready": macro_model.exists() and macro_vocab.exists(),
@@ -2982,16 +2989,19 @@ function renderCurrentData(data) {
 }
 function renderModelHealth(models, aiProcess, control, runtime, monsterProfiles) {
   const combat = models.combat || {};
+  const candidate = models.candidate || {};
   const macro = models.macro || {};
   const monster = monsterProfiles || {};
   const monsterSummary = monster.summary || {};
   const combatMeta = combat.metadata || {};
+  const candidateMeta = candidate.metadata || {};
   const macroSummary = macro.summary || {};
   const macroMeta = macro.metadata || {};
   const ready = !!combat.ready && !!macro.ready;
   const needsRestart = !!aiProcess.needs_restart;
   const warnings = [];
   if (!combat.ready) warnings.push("战斗 BC 模型缺失，需要重训。");
+  if (!candidate.ready) warnings.push("候选动作评分模型缺失：AI 会回退到旧战斗 BC。");
   if (!macro.ready) warnings.push("宏观 BC 模型缺失，需要先训练宏观模型。");
   if (needsRestart) warnings.push("AI 进程早于当前 ai_agent.py，必须重启 AI 后宏观执行才会生效。");
   if (runtime && runtime.agent_ready === false) warnings.push(`当前 Python 缺少 AI 依赖：${(runtime.missing || []).join(", ")}。网页能开，但启动 AI / 重训会失败。`);
@@ -3008,6 +3018,7 @@ function renderModelHealth(models, aiProcess, control, runtime, monsterProfiles)
 
   document.getElementById("modelHealth").innerHTML = `
     <div class="kv"><span>战斗模型</span><span><span class="pill ${combat.ready ? "on" : "off"}">${combat.ready ? "可用" : "缺失"}</span> 样本 ${combatMeta.samples || "-"}，特征 ${combatMeta.features || "旧版"} ${combat.model && combat.model.mtime ? combat.model.mtime : ""}</span></div>
+    <div class="kv"><span>候选动作模型</span><span><span class="pill ${candidate.ready ? "on" : "warn"}">${candidate.ready ? "线上优先" : "回退旧 BC"}</span> 行 ${candidateMeta.samples || 0}，正例 ${candidateMeta.positives || 0}，组 ${candidateMeta.groups || 0}，Top1 ${candidateMeta.best_group_top1 ? Number(candidateMeta.best_group_top1).toFixed(1) + "%" : "-"}</span></div>
     <div class="kv"><span>宏观模型</span><span><span class="pill ${macro.ready ? "on" : "off"}">${macro.ready ? "可用" : "缺失"}</span> 样本 ${macroSummary.samples || macroMeta.samples || 0}，动作 ${macroSummary.actions || macroMeta.classes || 0}</span></div>
     <div class="kv"><span>怪物画像</span><span><span class="pill ${monster.ready ? "on" : "warn"}">${monster.ready ? "可用" : "待生成"}</span> 怪物 ${monsterSummary.monsters || 0}，战斗 ${monsterSummary.encounters || 0}，回合样本 ${monsterSummary.monster_turn_rows || 0}</span></div>
     <div class="kv"><span>Python</span><span><span class="pill ${runtime && runtime.agent_ready ? "on" : "warn"}">${runtime && runtime.agent_ready ? "依赖可用" : "缺依赖"}</span> ${escapeHtml((runtime && runtime.executable) || "-")} ${runtime && runtime.version ? `(${runtime.version})` : ""}</span></div>

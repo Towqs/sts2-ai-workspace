@@ -9,8 +9,14 @@ import torch.nn as nn
 import numpy as np
 from colorama import init, Fore, Style
 
-from combat_actions import choose_candidate_for_card, enumerate_combat_actions, public_candidate_catalog
+from combat_actions import (
+    CANDIDATE_FEATURE_DIM,
+    choose_candidate_for_card,
+    enumerate_combat_actions,
+    public_candidate_catalog,
+)
 from data_pipeline import StateEncoder
+from train_candidate_bc import CandidateBCScorer
 from macro_data_pipeline import Vocab as MacroVocab, encode_record as encode_macro_record
 from train_macro_bc import MacroBCModel
 
@@ -78,12 +84,101 @@ def load_agent(processed_dir):
     return encoded, id_to_action, model, device, metadata
 
 
+def load_candidate_agent(processed_dir):
+    model_path = os.path.join(processed_dir, "candidate_bc_model_best.pth")
+    metadata_path = os.path.join(processed_dir, "candidate_metadata.json")
+    if not os.path.exists(model_path):
+        print(Fore.YELLOW + "[Candidate] Candidate scorer not found. Falling back to legacy combat BC.")
+        return None
+
+    metadata = {}
+    try:
+        with open(metadata_path, "r", encoding="utf-8") as f:
+            metadata = json.load(f)
+    except Exception:
+        pass
+
+    try:
+        state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
+        weight_input_dim = int(state_dict.get("net.0.weight").shape[1])
+        input_dim = int(metadata.get("features") or weight_input_dim)
+        if input_dim != weight_input_dim:
+            input_dim = weight_input_dim
+        if input_dim <= CANDIDATE_FEATURE_DIM:
+            raise ValueError(f"candidate input dim too small: {input_dim}")
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = CandidateBCScorer(input_dim).to(device)
+        model.load_state_dict(state_dict)
+        model.eval()
+        metadata["model_version"] = metadata.get("model_version") or build_model_version("candidate_bc", metadata_path, metadata)
+        print(Fore.CYAN + f"[*] Candidate Scorer Loaded! Features: {input_dim} | Device: {device}")
+        return {
+            "model": model,
+            "device": device,
+            "input_dim": input_dim,
+            "state_dim": input_dim - CANDIDATE_FEATURE_DIM,
+            "metadata": metadata,
+            "model_version": metadata["model_version"],
+        }
+    except Exception as exc:
+        print(Fore.YELLOW + f"[Candidate] Candidate scorer failed to load: {exc}. Falling back to legacy combat BC.")
+        return None
+
+
 def align_feature_vector(vector, expected_dim):
     if len(vector) == expected_dim:
         return vector
     if len(vector) > expected_dim:
         return vector[:expected_dim]
     return np.pad(vector, (0, expected_dim - len(vector)), mode="constant")
+
+
+def score_combat_candidates(candidate_agent, state_vec, candidates):
+    if not candidate_agent or not candidates:
+        return None, [], "candidate_model_unavailable"
+    model = candidate_agent["model"]
+    device = candidate_agent["device"]
+    state_part = align_feature_vector(state_vec, int(candidate_agent["state_dim"]))
+    rows = []
+    for candidate in candidates:
+        rows.append(np.concatenate([
+            state_part,
+            np.array(candidate.features, dtype=np.float32),
+        ]))
+    if not rows:
+        return None, [], "no_candidates"
+    x = torch.tensor(np.asarray(rows, dtype=np.float32), dtype=torch.float32).to(device)
+    with torch.no_grad():
+        logits = model(x)
+        probs = torch.sigmoid(logits).detach().cpu().numpy()
+    ranked = sorted(
+        [
+            {"candidate": candidate, "score": float(logit), "confidence": float(prob)}
+            for candidate, logit, prob in zip(candidates, logits.detach().cpu().numpy(), probs)
+        ],
+        key=lambda item: item["score"],
+        reverse=True,
+    )
+    playable_exists = any(item["candidate"].kind == "play_card" for item in ranked)
+    for item in ranked:
+        candidate = item["candidate"]
+        if candidate.kind == "end_turn" and playable_exists:
+            continue
+        return item, ranked, "candidate_scorer"
+    return (ranked[0] if ranked else None), ranked, "candidate_scorer_all_end_turn"
+
+
+def candidate_top_actions(ranked, limit=5):
+    top_actions = []
+    for item in ranked[:limit]:
+        candidate = item["candidate"]
+        top_actions.append({
+            "action": candidate.label,
+            "confidence": round(item["confidence"] * 100.0, 2),
+            "marker": candidate.kind,
+        })
+    return top_actions
 
 
 def load_macro_agent(processed_dir):
@@ -768,9 +863,12 @@ def run_agent():
     processed_dir = os.path.join(os.path.dirname(__file__), "ProcessedParams")
     macro_processed_dir = os.path.join(os.path.dirname(__file__), "ProcessedMacroParams")
     encoder, id_to_action, model, device, combat_metadata = load_agent(processed_dir)
+    candidate_agent = load_candidate_agent(processed_dir)
     macro_agent = load_macro_agent(macro_processed_dir)
     combat_policy_name = "bc_combat"
     combat_model_version = combat_metadata.get("model_version", "")
+    candidate_policy_name = "candidate_bc_combat"
+    candidate_model_version = (candidate_agent or {}).get("model_version", "")
     macro_policy_name = "macro_mixed"
     macro_model_version = (macro_agent or {}).get("model_version", "rules")
     session_id = f"ai_{datetime.now():%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:8]}"
@@ -932,8 +1030,62 @@ def run_agent():
                     print(f"    {act:25s}  {conf:5.1f}%{marker}")
                     top_actions.append({"action": act, "confidence": round(conf, 2), "marker": marker.replace("\x1b[32m", "").replace("\x1b[33m", "").replace("\x1b[31m", "")})
                     top_printed += 1
+
+            legacy_top_actions = list(top_actions)
+            candidate_decision, ranked_candidates, decision_source = score_combat_candidates(candidate_agent, state_vec, legal_candidates)
             
             # === 选择最佳合法动作 ===
+            if candidate_decision:
+                chosen_candidate = candidate_decision["candidate"]
+                chosen_action = chosen_candidate.kind
+                chosen_candidate_label = chosen_candidate.label
+                top_actions = candidate_top_actions(ranked_candidates)
+                active_policy_name = candidate_policy_name
+                active_model_version = candidate_model_version
+                print(Fore.CYAN + "  [Candidate] Top 5 candidate scores:")
+                for item in top_actions:
+                    print(f"    {item['action'][:58]:58s}  {item['confidence']:5.1f}% [{item['marker']}]")
+                print(Fore.GREEN + Style.BRIGHT + f"  >>> EXECUTE: {chosen_candidate_label}")
+                payload = payload_with_policy(chosen_candidate.payload, active_policy_name, active_model_version)
+                write_ai_logic_snapshot({
+                    "timestamp": int(time.time() * 1000),
+                    "session_id": session_id,
+                    "state_type": state_type,
+                    "policy_name": active_policy_name,
+                    "model_version": active_model_version,
+                    "fallback_policy_name": combat_policy_name,
+                    "fallback_model_version": combat_model_version,
+                    "decision_source": decision_source,
+                    "hp": hp,
+                    "block": block,
+                    "energy": energy,
+                    "hand": available_card_ids,
+                    "playable": playable_card_ids,
+                    "enemies": [{"id": get_enemy_target_id(e), "name": e.get("name"), "hp": get_enemy_hp(e)} for e in alive_enemies],
+                    "top_actions": top_actions,
+                    "legacy_top_actions": legacy_top_actions,
+                    "candidate_actions": legal_candidate_catalog,
+                    "chosen_action": chosen_action,
+                    "chosen_candidate": chosen_candidate_label,
+                    "payload": payload,
+                    "reason": "candidate scorer chose the highest scoring legal action; end_turn is skipped while playable cards exist",
+                })
+                if payload:
+                    print(Fore.WHITE + f"  Sending: {json.dumps(payload)}")
+                    if last_data_source != "ai":
+                        set_data_source("ai")
+                        last_data_source = "ai"
+                    success = send_action(payload)
+                    state_after = fetch_game_state()
+                    append_ai_action_log(session_id, payload, state, state_after, success, active_policy_name, active_model_version)
+                    if success:
+                        time.sleep(1.5)
+                    else:
+                        time.sleep(0.5)
+                else:
+                    print(Fore.RED + "  [Bug] Candidate scorer returned empty payload")
+                continue
+
             chosen_card = choose_card_to_play(sorted_indices, id_to_action, hand_cards, energy)
 
             if chosen_card:
