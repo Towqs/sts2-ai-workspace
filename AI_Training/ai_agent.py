@@ -36,6 +36,8 @@ DEFAULT_CONTROL = {
     "macro_card_reward_weight": 0.35,
     "record_ai_actions": True,
     "include_ai_in_training": False,
+    "game_speed_enabled": False,
+    "game_speed_multiplier": 2.0,
     "ai_min_training_quality": "partial_act1",
     "ai_accept_failed_after_act1": True,
     "ai_require_no_invalid_actions": True,
@@ -2218,6 +2220,20 @@ def load_control():
     return control
 
 
+def control_speed_multiplier(control):
+    if not control.get("game_speed_enabled", False):
+        return 1.0
+    try:
+        return max(1.0, min(float(control.get("game_speed_multiplier", 2.0)), 6.0))
+    except (TypeError, ValueError):
+        return 2.0
+
+
+def agent_sleep(seconds, control=None):
+    multiplier = control_speed_multiplier(control or load_control())
+    time.sleep(max(0.05, float(seconds) / multiplier))
+
+
 def payload_with_policy(payload, policy_name, model_version):
     if not payload:
         return payload
@@ -2312,7 +2328,7 @@ def run_agent():
     last_macro_decision_key = None
 
     while True:
-        time.sleep(0.8)
+        agent_sleep(0.8)
         
         state = fetch_game_state()
         if not state:
@@ -2363,7 +2379,7 @@ def run_agent():
                 if last_data_source != "human":
                     set_data_source("human")
                     last_data_source = "human"
-                time.sleep(4.0)
+                agent_sleep(4.0, control)
                 continue
 
             if control.get("macro_enabled", False) and state_type in ("map", "rewards", "card_reward", "card_select", "event", "rest_site", "shop", "fake_merchant", "treasure"):
@@ -2405,10 +2421,10 @@ def run_agent():
                     if not success and last_data_source != "human":
                         set_data_source("human")
                         last_data_source = "human"
-                    time.sleep(1.5)
+                    agent_sleep(1.5, control)
                     continue
                 if state_type in ("shop", "fake_merchant") and not allow_shop:
-                    time.sleep(4.0)
+                    agent_sleep(4.0, control)
                     continue
 
             if state_type not in ("monster", "elite", "boss") and last_data_source != "human":
@@ -2517,9 +2533,9 @@ def run_agent():
                     state_after = fetch_game_state()
                     append_ai_action_log(session_id, payload, state, state_after, success, active_policy_name, active_model_version)
                     if success:
-                        time.sleep(1.5)
+                        agent_sleep(1.5, control)
                     else:
-                        time.sleep(0.5)
+                        agent_sleep(0.5, control)
                 else:
                     print(Fore.RED + "  [Bug] Candidate scorer returned empty payload")
                 continue
@@ -2562,9 +2578,9 @@ def run_agent():
                     state_after = fetch_game_state()
                     append_ai_action_log(session_id, payload, state, state_after, success, combat_policy_name, combat_model_version)
                     if success:
-                        time.sleep(1.5)  # 等动画播完
+                        agent_sleep(1.5, control)  # 等动画播完
                     else:
-                        time.sleep(0.5)  # 失败了也稍微等一下再重试
+                        agent_sleep(0.5, control)  # 失败了也稍微等一下再重试
                 else:
                     print(Fore.RED + "  [Bug] Could not build payload")
             else:
@@ -2597,7 +2613,7 @@ def run_agent():
                 success = send_action(payload)
                 state_after = fetch_game_state()
                 append_ai_action_log(session_id, payload, state, state_after, success, combat_policy_name, combat_model_version)
-                time.sleep(1.5)
+                agent_sleep(1.5, control)
                         
 if __name__ == "__main__":
     run_agent()

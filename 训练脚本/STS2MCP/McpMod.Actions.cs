@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using System.Linq;
 using System.Text.Json;
+using Godot;
 using MegaCrit.Sts2.Core.Nodes.Cards;
 using MegaCrit.Sts2.Core.Nodes.Cards.Holders;
 using MegaCrit.Sts2.Core.Nodes.CommonUi;
@@ -47,6 +48,9 @@ public static partial class McpMod
 
     private static Dictionary<string, object?> ExecuteAction(string action, Dictionary<string, JsonElement> data)
     {
+        if (action == "set_game_speed")
+            return ExecuteSetGameSpeed(data);
+
         if (!RunManager.Instance.IsInProgress)
             return Error("No run in progress");
 
@@ -89,6 +93,47 @@ public static partial class McpMod
             "crystal_sphere_click_cell" => ExecuteCrystalSphereClickCell(data),
             "crystal_sphere_proceed" => ExecuteCrystalSphereProceed(),
             _ => Error($"Unknown action: {action}")
+        };
+    }
+
+    private static double OptionalDouble(Dictionary<string, JsonElement> data, string key, double fallback)
+    {
+        if (!data.TryGetValue(key, out var elem) || elem.ValueKind == JsonValueKind.Null)
+            return fallback;
+        if (elem.ValueKind == JsonValueKind.Number && elem.TryGetDouble(out var number))
+            return number;
+        if (elem.ValueKind == JsonValueKind.String && double.TryParse(elem.GetString(), out number))
+            return number;
+        return fallback;
+    }
+
+    private static bool OptionalBool(Dictionary<string, JsonElement> data, string key, bool fallback)
+    {
+        if (!data.TryGetValue(key, out var elem) || elem.ValueKind == JsonValueKind.Null)
+            return fallback;
+        if (elem.ValueKind == JsonValueKind.True) return true;
+        if (elem.ValueKind == JsonValueKind.False) return false;
+        if (elem.ValueKind == JsonValueKind.String && bool.TryParse(elem.GetString(), out var parsed))
+            return parsed;
+        return fallback;
+    }
+
+    private static Dictionary<string, object?> ExecuteSetGameSpeed(Dictionary<string, JsonElement> data)
+    {
+        var enabled = OptionalBool(data, "enabled", true);
+        var requestedSpeed = OptionalDouble(data, "speed", OptionalDouble(data, "multiplier", 2.0));
+        var speed = enabled ? requestedSpeed : 1.0;
+        if (speed < 1.0) speed = 1.0;
+        if (speed > 6.0) speed = 6.0;
+
+        Engine.TimeScale = speed;
+
+        return new Dictionary<string, object?>
+        {
+            ["status"] = "ok",
+            ["enabled"] = enabled,
+            ["speed"] = speed,
+            ["message"] = enabled ? $"Game speed set to {speed:0.##}x" : "Game speed restored to 1x"
         };
     }
 

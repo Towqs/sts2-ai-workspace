@@ -100,6 +100,8 @@ DEFAULT_CONTROL = {
     "macro_card_reward_weight": 0.35,
     "record_ai_actions": True,
     "include_ai_in_training": False,
+    "game_speed_enabled": False,
+    "game_speed_multiplier": 2.0,
     "ai_min_training_quality": "partial_act1",
     "ai_accept_failed_after_act1": True,
     "ai_require_no_invalid_actions": True,
@@ -160,6 +162,13 @@ def read_control():
     return data
 
 
+def clamp_game_speed_multiplier(value):
+    try:
+        return max(1.0, min(float(value), 6.0))
+    except (TypeError, ValueError):
+        return DEFAULT_CONTROL["game_speed_multiplier"]
+
+
 def update_control(patch):
     data = read_control()
     for key in DEFAULT_CONTROL:
@@ -177,6 +186,8 @@ def update_control(patch):
                     data[key] = max(0.0, min(float(patch[key]), 2.0))
                 except (TypeError, ValueError):
                     data[key] = DEFAULT_CONTROL[key]
+            elif key == "game_speed_multiplier":
+                data[key] = clamp_game_speed_multiplier(patch[key])
             elif key == "collection_enabled":
                 enabled = bool(patch[key])
                 was_enabled = bool(data.get("collection_enabled", True))
@@ -536,6 +547,36 @@ def post_game_action(payload):
     )
     with urlopen(req, timeout=2) as resp:
         return json.loads(resp.read().decode("utf-8"))
+
+
+def apply_game_speed(body=None):
+    control = read_control()
+    enabled = bool(control.get("game_speed_enabled", False))
+    multiplier = clamp_game_speed_multiplier(control.get("game_speed_multiplier", 2.0))
+
+    if isinstance(body, dict):
+        if "enabled" in body:
+            enabled = bool(body.get("enabled"))
+        if "multiplier" in body:
+            multiplier = clamp_game_speed_multiplier(body.get("multiplier"))
+        elif "speed" in body:
+            multiplier = clamp_game_speed_multiplier(body.get("speed"))
+
+    speed = multiplier if enabled else 1.0
+    try:
+        result = post_game_action({"action": "set_game_speed", "enabled": enabled, "speed": speed})
+        if isinstance(result, dict):
+            result["configured_enabled"] = enabled
+            result["configured_multiplier"] = multiplier
+        return result
+    except Exception as exc:
+        return {
+            "status": "error",
+            "error": str(exc),
+            "configured_enabled": enabled,
+            "configured_multiplier": multiplier,
+            "speed": speed,
+        }
 
 
 def get_game_state():
@@ -2596,6 +2637,21 @@ INDEX_HTML = r"""<!doctype html>
           <div><div class="switch-title">AI 数据进入 BC</div><div class="switch-note">默认关闭，避免自举污染</div></div>
           <input id="include_ai_in_training" type="checkbox" onchange="saveControl()">
         </div>
+        <div class="switch">
+          <div><div class="switch-title">测试加速</div><div class="switch-note">加快游戏时间，并缩短 AI 固定等待；出异常先关掉</div></div>
+          <input id="game_speed_enabled" type="checkbox" onchange="saveControl(true)">
+        </div>
+        <div class="field">
+          <span>加速倍率</span>
+          <select id="game_speed_multiplier" onchange="saveControl(true)">
+            <option value="1.5">1.5x：稳妥</option>
+            <option value="2">2x：推荐测试</option>
+            <option value="3">3x：快速跑图</option>
+            <option value="4">4x：高风险</option>
+            <option value="6">6x：只做极限测试</option>
+          </select>
+        </div>
+        <div id="speedDetail" class="fine" style="margin-top:8px">正常速度</div>
           </div>
         </details>
       </section>
@@ -3224,6 +3280,7 @@ let lastDropTargetId = "";
 let lastDropPlaceAfter = false;
 let resizingModuleId = "";
 let resizeState = null;
+let lastSpeedControlKey = "";
 function saveModuleState() {
   localStorage.setItem(MODULE_STORAGE_KEY, JSON.stringify(moduleState));
 }
@@ -3873,6 +3930,8 @@ function renderStatus(s) {
   document.getElementById("collection_enabled").checked = !!s.control.collection_enabled;
   document.getElementById("record_ai_actions").checked = !!s.control.record_ai_actions;
   document.getElementById("include_ai_in_training").checked = !!s.control.include_ai_in_training;
+  document.getElementById("game_speed_enabled").checked = !!s.control.game_speed_enabled;
+  document.getElementById("game_speed_multiplier").value = String(s.control.game_speed_multiplier || 2);
   document.getElementById("min_training_quality").value = s.control.min_training_quality || "unknown";
   const llmCfg = (s.llm && s.llm.config) || {};
   if (!isLLMFormEditing()) {
@@ -3885,7 +3944,13 @@ function renderStatus(s) {
   document.getElementById("gameDetail").textContent = phase.detail;
   document.getElementById("aiStatus").textContent = s.control.ai_enabled ? (s.control.macro_enabled ? "战斗+宏观" : "只管战斗") : "手动模式";
   document.getElementById("aiStatus").className = `status-main ${s.control.ai_enabled ? "on" : "warn"}`;
-  document.getElementById("aiDetail").textContent = s.ai_pid ? `托管进程 PID ${s.ai_pid}；宏观 ${s.control.macro_enabled ? "开启" : "关闭"}；商店 ${s.control.macro_shop_enabled ? "允许" : "保护"}` : "AI 进程未由控制台托管";
+  const speedLabel = s.control.game_speed_enabled ? `${s.control.game_speed_multiplier || 2}x` : "1x";
+  lastSpeedControlKey = `${!!s.control.game_speed_enabled}:${Number(s.control.game_speed_multiplier || 2)}`;
+  document.getElementById("aiDetail").textContent = s.ai_pid ? `托管进程 PID ${s.ai_pid}；宏观 ${s.control.macro_enabled ? "开启" : "关闭"}；商店 ${s.control.macro_shop_enabled ? "允许" : "保护"}；速度 ${speedLabel}` : `AI 进程未由控制台托管；速度 ${speedLabel}`;
+  const speedDetail = document.getElementById("speedDetail");
+  if (speedDetail) speedDetail.textContent = s.control.game_speed_enabled
+    ? `已配置 ${speedLabel}：游戏时间加速，AI 等待同步缩短`
+    : "正常速度：游戏 1x，AI 使用标准等待";
   document.getElementById("collectStatus").textContent = s.control.collection_enabled ? "采集中" : "已暂停";
   document.getElementById("collectStatus").className = `status-main ${s.control.collection_enabled ? "on" : "off"}`;
   document.getElementById("collectDetail").textContent = s.control.collection_enabled
@@ -4282,7 +4347,25 @@ function renderLLMProfiles(profiles, activeId) {
     </tr>`).join("");
   document.getElementById("llmProfiles").innerHTML = rows || "<tr><td colspan=5>暂无保存的 API 配置</td></tr>";
 }
-async function saveControl() {
+async function applyGameSpeed() {
+  const enabled = document.getElementById("game_speed_enabled").checked;
+  const multiplier = Number(document.getElementById("game_speed_multiplier").value || 2);
+  const speedDetail = document.getElementById("speedDetail");
+  const result = await api("/api/game-speed", {enabled, multiplier});
+  if (speedDetail) {
+    if (result.status === "ok") {
+      speedDetail.textContent = enabled ? `已应用 ${multiplier}x：游戏时间加速，AI 等待同步缩短` : "已恢复正常速度";
+    } else {
+      speedDetail.textContent = `加速配置已保存，但游戏暂未应用：${result.error || result.message || "游戏 API 离线"}`;
+    }
+  }
+  return result;
+}
+function currentSpeedControlKey() {
+  return `${document.getElementById("game_speed_enabled").checked}:${Number(document.getElementById("game_speed_multiplier").value || 2)}`;
+}
+async function saveControl(applySpeed = false) {
+  const nextSpeedKey = currentSpeedControlKey();
   await api("/api/control", {
     ai_enabled: document.getElementById("ai_enabled").checked,
     macro_enabled: document.getElementById("macro_enabled").checked,
@@ -4290,8 +4373,14 @@ async function saveControl() {
     collection_enabled: document.getElementById("collection_enabled").checked,
     record_ai_actions: document.getElementById("record_ai_actions").checked,
     include_ai_in_training: document.getElementById("include_ai_in_training").checked,
+    game_speed_enabled: document.getElementById("game_speed_enabled").checked,
+    game_speed_multiplier: Number(document.getElementById("game_speed_multiplier").value || 2),
     min_training_quality: document.getElementById("min_training_quality").value
   });
+  if (applySpeed || nextSpeedKey !== lastSpeedControlKey) {
+    await applyGameSpeed();
+    lastSpeedControlKey = nextSpeedKey;
+  }
   refresh();
 }
 async function saveLLMConfig() {
@@ -4508,6 +4597,8 @@ class Handler(BaseHTTPRequestHandler):
             body = self._body()
             if self.path == "/api/control":
                 self._json(200, {"control": update_control(body)})
+            elif self.path == "/api/game-speed":
+                self._json(200, apply_game_speed(body))
             elif self.path == "/api/llm/config":
                 self._json(200, {"config": update_llm_config(body)})
             elif self.path == "/api/llm/profile/use":
