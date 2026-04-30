@@ -191,6 +191,8 @@ AI_Training/ModelZoo/demo_local_20260430/
 
 最需要的贡献仍然是高质量真实数据。推荐通过控制台点击“一键打包数据库”，把 `Data_Packages/` 下生成的 zip 发给维护者，或在 GitHub Issue 中提供下载链接。
 
+如果不方便走 GitHub，也可以通过 QQ 联系维护者：`2775089081`。
+
 提交数据时请说明：
 
 ```text
