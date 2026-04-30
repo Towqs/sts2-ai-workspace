@@ -760,6 +760,105 @@ def choose_card_reward_baseline_action(state, card_baseline_weight=1.0):
     }
 
 
+def tactical_card_select_score(card):
+    traits = card_traits(card)
+    text = card_blob(card)
+    score = 0.0
+    reasons = []
+
+    if traits["is_attack"]:
+        score += 2.0
+        reasons.append("攻击牌")
+    if "vulnerable" in text or "易伤" in text:
+        score += 1.2
+        reasons.append("易伤")
+    if traits["block"]:
+        score += 0.8
+        reasons.append("格挡")
+    if traits["draw"]:
+        score += 1.0
+        reasons.append("过牌")
+    if traits["scaling"] or traits["is_power"]:
+        score += 1.0
+        reasons.append("成长")
+    if "energy" in text or "能量" in text:
+        score += 0.6
+        reasons.append("能量")
+    if "exhaust" in text or "消耗" in text:
+        score -= 0.4
+        reasons.append("消耗")
+    if "basic" in traits["rarity"]:
+        score -= 0.2
+    if "rare" in traits["rarity"]:
+        score += 0.4
+    score -= max(traits["cost"] - 2.0, 0.0) * 0.35
+    return round(score, 3), reasons[:3]
+
+
+def choose_card_select_action(state):
+    screen = state.get("card_select") or {}
+    prompt = str(screen.get("prompt") or "").lower()
+
+    if screen.get("can_confirm"):
+        return {"action": "confirm_selection"}, {
+            "top_actions": [{"action": "confirm_selection", "confidence": 100.0, "marker": "selection_ready"}],
+            "chosen_action": "confirm_selection",
+            "payload": {"action": "confirm_selection"},
+            "reason": "card_select_confirm_ready",
+        }
+
+    cards = screen.get("cards") or []
+    if not cards:
+        if screen.get("can_cancel"):
+            return {"action": "cancel_selection"}, {
+                "top_actions": [{"action": "cancel_selection", "confidence": 100.0, "marker": "no_cards"}],
+                "chosen_action": "cancel_selection",
+                "payload": {"action": "cancel_selection"},
+                "reason": "card_select_no_cards",
+            }
+        return None, {
+            "top_actions": [],
+            "chosen_action": None,
+            "payload": None,
+            "reason": "card_select_no_cards",
+        }
+
+    invert = any(token in prompt for token in ("discard", "丢弃", "exhaust", "消耗", "remove", "移除"))
+    topdeck = any(token in prompt for token in ("draw pile", "抽牌堆顶", "抽牌堆顶部", "牌堆顶"))
+    scored = []
+    for fallback_index, card in enumerate(cards):
+        score, reasons = tactical_card_select_score(card)
+        if invert:
+            score = -score
+            reasons = ["选择低价值牌"] + reasons[:2]
+        elif topdeck:
+            reasons = ["放到抽牌堆顶"] + reasons[:2]
+        scored.append({
+            "index": safe_int(card.get("index"), fallback_index),
+            "id": card.get("id"),
+            "name": card.get("name"),
+            "score": round(score, 3),
+            "reasons": reasons,
+        })
+
+    best = max(scored, key=lambda item: item["score"])
+    payload = {"action": "select_card", "index": best["index"]}
+    top_actions = [
+        {
+            "action": f"select_card:index_{item['index']}:{item.get('id') or item.get('name')}",
+            "confidence": round(max(item["score"], 0.0) * 20, 2),
+            "marker": f"score={item['score']:+.2f}; {' / '.join(item['reasons']) or '-'}",
+        }
+        for item in sorted(scored, key=lambda item: item["score"], reverse=True)[:6]
+    ]
+    return payload, {
+        "top_actions": top_actions,
+        "chosen_action": f"select_card:index_{best['index']}:{best.get('id') or best.get('name')}",
+        "payload": payload,
+        "reason": "card_select: " + (" / ".join(best["reasons"]) or "highest score"),
+    }
+
+
 def choose_card_reward_mixed_action(macro_agent, state, outputs, probs, card_baseline_weight):
     baseline_entries, profile = card_reward_baseline_entries(state)
     baseline_by_label = {entry["label"]: entry for entry in baseline_entries}
@@ -941,6 +1040,17 @@ def macro_state_signature(state):
             (c.get("index"), c.get("id"), c.get("name"))
             for c in ((state.get("card_reward") or {}).get("cards") or [])
         ]
+        payload["can_skip"] = (state.get("card_reward") or {}).get("can_skip")
+    elif state_type == "card_select":
+        card_select = state.get("card_select") or {}
+        payload["screen_type"] = card_select.get("screen_type")
+        payload["prompt"] = card_select.get("prompt")
+        payload["can_confirm"] = card_select.get("can_confirm")
+        payload["can_cancel"] = card_select.get("can_cancel")
+        payload["cards"] = [
+            (c.get("index"), c.get("id"), c.get("name"))
+            for c in (card_select.get("cards") or [])
+        ]
     elif state_type == "event":
         payload["options"] = [
             (o.get("index"), o.get("title"), o.get("is_locked"), o.get("is_proceed"), o.get("was_chosen"))
@@ -965,6 +1075,8 @@ def choose_macro_action(macro_agent, state, allow_shop=False, card_baseline_weig
     state_type = str(state.get("state_type") or "").lower()
     if state_type == "map":
         return choose_map_route_action(state)
+    if state_type == "card_select":
+        return choose_card_select_action(state)
 
     if not macro_agent:
         if state_type == "card_reward":
@@ -1302,7 +1414,7 @@ def run_agent():
                 time.sleep(4.0)
                 continue
 
-            if control.get("macro_enabled", False) and state_type in ("map", "rewards", "card_reward", "event", "rest_site", "shop", "fake_merchant", "treasure"):
+            if control.get("macro_enabled", False) and state_type in ("map", "rewards", "card_reward", "card_select", "event", "rest_site", "shop", "fake_merchant", "treasure"):
                 allow_shop = bool(control.get("macro_shop_enabled", False))
                 card_baseline_weight = safe_num(control.get("macro_card_reward_weight"), 0.35)
                 payload, macro_info = choose_macro_action(
