@@ -242,6 +242,136 @@ def potion_for_candidate(candidate, state):
     return {}
 
 
+def card_effect_profile(card):
+    text = combat_text(card)
+    card_id = str(card.get("id") or "").upper()
+    card_type = str(card.get("type") or "").lower()
+    damage = combat_number_hint(card, "attack")
+    block_gain = combat_number_hint(card, "block")
+    self_damage = card_self_damage(card)
+    status_like_ids = {
+        "SLIMED",
+        "WOUND",
+        "DAZED",
+        "BURN",
+        "VOID",
+        "PARASITE",
+    }
+    status_like = (
+        card_id in status_like_ids
+        or "status" in card_type
+        or "状态" in card_type
+        or "黏液" in text
+    )
+    utility_terms = (
+        "draw", "抽", "vulnerable", "易伤", "weak", "虚弱", "strength", "力量",
+        "dexterity", "敏捷", "energy", "能量", "exhaust", "消耗", "upgrade", "升级",
+        "apply", "给予",
+    )
+    return {
+        "text": text,
+        "card_id": card_id,
+        "card_type": card_type,
+        "damage": damage,
+        "block_gain": block_gain,
+        "self_damage": self_damage,
+        "status_like": status_like,
+        "has_utility": any(term in text for term in utility_terms),
+    }
+
+
+def potion_damage_hint(potion):
+    text = combat_text(potion)
+    if not any(k in text for k in ("damage", "伤害", "fire", "火焰", "attack", "攻击")):
+        return 0
+    nums = combat_numbers(text)
+    if not nums:
+        return 0
+    return max(nums)
+
+
+def potion_tactical_profile(candidate, state):
+    potion = potion_for_candidate(candidate, state)
+    text = combat_text(potion)
+    player = (state or {}).get("player") or {}
+    battle = (state or {}).get("battle") or {}
+    enemies = battle.get("enemies") or []
+    hp = safe_num(player.get("hp"), 0.0)
+    max_hp = max(safe_num(player.get("max_hp"), 1.0), 1.0)
+    hp_ratio = hp / max_hp
+    incoming = enemy_incoming_damage(enemies)
+    block = safe_num(player.get("block"), 0.0)
+    net_incoming = max(0.0, incoming - block)
+    round_no = safe_int(battle.get("round"), 0)
+    damage = potion_damage_hint(potion)
+    defensive = any(k in text for k in ("block", "格挡", "weak", "虚弱"))
+    scaling = any(k in text for k in ("dexterity", "敏捷", "strength", "力量"))
+    lethal = bool(damage > 0 and candidate.target_effective_hp and damage >= candidate.target_effective_hp)
+    urgent = hp_ratio <= 0.40 or net_incoming >= max(8.0, hp * 0.35)
+    useful = (
+        lethal
+        or (damage > 0 and urgent)
+        or (defensive and incoming > 0 and (urgent or hp_ratio <= 0.55))
+        or (scaling and incoming > 0 and (round_no >= 3 or hp_ratio <= 0.55))
+    )
+    return {
+        "text": text,
+        "damage": damage,
+        "defensive": defensive,
+        "scaling": scaling,
+        "lethal": lethal,
+        "urgent": urgent,
+        "useful": useful,
+        "incoming": incoming,
+        "net_incoming": net_incoming,
+        "hp_ratio": hp_ratio,
+        "round_no": round_no,
+    }
+
+
+def candidate_should_play_before_end_turn(candidate, state):
+    if candidate.kind == "play_card":
+        card = card_for_candidate(candidate, state)
+        profile = card_effect_profile(card)
+        hp = safe_num(((state or {}).get("player") or {}).get("hp"), 0.0)
+        max_hp = max(safe_num(((state or {}).get("player") or {}).get("max_hp"), 1.0), 1.0)
+        hp_ratio = hp / max_hp
+        incoming = enemy_incoming_damage(((state or {}).get("battle") or {}).get("enemies") or [])
+        if profile["self_damage"] > 0 and (hp <= profile["self_damage"] + 1 or hp_ratio <= 0.25):
+            return False
+        if profile["status_like"] and profile["damage"] <= 0 and profile["block_gain"] <= 0:
+            return False
+        if profile["damage"] > 0:
+            return True
+        if profile["block_gain"] > 0 and incoming > 0:
+            return True
+        if "power" in profile["card_type"]:
+            return True
+        return bool(profile["has_utility"] and not profile["status_like"])
+    if candidate.kind == "use_potion":
+        return potion_tactical_profile(candidate, state)["useful"]
+    return False
+
+
+def should_force_delay_end_turn(candidates, state):
+    if not state:
+        return False, ""
+    useful = [candidate for candidate in candidates if candidate_should_play_before_end_turn(candidate, state)]
+    if not useful:
+        return False, ""
+    player = state.get("player") or {}
+    energy = safe_num(player.get("energy"), 0.0)
+    battle = state.get("battle") or {}
+    incoming = enemy_incoming_damage(battle.get("enemies") or [])
+    if incoming > 0:
+        return True, "useful_action_available_under_threat"
+    if any(c.kind == "play_card" for c in useful) and energy > 0:
+        return True, "useful_card_available"
+    if any(c.kind == "use_potion" for c in useful):
+        return True, "useful_potion_available"
+    return False, ""
+
+
 def tactical_candidate_adjustment(candidate, state):
     if not state:
         return 0.0, ""
@@ -259,10 +389,15 @@ def tactical_candidate_adjustment(candidate, state):
 
     if candidate.kind == "play_card":
         card = card_for_candidate(candidate, state)
-        damage = combat_number_hint(card, "attack")
-        block_gain = combat_number_hint(card, "block")
-        self_damage = card_self_damage(card)
-        card_type = str(card.get("type") or "").lower()
+        profile = card_effect_profile(card)
+        damage = profile["damage"]
+        block_gain = profile["block_gain"]
+        self_damage = profile["self_damage"]
+        card_type = profile["card_type"]
+
+        if profile["status_like"] and damage <= 0 and block_gain <= 0:
+            adjustment -= 8.0
+            reasons.append("status_card_penalty")
 
         if self_damage > 0:
             if hp <= self_damage + 1 or hp_ratio <= 0.25:
@@ -272,30 +407,38 @@ def tactical_candidate_adjustment(candidate, state):
 
         if incoming <= 0:
             if damage > 0 or "attack" in card_type:
-                adjustment += 2.0
+                adjustment += 6.0
                 reasons.append("no_incoming_attack")
             if block_gain > 0 and damage <= 0:
-                adjustment -= 6.0
+                adjustment -= 10.0
                 reasons.append("no_incoming_block_penalty")
         else:
             if net_incoming >= max(8.0, hp * 0.35) and block_gain > 0:
-                adjustment += 2.5
+                adjustment += 5.0
                 reasons.append("high_threat_block")
             if hp_ratio <= 0.35 and block_gain > 0:
-                adjustment += 1.0
+                adjustment += 3.0
                 reasons.append("low_hp_block")
 
         if damage > 0 and candidate.target_effective_hp and damage >= candidate.target_effective_hp:
-            adjustment += 4.0
+            adjustment += 8.0
             reasons.append("lethal")
 
     elif candidate.kind == "use_potion":
-        potion = potion_for_candidate(candidate, state)
-        text = combat_text(potion)
-        if hp_ratio <= 0.35 and incoming > 0 and any(k in text for k in ("block", "格挡", "weak", "虚弱")):
-            adjustment += 4.0
+        profile = potion_tactical_profile(candidate, state)
+        if profile["lethal"]:
+            adjustment += 14.0
+            reasons.append("lethal_potion")
+        elif profile["damage"] > 0 and profile["urgent"]:
+            adjustment += 7.0
+            reasons.append("urgent_damage_potion")
+        if hp_ratio <= 0.45 and incoming > 0 and profile["defensive"]:
+            adjustment += 7.0
             reasons.append("low_hp_defensive_potion")
-        if incoming <= 0 and any(k in text for k in ("block", "格挡", "weak", "虚弱")):
+        if profile["scaling"] and incoming > 0 and (profile["round_no"] >= 3 or hp_ratio <= 0.55):
+            adjustment += 4.0
+            reasons.append("scaling_potion_long_fight")
+        if incoming <= 0 and (profile["defensive"] or profile["scaling"]):
             adjustment -= 3.0
             reasons.append("no_incoming_save_potion")
 
@@ -314,6 +457,7 @@ def score_combat_candidates(candidate_agent, state_vec, candidates, state=None):
         return None, [], "candidate_model_unavailable"
     model = candidate_agent["model"]
     device = candidate_agent["device"]
+    force_delay_end_turn, delay_reason = should_force_delay_end_turn(candidates, state)
     state_part = align_feature_vector(state_vec, int(candidate_agent["state_dim"]))
     rows = []
     for candidate in candidates:
@@ -330,6 +474,9 @@ def score_combat_candidates(candidate_agent, state_vec, candidates, state=None):
     ranked = []
     for candidate, logit, prob in zip(candidates, logits.detach().cpu().numpy(), probs):
         adjustment, marker = tactical_candidate_adjustment(candidate, state)
+        if candidate.kind == "end_turn" and force_delay_end_turn:
+            adjustment -= 100.0
+            marker = ",".join(x for x in (marker, delay_reason) if x)
         base_score = float(logit)
         ranked.append({
             "candidate": candidate,
@@ -1095,13 +1242,15 @@ def choose_card_reward_mixed_action(macro_agent, state, outputs, probs, card_bas
     }
 
 
-def route_type_score(node_type, hp_ratio, gold):
+def route_type_score(node_type, hp_ratio, gold, floor=0):
     node_type = str(node_type or "").lower()
     if "boss" in node_type:
         return 0.0
     if "elite" in node_type:
         if hp_ratio < 0.40:
             return -10.0
+        if floor and floor <= 7:
+            return 0.5 if hp_ratio >= 0.70 else -6.0
         if hp_ratio >= 0.70:
             return 5.0
         if hp_ratio >= 0.55:
@@ -1110,7 +1259,11 @@ def route_type_score(node_type, hp_ratio, gold):
     if "rest" in node_type or "camp" in node_type:
         if hp_ratio < 0.35:
             return 10.0
-        return 6.0 if hp_ratio < 0.55 else 1.0
+        if hp_ratio < 0.55:
+            return 7.0
+        if hp_ratio < 0.70:
+            return 4.0
+        return 1.0
     if "shop" in node_type or "merchant" in node_type:
         if hp_ratio < 0.35:
             return 4.0 if gold >= 75 else 1.5
@@ -1123,18 +1276,22 @@ def route_type_score(node_type, hp_ratio, gold):
         return 4.0 if hp_ratio < 0.45 else 2.5
     if "event" in node_type or "unknown" in node_type or "ancient" in node_type or "?" in node_type:
         if hp_ratio < 0.35:
-            return 6.0
+            return 8.0
         if hp_ratio < 0.55:
-            return 3.5
-        return 2.0
+            return 5.5
+        if floor and floor <= 7:
+            return 4.0
+        return 3.0
     if "monster" in node_type:
         if hp_ratio < 0.25:
             return -8.0
         if hp_ratio < 0.35:
             return -5.0
         if hp_ratio < 0.55:
-            return -1.5
-        return 2.0
+            return -3.0
+        if hp_ratio < 0.70:
+            return -1.0
+        return -0.5 if floor and floor <= 7 else 1.0
     return 0.5
 
 
@@ -1167,11 +1324,11 @@ def choose_map_route_action(state):
     scored = []
     for fallback_index, option in enumerate(options):
         node_type = option.get("type")
-        score = route_type_score(node_type, hp_ratio, gold)
+        score = route_type_score(node_type, hp_ratio, gold, floor)
         leads = option.get("leads_to") or []
         score += min(len(leads), 3) * 0.25
         for lead in leads[:4]:
-            score += route_type_score(lead.get("type"), hp_ratio, gold) * 0.35
+            score += route_type_score(lead.get("type"), hp_ratio, gold, floor + 1) * 0.35
         # Avoid deterministic left-edge drift on close scores.
         score += (safe_num(option.get("col")) % 2) * 0.05
         scored.append({
