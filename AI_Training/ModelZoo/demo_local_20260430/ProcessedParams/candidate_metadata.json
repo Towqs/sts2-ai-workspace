@@ -1,0 +1,13 @@
+{
+  "samples": 2948,
+  "groups": 547,
+  "positives": 547,
+  "negatives": 2401,
+  "features": 102,
+  "epochs": 80,
+  "best_loss": 0.7312576075394949,
+  "best_group_top1": 62.52285191956124,
+  "device": "cuda",
+  "elapsed_sec": 5.03,
+  "model_path": "candidate_bc_model_best.pth"
+}

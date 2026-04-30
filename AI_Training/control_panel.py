@@ -30,6 +30,7 @@ DATA_DIR = WORKSPACE / "RL_Datasets"
 EXPORT_DIR = WORKSPACE / "Data_Packages"
 ASSETS_DIR = AI_DIR / "assets"
 DOCS_DIR = WORKSPACE / "docs"
+MODEL_ZOO_DIR = AI_DIR / "ModelZoo"
 CONTROL_PATH = AI_DIR / "control_state.json"
 AI_LOGIC_PATH = AI_DIR / "ai_logic_state.json"
 LLM_CONFIG_PATH = AI_DIR / "model_config.json"
@@ -40,6 +41,22 @@ DEFAULT_PYTHON_EXE = WORKSPACE / ".venv" / "Scripts" / "python.exe"
 AGENT_PATH = AI_DIR / "ai_agent.py"
 LLM_AGENT_PATH = AI_DIR / "llm_agent.py"
 API_URL = "http://localhost:15526/api/v1/singleplayer"
+
+MODEL_ARTIFACTS = {
+    "ProcessedParams": [
+        "bc_model_best.pth",
+        "candidate_bc_model_best.pth",
+        "vocab.json",
+        "metadata.json",
+        "candidate_metadata.json",
+    ],
+    "ProcessedMacroParams": [
+        "macro_bc_model_best.pth",
+        "vocab.json",
+        "metadata.json",
+        "training_summary.json",
+    ],
+}
 
 
 def python_exe_runs(candidate):
@@ -86,6 +103,7 @@ DEFAULT_CONTROL = {
     "ai_min_training_quality": "partial_act1",
     "ai_accept_failed_after_act1": True,
     "ai_require_no_invalid_actions": True,
+    "active_model_id": "local",
     "next_run_mode": "auto",
     "collection_enabled": True,
     "collection_disabled_since": None,
@@ -152,6 +170,8 @@ def update_control(patch):
                 data[key] = patch[key] if patch[key] in QUALITY_ORDER else "unknown"
             elif key == "ai_min_training_quality":
                 data[key] = patch[key] if patch[key] in QUALITY_ORDER else "partial_act1"
+            elif key == "active_model_id":
+                data[key] = str(patch[key] or "local")
             elif key == "macro_card_reward_weight":
                 try:
                     data[key] = max(0.0, min(float(patch[key]), 2.0))
@@ -804,6 +824,128 @@ def file_status(path):
     return data
 
 
+def safe_model_id(value):
+    model_id = str(value or "").strip()
+    if not model_id or model_id != Path(model_id).name:
+        return ""
+    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+    if any(ch not in allowed for ch in model_id):
+        return ""
+    return model_id
+
+
+def model_package_status(model_id):
+    model_id = safe_model_id(model_id)
+    if not model_id:
+        return None
+    root = MODEL_ZOO_DIR / model_id
+    manifest = read_json(root / "manifest.json", {})
+    missing = []
+    artifacts = {}
+    total_size = 0
+    for dirname, filenames in MODEL_ARTIFACTS.items():
+        artifacts[dirname] = {}
+        for filename in filenames:
+            path = root / dirname / filename
+            status = file_status(path)
+            artifacts[dirname][filename] = status
+            total_size += int(status.get("size") or 0)
+            if not status.get("exists"):
+                missing.append(f"{dirname}/{filename}")
+
+    combat_meta = read_json(root / "ProcessedParams" / "metadata.json", {})
+    candidate_meta = read_json(root / "ProcessedParams" / "candidate_metadata.json", {})
+    macro_meta = read_json(root / "ProcessedMacroParams" / "metadata.json", {})
+    macro_summary = read_json(root / "ProcessedMacroParams" / "training_summary.json", {})
+    return {
+        "id": model_id,
+        "label": manifest.get("label") or model_id,
+        "description": manifest.get("description", ""),
+        "created_at": manifest.get("created_at", ""),
+        "complete": not missing,
+        "missing": missing,
+        "size": total_size,
+        "artifacts": artifacts,
+        "summary": {
+            "combat_samples": combat_meta.get("samples", 0),
+            "combat_features": combat_meta.get("features", 0),
+            "candidate_rows": candidate_meta.get("samples", combat_meta.get("candidate_rows", 0)),
+            "candidate_features": candidate_meta.get("features", combat_meta.get("candidate_total_features", 0)),
+            "macro_samples": macro_summary.get("samples", macro_meta.get("samples", 0)),
+            "macro_features": macro_summary.get("features", macro_meta.get("features", 0)),
+            "include_ai": combat_meta.get("include_ai", False) or macro_meta.get("include_ai", False),
+            "accepted_sources": {
+                "combat": combat_meta.get("accepted_sources", {}),
+                "macro": macro_meta.get("accepted_sources", {}),
+            },
+        },
+    }
+
+
+def model_registry_status(active_model_id=None):
+    packages = []
+    if MODEL_ZOO_DIR.exists():
+        for item in sorted(MODEL_ZOO_DIR.iterdir(), key=lambda p: p.name.lower()):
+            if item.is_dir():
+                status = model_package_status(item.name)
+                if status:
+                    packages.append(status)
+    active = safe_model_id(active_model_id or read_control().get("active_model_id")) or "local"
+    active_package = next((pkg for pkg in packages if pkg["id"] == active), None)
+    return {
+        "active_model_id": active,
+        "active_label": active_package["label"] if active_package else ("本地当前模型" if active == "local" else active),
+        "packages": packages,
+    }
+
+
+def activate_model_package(model_id):
+    model_id = safe_model_id(model_id)
+    if not model_id:
+        return {"status": "error", "error": "invalid model_id"}
+    package = model_package_status(model_id)
+    if not package:
+        return {"status": "error", "error": "model package not found"}
+    if not package.get("complete"):
+        return {"status": "error", "error": "model package is incomplete", "missing": package.get("missing", [])}
+
+    root = MODEL_ZOO_DIR / model_id
+    for dirname, filenames in MODEL_ARTIFACTS.items():
+        dst_dir = AI_DIR / dirname
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        for filename in filenames:
+            shutil.copy2(root / dirname / filename, dst_dir / filename)
+
+    control = read_control()
+    control["active_model_id"] = model_id
+    write_json(CONTROL_PATH, control)
+    return {
+        "status": "ok",
+        "active_model_id": model_id,
+        "active_label": package.get("label", model_id),
+        "needs_restart": bool(get_ai_pid()),
+    }
+
+
+def active_model_artifacts_complete():
+    for dirname, filenames in MODEL_ARTIFACTS.items():
+        active_dir = AI_DIR / dirname
+        for filename in filenames:
+            if not (active_dir / filename).exists():
+                return False
+    return True
+
+
+def ensure_active_model_available():
+    if active_model_artifacts_complete():
+        return
+    registry = model_registry_status()
+    for package in registry.get("packages", []):
+        if package.get("complete"):
+            activate_model_package(package["id"])
+            return
+
+
 def app_version_status():
     now = time.time()
     cached = APP_VERSION_CACHE.get("data")
@@ -891,6 +1033,7 @@ def training_version_status(models):
 
 
 def models_status():
+    control = read_control()
     combat_dir = AI_DIR / "ProcessedParams"
     macro_dir = AI_DIR / "ProcessedMacroParams"
     combat_model = combat_dir / "bc_model_best.pth"
@@ -925,6 +1068,7 @@ def models_status():
                 "classes": len(macro_metadata.get("classes", {})) if isinstance(macro_metadata.get("classes"), dict) else 0,
             },
         },
+        "registry": model_registry_status(control.get("active_model_id", "local")),
     }
 
 
@@ -3883,6 +4027,46 @@ function renderModelHealth(models, aiProcess, control, runtime, monsterProfiles)
   const warningHtml = warnings.length
     ? `<div class="warning-list">${warnings.map(w => `<div><span class="pill warn">注意</span> ${w}</div>`).join("")}</div>`
     : `<div class="notice good">战斗模型、候选动作模型和宏观模型都已就绪。</div>`;
+  const registry = models.registry || {};
+  const packages = registry.packages || [];
+  const activeModelId = registry.active_model_id || "local";
+  const packageOptions = packages.map(pkg =>
+    `<option value="${escapeHtml(pkg.id)}" ${pkg.id === activeModelId ? "selected" : ""}>${escapeHtml(pkg.label || pkg.id)}</option>`
+  ).join("");
+  const packageRows = packages.map(pkg => {
+    const summary = pkg.summary || {};
+    const sources = summary.accepted_sources || {};
+    const combatSources = sources.combat || {};
+    const macroSources = sources.macro || {};
+    return `<tr>
+      <td><code>${escapeHtml(pkg.id)}</code><br><span class="fine">${escapeHtml(pkg.created_at || "")}</span></td>
+      <td>${escapeHtml(pkg.label || pkg.id)}<br><span class="fine">${escapeHtml(pkg.description || "")}</span></td>
+      <td>战斗 ${summary.combat_samples || 0} / 候选 ${summary.candidate_rows || 0}<br><span class="fine">宏观 ${summary.macro_samples || 0}，AI ${summary.include_ai ? "已纳入" : "未纳入"}</span></td>
+      <td><span class="fine">C: H${combatSources.human || 0}/AI${combatSources.ai || 0}<br>M: H${macroSources.human || 0}/AI${macroSources.ai || 0}</span></td>
+      <td><span class="pill ${pkg.complete ? "on" : "off"}">${pkg.complete ? "完整" : "缺文件"}</span><br><span class="fine">${formatBytes(pkg.size || 0)}</span></td>
+    </tr>`;
+  }).join("");
+  const modelSwitchHtml = `
+    <div class="notice">
+      <b>训练模型切换</b>
+      <div class="field" style="margin-top:8px">
+        <span>模型包</span>
+        <select id="modelPackageSelect" ${packages.length ? "" : "disabled"}>
+          ${packageOptions || '<option value="">暂无模型包</option>'}
+        </select>
+      </div>
+      <div class="button-row" style="margin-top:8px">
+        <button class="primary" onclick="activateModelPackage()" ${packages.length ? "" : "disabled"}>切换到选中模型</button>
+        <button onclick="restartAI()">重启 AI</button>
+      </div>
+      <div id="modelSwitchResult" class="fine" style="margin-top:6px">当前启用：${escapeHtml(registry.active_label || activeModelId)}。切换后需要重启 AI 进程。</div>
+    </div>
+    <div class="table-wrap" style="margin-top:10px">
+      <table>
+        <thead><tr><th>ID</th><th>说明</th><th>样本</th><th>来源</th><th>状态</th></tr></thead>
+        <tbody>${packageRows || '<tr><td colspan=5>暂无可切换模型包</td></tr>'}</tbody>
+      </table>
+    </div>`;
 
   document.getElementById("modelHealth").innerHTML = `
     <div class="kv"><span>战斗模型</span><span><span class="pill ${combat.ready ? "on" : "off"}">${combat.ready ? "可用" : "缺失"}</span> 样本 ${combatMeta.samples || "-"}，特征 ${combatMeta.features || "旧版"} ${combat.model && combat.model.mtime ? combat.model.mtime : ""}</span></div>
@@ -3893,6 +4077,7 @@ function renderModelHealth(models, aiProcess, control, runtime, monsterProfiles)
     <div class="kv"><span>AI 进程</span><span>${aiProcess.pid ? `PID ${aiProcess.pid}` : "未启动"}${aiProcess.started_at ? `，启动 ${aiProcess.started_at}` : ""}</span></div>
     <div class="kv"><span>宏观执行</span><span><span class="pill ${control.macro_enabled ? "warn" : "info"}">${control.macro_enabled ? "开启" : "关闭"}</span> ${control.macro_enabled ? "会自动点地图/奖励/选卡" : "只显示战斗托管"}</span></div>
     <div class="kv"><span>商店保护</span><span><span class="pill ${control.macro_shop_enabled ? "warn" : "on"}">${control.macro_shop_enabled ? "允许购买" : "保护中"}</span> ${control.macro_shop_enabled ? "AI 可买明确商品；不自动删牌" : "AI 不碰商店，避免抢操作"}</span></div>
+    ${modelSwitchHtml}
     ${restartNotice}
     ${warningHtml}`;
 }
@@ -4202,6 +4387,20 @@ async function restartAI(){ await api("/api/ai/restart", {}); refresh(); }
 async function startLLM(){ await saveLLMConfig(); await api("/api/llm/start", {}); refresh(); }
 async function stopLLM(){ await api("/api/llm/stop", {}); refresh(); }
 async function train(){ await api("/api/train", {}); refresh(); }
+async function activateModelPackage(){
+  const select = document.getElementById("modelPackageSelect");
+  const resultEl = document.getElementById("modelSwitchResult");
+  const model_id = select ? select.value : "";
+  if (!model_id) return;
+  if (resultEl) resultEl.textContent = "正在切换模型包...";
+  const result = await api("/api/model/activate", {model_id});
+  if (result.status === "ok") {
+    if (resultEl) resultEl.textContent = `已切换到 ${result.active_label || result.active_model_id}。${result.needs_restart ? "请重启 AI 后生效。" : "下次启动 AI 时生效。"}`;
+  } else if (resultEl) {
+    resultEl.textContent = result.error || "切换失败";
+  }
+  refresh();
+}
 async function proceed(){ await api("/api/proceed", {}); refresh(); }
 async function markRun(run_id, discarded){ await api("/api/run", {run_id, discarded}); refresh(); }
 async function setQuality(run_id, quality){ await api("/api/quality", {run_id, quality}); refresh(); }
@@ -4331,6 +4530,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, restart_ai())
             elif self.path == "/api/train":
                 self._json(200, run_training_background())
+            elif self.path == "/api/model/activate":
+                self._json(200, activate_model_package(body.get("model_id")))
             elif self.path == "/api/export":
                 self._json(200, export_database_package())
             elif self.path == "/api/run":
@@ -4358,6 +4559,7 @@ def main():
     if not LLM_CONFIG_PATH.exists():
         write_json(LLM_CONFIG_PATH, DEFAULT_LLM_CONFIG)
     ensure_llm_profiles_initialized()
+    ensure_active_model_available()
     if not DISCARDED_PATH.exists():
         write_json(DISCARDED_PATH, {"discarded": []})
     server = ThreadingHTTPServer(("127.0.0.1", 8765), Handler)

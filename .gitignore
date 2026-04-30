@@ -18,6 +18,11 @@ RL_Datasets/
 Data_Packages/
 AI_Training/ProcessedParams/
 AI_Training/ProcessedMacroParams/
+!AI_Training/ModelZoo/
+!AI_Training/ModelZoo/**/
+!AI_Training/ModelZoo/**/*.json
+!AI_Training/ModelZoo/**/*.pth
+!AI_Training/ModelZoo/**/*.md
 
 # Runtime control state
 AI_Training/control_state.json

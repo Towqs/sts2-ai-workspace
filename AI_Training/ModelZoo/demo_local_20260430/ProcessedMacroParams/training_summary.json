@@ -1,0 +1,11 @@
+{
+  "samples": 528,
+  "features": 115,
+  "actions": 65,
+  "batch_size": 32,
+  "epochs": 120,
+  "best_loss": 0.8764209852499121,
+  "best_train_accuracy": 70.07575757575758,
+  "device": "cuda",
+  "model_path": "macro_bc_model_best.pth"
+}
