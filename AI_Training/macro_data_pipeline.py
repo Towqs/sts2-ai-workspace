@@ -50,6 +50,13 @@ def read_json(path, default):
         return default
 
 
+def safe_int(value, default=0):
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
 def iter_jsonl(path):
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         for line in f:
@@ -62,6 +69,47 @@ def iter_jsonl(path):
                 continue
             if isinstance(value, dict):
                 yield value
+
+
+def run_values_from_record(record):
+    state = record.get("state") if isinstance(record.get("state"), dict) else {}
+    screen = screen_state(record) if isinstance(record, dict) else {}
+    run = ((screen.get("run") or {}) if isinstance(screen.get("run"), dict) else {})
+    return (
+        safe_int(run.get("act", state.get("act"))),
+        safe_int(run.get("floor", state.get("floor"))),
+    )
+
+
+def record_is_invalid(record):
+    if record.get("ok") is False:
+        return True
+    action_type = str(record.get("action_type") or record.get("type") or "").lower()
+    return action_type in {"invalid_action", "error"}
+
+
+def build_run_progress(files):
+    progress = {}
+    for path in files:
+        for record in iter_jsonl(path):
+            run_id = record.get("run_id")
+            if not run_id:
+                continue
+            item = progress.setdefault(run_id, {
+                "records": 0,
+                "max_act": 0,
+                "max_floor": 0,
+                "invalid_actions": 0,
+                "sources": set(),
+            })
+            act, floor = run_values_from_record(record)
+            item["records"] += 1
+            item["max_act"] = max(item["max_act"], act)
+            item["max_floor"] = max(item["max_floor"], floor)
+            item["sources"].add(record.get("source") or "unknown")
+            if record_is_invalid(record):
+                item["invalid_actions"] += 1
+    return progress
 
 
 def macro_files():
@@ -112,7 +160,66 @@ def min_training_quality():
     return quality if quality in QUALITY_ORDER else "unknown"
 
 
-def should_use_record(record):
+def ai_min_training_quality():
+    quality = control().get("ai_min_training_quality", "partial_act1")
+    return quality if quality in QUALITY_ORDER else "partial_act1"
+
+
+class FilterContext:
+    def __init__(self, files):
+        self.control = control()
+        self.include_ai = bool(self.control.get("include_ai_in_training", False))
+        self.min_quality = self.control.get("min_training_quality", "unknown")
+        if self.min_quality not in QUALITY_ORDER:
+            self.min_quality = "unknown"
+        self.ai_min_quality = self.control.get("ai_min_training_quality", "partial_act1")
+        if self.ai_min_quality not in QUALITY_ORDER:
+            self.ai_min_quality = "partial_act1"
+        self.ai_accept_failed_after_act1 = bool(self.control.get("ai_accept_failed_after_act1", True))
+        self.ai_require_no_invalid_actions = bool(self.control.get("ai_require_no_invalid_actions", True))
+        self.discarded = discarded_run_ids()
+        self.labels = read_json(RUN_LABELS_PATH, {"labels": {}}).get("labels", {})
+        self.run_progress = build_run_progress(files)
+
+    def record_is_collectable(self, record):
+        ts = int(record.get("timestamp") or 0)
+        disabled_since = self.control.get("collection_disabled_since")
+        if disabled_since and ts >= int(disabled_since):
+            return False
+        for span in self.control.get("collection_disabled_ranges", []):
+            if len(span) == 2 and int(span[0]) <= ts <= int(span[1]):
+                return False
+        return True
+
+    def run_quality(self, run_id):
+        return self.labels.get(run_id, {}).get("quality", "unknown")
+
+    def run_reached_act2(self, run_id):
+        progress = self.run_progress.get(run_id, {})
+        return progress.get("max_act", 0) >= 2 or progress.get("max_floor", 0) > 17
+
+    def run_has_invalid_actions(self, run_id):
+        return self.run_progress.get(run_id, {}).get("invalid_actions", 0) > 0
+
+    def source_allowed(self, record):
+        run_id = record.get("run_id")
+        source = record.get("source")
+        if source != "ai":
+            quality = self.run_quality(run_id)
+            return QUALITY_ORDER.get(quality, 0) >= QUALITY_ORDER.get(self.min_quality, 0)
+        if not self.include_ai:
+            return False
+        if self.ai_require_no_invalid_actions and self.run_has_invalid_actions(run_id):
+            return False
+        quality = self.run_quality(run_id)
+        if QUALITY_ORDER.get(quality, 0) >= QUALITY_ORDER.get(self.ai_min_quality, 0):
+            return True
+        if self.ai_accept_failed_after_act1 and quality in {"failed_run", "unknown"}:
+            return self.run_reached_act2(run_id)
+        return False
+
+
+def should_use_record(record, ctx=None):
     if record.get("type") != "macro_action":
         return False
     if record.get("action_type") not in ALLOWED_MACRO_ACTIONS:
@@ -121,20 +228,32 @@ def should_use_record(record):
         return False
     if not record.get("action_type"):
         return False
-    if not record_is_collectable(record):
-        return False
-    if record.get("run_id") in discarded_run_ids():
-        return False
-    if record.get("source") == "ai" and not include_ai():
-        return False
+    if ctx:
+        if not ctx.record_is_collectable(record):
+            return False
+        if record.get("run_id") in ctx.discarded:
+            return False
+        if not ctx.source_allowed(record):
+            return False
+    else:
+        if not record_is_collectable(record):
+            return False
+        if record.get("run_id") in discarded_run_ids():
+            return False
+        if record.get("source") == "ai":
+            if not include_ai() or record_is_invalid(record):
+                return False
+            if QUALITY_ORDER.get(run_quality(record.get("run_id")), 0) < QUALITY_ORDER.get(ai_min_training_quality(), 0):
+                return False
     if record.get("action_type") == "select_map_node":
         screen = record.get("screen_state") or record.get("screen") or {}
         options = ((screen.get("map") or {}).get("next_options") or [])
         if len(options) <= 1:
             return False
-    min_quality = min_training_quality()
-    if QUALITY_ORDER.get(run_quality(record.get("run_id")), 0) < QUALITY_ORDER.get(min_quality, 0):
-        return False
+    if not ctx and record.get("source") != "ai":
+        min_quality = min_training_quality()
+        if QUALITY_ORDER.get(run_quality(record.get("run_id")), 0) < QUALITY_ORDER.get(min_quality, 0):
+            return False
     return True
 
 
@@ -365,11 +484,12 @@ def encode_record(vocab, record):
 def build_dataset():
     files = macro_files()
     print(f"Found {len(files)} macro files.")
+    ctx = FilterContext(files)
     records = []
     skipped = Counter()
     for path in files:
         for record in iter_jsonl(path):
-            if should_use_record(record):
+            if should_use_record(record, ctx=ctx):
                 records.append(record)
             else:
                 skipped["filtered"] += 1
@@ -387,6 +507,8 @@ def build_dataset():
     x_rows = []
     y_rows = []
     class_counts = Counter()
+    source_counts = Counter()
+    quality_counts = Counter()
     for record in records:
         label = norm_action_label(record)
         action_id = vocab.get("actions", label)
@@ -395,6 +517,8 @@ def build_dataset():
         x_rows.append(encode_record(vocab, record))
         y_rows.append(action_id)
         class_counts[label] += 1
+        source_counts[record.get("source") or "unknown"] += 1
+        quality_counts[ctx.run_quality(record.get("run_id"))] += 1
 
     if x_rows:
         x_data = np.vstack(x_rows).astype(np.float32)
@@ -410,9 +534,20 @@ def build_dataset():
             "samples": int(len(y_data)),
             "features": int(x_data.shape[1]) if x_data.ndim == 2 else 0,
             "classes": class_counts,
+            "accepted_sources": source_counts,
+            "accepted_run_qualities": quality_counts,
             "files": [str(p.relative_to(WORKSPACE_DIR)) for p in files],
-            "include_ai": include_ai(),
-            "min_training_quality": min_training_quality(),
+            "include_ai": ctx.include_ai,
+            "min_training_quality": ctx.min_quality,
+            "ai_min_training_quality": ctx.ai_min_quality,
+            "ai_accept_failed_after_act1": ctx.ai_accept_failed_after_act1,
+            "ai_require_no_invalid_actions": ctx.ai_require_no_invalid_actions,
+            "ai_qualified_run_ids": sorted(
+                run_id
+                for run_id, progress in ctx.run_progress.items()
+                if "ai" in progress.get("sources", set())
+                and (progress.get("max_act", 0) >= 2 or progress.get("max_floor", 0) > 17)
+            ),
         }, f, ensure_ascii=False, indent=2)
 
     print(f"Saved macro dataset: X={x_data.shape}, Y={y_data.shape}")

@@ -30,6 +30,28 @@ QUALITY_ORDER = {
 }
 
 
+def iter_json_objects(filepath):
+    """Yield JSON objects from JSONL or concatenated JSON logs."""
+    with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+        content = f.read()
+
+    decoder = json.JSONDecoder()
+    idx = 0
+    length = len(content)
+    while idx < length:
+        while idx < length and content[idx].isspace():
+            idx += 1
+        if idx >= length:
+            break
+        try:
+            obj, new_idx = decoder.raw_decode(content, idx)
+            if isinstance(obj, dict):
+                yield obj
+            idx = new_idx
+        except json.JSONDecodeError:
+            idx += 1
+
+
 def _read_json_file(path, default):
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -38,12 +60,65 @@ def _read_json_file(path, default):
         return default
 
 
+def _safe_int(value, default=0):
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _record_state(record):
+    state = record.get("state_before") or record.get("state") or {}
+    return state if isinstance(state, dict) else {}
+
+
+def _run_values_from_record(record):
+    state = _record_state(record)
+    run = state.get("run") if isinstance(state.get("run"), dict) else state
+    return _safe_int(run.get("act")), _safe_int(run.get("floor"))
+
+
+def _record_is_invalid(record):
+    if record.get("ok") is False:
+        return True
+    action_type = str(record.get("action_type") or record.get("type") or "").lower()
+    return action_type in {"invalid_action", "error"}
+
+
+def _build_run_progress(filepaths):
+    progress = {}
+    for filepath in filepaths:
+        for record in iter_json_objects(filepath):
+            run_id = record.get("run_id")
+            if not run_id:
+                continue
+            item = progress.setdefault(run_id, {
+                "records": 0,
+                "max_act": 0,
+                "max_floor": 0,
+                "invalid_actions": 0,
+                "sources": set(),
+            })
+            act, floor = _run_values_from_record(record)
+            item["records"] += 1
+            item["max_act"] = max(item["max_act"], act)
+            item["max_floor"] = max(item["max_floor"], floor)
+            item["sources"].add(record.get("source") or "unknown")
+            if _record_is_invalid(record):
+                item["invalid_actions"] += 1
+    return progress
+
+
 class FilterContext:
     """Pre-load all filter config once so we don't re-read JSON files per record."""
 
     def __init__(self):
         control = _read_json_file(CONTROL_PATH, {})
         self.include_ai = bool(control.get("include_ai_in_training", False))
+        ai_min_q = control.get("ai_min_training_quality", "partial_act1")
+        self.ai_min_quality = ai_min_q if ai_min_q in QUALITY_ORDER else "partial_act1"
+        self.ai_accept_failed_after_act1 = bool(control.get("ai_accept_failed_after_act1", True))
+        self.ai_require_no_invalid_actions = bool(control.get("ai_require_no_invalid_actions", True))
         self.disabled_since = control.get("collection_disabled_since")
         self.disabled_ranges = control.get("collection_disabled_ranges", [])
         min_q = control.get("min_training_quality", "unknown")
@@ -52,6 +127,10 @@ class FilterContext:
             _read_json_file(DISCARDED_RUNS_PATH, {"discarded": []}).get("discarded", [])
         )
         self.labels = _read_json_file(RUN_LABELS_PATH, {"labels": {}}).get("labels", {})
+        self.run_progress = {}
+
+    def prepare(self, filepaths):
+        self.run_progress = _build_run_progress(filepaths)
 
     def record_is_collectable(self, timestamp):
         ts = int(timestamp or 0)
@@ -64,6 +143,30 @@ class FilterContext:
 
     def run_quality(self, run_id):
         return self.labels.get(run_id, {}).get("quality", "unknown")
+
+    def run_reached_act2(self, run_id):
+        progress = self.run_progress.get(run_id, {})
+        return progress.get("max_act", 0) >= 2 or progress.get("max_floor", 0) > 17
+
+    def run_has_invalid_actions(self, run_id):
+        return self.run_progress.get(run_id, {}).get("invalid_actions", 0) > 0
+
+    def source_allowed(self, data):
+        run_id = data.get("run_id")
+        source = data.get("source")
+        if source != "ai":
+            rq = self.run_quality(run_id)
+            return QUALITY_ORDER.get(rq, 0) >= QUALITY_ORDER.get(self.min_quality, 0)
+        if not self.include_ai:
+            return False
+        if self.ai_require_no_invalid_actions and self.run_has_invalid_actions(run_id):
+            return False
+        rq = self.run_quality(run_id)
+        if QUALITY_ORDER.get(rq, 0) >= QUALITY_ORDER.get(self.ai_min_quality, 0):
+            return True
+        if self.ai_accept_failed_after_act1 and rq in {"failed_run", "unknown"}:
+            return self.run_reached_act2(run_id)
+        return False
 
 
 # Keep module-level helpers for backward compatibility (used outside build_dataset)
@@ -98,6 +201,12 @@ def _min_training_quality():
     control = _read_json_file(CONTROL_PATH, {})
     quality = control.get("min_training_quality", "unknown")
     return quality if quality in QUALITY_ORDER else "unknown"
+
+
+def _ai_min_training_quality():
+    control = _read_json_file(CONTROL_PATH, {})
+    quality = control.get("ai_min_training_quality", "partial_act1")
+    return quality if quality in QUALITY_ORDER else "partial_act1"
 
 
 def _parse_card_cost(card, energy):
@@ -220,10 +329,7 @@ def should_use_record(data, state, action, ctx=None):
             return False
         if data.get("run_id") in ctx.discarded:
             return False
-        rq = ctx.run_quality(data.get("run_id"))
-        if QUALITY_ORDER.get(rq, 0) < QUALITY_ORDER.get(ctx.min_quality, 0):
-            return False
-        if data.get("source") == "ai" and not ctx.include_ai:
+        if not ctx.source_allowed(data):
             return False
     else:
         if not _record_is_collectable(data.get("timestamp")):
@@ -231,11 +337,16 @@ def should_use_record(data, state, action, ctx=None):
         if data.get("run_id") in _discarded_run_ids():
             return False
         run_quality = _run_quality(data.get("run_id"))
-        min_quality = _min_training_quality()
-        if QUALITY_ORDER.get(run_quality, 0) < QUALITY_ORDER.get(min_quality, 0):
-            return False
-        if data.get("source") == "ai" and not _include_ai_in_training():
-            return False
+        if data.get("source") == "ai":
+            if not _include_ai_in_training() or _record_is_invalid(data):
+                return False
+            min_quality = _ai_min_training_quality()
+            if QUALITY_ORDER.get(run_quality, 0) < QUALITY_ORDER.get(min_quality, 0):
+                return False
+        else:
+            min_quality = _min_training_quality()
+            if QUALITY_ORDER.get(run_quality, 0) < QUALITY_ORDER.get(min_quality, 0):
+                return False
 
     act_type = action.get("action", action.get("action_type", data.get("action_type", "UNKNOWN")))
     if act_type == "end_turn" and _has_affordable_playable_card(state):
@@ -260,24 +371,7 @@ class VocabBuilder:
             
     def _iter_json_objects(self, filepath):
         """Helper to yield JSON objects from a file that might have newlines or multiple root objects."""
-        with open(filepath, 'r', encoding='utf-8') as f:
-            content = f.read()
-        
-        decoder = json.JSONDecoder()
-        idx = 0
-        length = len(content)
-        while idx < length:
-            # Skip whitespace
-            while idx < length and content[idx].isspace():
-                idx += 1
-            if idx >= length: break
-            
-            try:
-                obj, new_idx = decoder.raw_decode(content, idx)
-                yield obj
-                idx = new_idx
-            except json.JSONDecodeError:
-                idx += 1 # Not ideal but prevents infinite loops if corrupted
+        yield from iter_json_objects(filepath)
 
     def scan_files(self, filepaths, ctx=None):
         print(f"Scanning {len(filepaths)} files to build vocab...")
@@ -483,6 +577,7 @@ def build_dataset(data_dirs, output_dir):
         filepaths.extend(glob.glob(os.path.join(d, "*.jsonl")))
         
     print(f"Found {len(filepaths)} data files.")
+    ctx.prepare(filepaths)
     
     # 1. 扫描词表
     if not os.path.exists(vocab_path):
@@ -502,6 +597,8 @@ def build_dataset(data_dirs, output_dir):
     candidate_group_data = [] # 同一个原始样本下的候选动作分组
     candidate_groups = 0
     candidate_match_misses = 0
+    accepted_sources = {}
+    accepted_run_qualities = {}
     
     print("Encoding data into features...")
     start_time = time.time()
@@ -531,6 +628,10 @@ def build_dataset(data_dirs, output_dir):
                         group_id = len(Y_data)
                         X_data.append(state_vec)
                         Y_data.append(action_id)
+                        source = data.get("source") or "unknown"
+                        accepted_sources[source] = accepted_sources.get(source, 0) + 1
+                        quality = ctx.run_quality(data.get("run_id"))
+                        accepted_run_qualities[quality] = accepted_run_qualities.get(quality, 0) + 1
 
                         candidates = enumerate_combat_actions(state)
                         matched_idx = match_logged_action(candidates, action)
@@ -577,6 +678,19 @@ def build_dataset(data_dirs, output_dir):
         "candidate_match_misses": int(candidate_match_misses),
         "candidate_feature_dim": int(CANDIDATE_FEATURE_DIM),
         "candidate_total_features": int(candidate_X_data.shape[1]) if candidate_X_data.ndim == 2 else 0,
+        "accepted_sources": accepted_sources,
+        "accepted_run_qualities": accepted_run_qualities,
+        "include_ai": ctx.include_ai,
+        "min_training_quality": ctx.min_quality,
+        "ai_min_training_quality": ctx.ai_min_quality,
+        "ai_accept_failed_after_act1": ctx.ai_accept_failed_after_act1,
+        "ai_require_no_invalid_actions": ctx.ai_require_no_invalid_actions,
+        "ai_qualified_run_ids": sorted(
+            run_id
+            for run_id, progress in ctx.run_progress.items()
+            if "ai" in progress.get("sources", set())
+            and (progress.get("max_act", 0) >= 2 or progress.get("max_floor", 0) > 17)
+        ),
         "feature_notes": [
             "act_floor_round",
             "incoming_damage",

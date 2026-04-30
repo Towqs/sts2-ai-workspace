@@ -83,6 +83,9 @@ DEFAULT_CONTROL = {
     "macro_card_reward_weight": 0.35,
     "record_ai_actions": True,
     "include_ai_in_training": False,
+    "ai_min_training_quality": "partial_act1",
+    "ai_accept_failed_after_act1": True,
+    "ai_require_no_invalid_actions": True,
     "next_run_mode": "auto",
     "collection_enabled": True,
     "collection_disabled_since": None,
@@ -147,6 +150,8 @@ def update_control(patch):
                 data[key] = patch[key] if patch[key] in ("auto", "new", "continue") else "auto"
             elif key == "min_training_quality":
                 data[key] = patch[key] if patch[key] in QUALITY_ORDER else "unknown"
+            elif key == "ai_min_training_quality":
+                data[key] = patch[key] if patch[key] in QUALITY_ORDER else "partial_act1"
             elif key == "macro_card_reward_weight":
                 try:
                     data[key] = max(0.0, min(float(patch[key]), 2.0))

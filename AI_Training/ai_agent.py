@@ -36,6 +36,9 @@ DEFAULT_CONTROL = {
     "macro_card_reward_weight": 0.35,
     "record_ai_actions": True,
     "include_ai_in_training": False,
+    "ai_min_training_quality": "partial_act1",
+    "ai_accept_failed_after_act1": True,
+    "ai_require_no_invalid_actions": True,
 }
 
 from train_bc import CombatBCModel
