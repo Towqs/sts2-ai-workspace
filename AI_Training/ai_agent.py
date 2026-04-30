@@ -2,6 +2,7 @@ import os
 import json
 import time
 import uuid
+import re
 from datetime import datetime
 import requests
 import torch
@@ -23,7 +24,7 @@ from train_macro_bc import MacroBCModel
 init(autoreset=True)
 
 PORT = 15526
-API_URL = f"http://localhost:{PORT}/api/v1/singleplayer"
+API_URL = f"http://127.0.0.1:{PORT}/api/v1/singleplayer"
 WORKSPACE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONTROL_PATH = os.path.join(os.path.dirname(__file__), "control_state.json")
 AI_LOGIC_PATH = os.path.join(os.path.dirname(__file__), "ai_logic_state.json")
@@ -231,7 +232,37 @@ def known_card_utility_hints(card):
     }
 
 
+def card_end_turn_hand_damage(card):
+    text = combat_text(card)
+    card_id = card_id_key(card)
+    if card_id == "BECKON":
+        return 6.0
+
+    has_end_turn = "end of your turn" in text or "\u56de\u5408\u7ed3\u675f" in text
+    has_hand_clause = "in your hand" in text or "\u624b\u724c" in text
+    has_life_loss = (
+        "lose" in text
+        or "damage" in text
+        or "\u5931\u53bb" in text
+        or "\u751f\u547d" in text
+    )
+    if has_end_turn and has_hand_clause and has_life_loss:
+        nums = combat_numbers(text)
+        return max(nums) if nums else 0.0
+    return 0.0
+
+
+def hand_end_turn_damage(hand):
+    return sum(
+        card_end_turn_hand_damage(card)
+        for card in hand or []
+        if isinstance(card, dict)
+    )
+
+
 def card_self_damage(card):
+    if card_end_turn_hand_damage(card) > 0:
+        return 0.0
     text = combat_text(card)
     card_key = f"{card.get('id') or ''} {card.get('name') or ''} {text}".lower()
     known_self_damage = {
@@ -347,6 +378,10 @@ def potion_for_candidate(candidate, state):
     return {}
 
 
+def potion_id_key(potion):
+    return str(potion.get("id") or potion.get("potion_id") or "").upper()
+
+
 def card_effect_profile(card):
     text = combat_text(card)
     card_id = card_id_key(card)
@@ -360,6 +395,7 @@ def card_effect_profile(card):
         block_gain = known_block
     utility_hints = known_card_utility_hints(card)
     self_damage = card_self_damage(card)
+    end_turn_hand_damage = card_end_turn_hand_damage(card)
     status_like_ids = {
         "SLIMED",
         "WOUND",
@@ -386,6 +422,7 @@ def card_effect_profile(card):
         "damage": damage,
         "block_gain": block_gain,
         "self_damage": self_damage,
+        "end_turn_hand_damage": end_turn_hand_damage,
         "status_like": status_like,
         "has_utility": any(term in text for term in utility_terms) or any(utility_hints.values()),
         "scaling": utility_hints["scaling"],
@@ -396,6 +433,14 @@ def card_effect_profile(card):
 
 
 def potion_damage_hint(potion):
+    known_damage = {
+        "FIRE_POTION": 20.0,
+        "EXPLOSIVE_AMPOULE": 10.0,
+        "POWDERED_DEMISE": 10.0,
+    }
+    potion_id = potion_id_key(potion)
+    if potion_id in known_damage:
+        return known_damage[potion_id]
     text = combat_core_text(potion)
     if not any(k in text for k in ("deal", "attack", "fire", "造成", "攻击", "火焰")):
         return 0
@@ -405,11 +450,37 @@ def potion_damage_hint(potion):
     return max(nums)
 
 
+def potion_block_hint(potion, current_block=0.0):
+    potion_id = potion_id_key(potion)
+    if potion_id == "BLOCK_POTION":
+        return 12.0
+    if potion_id == "FORTIFIER":
+        return max(0.0, safe_num(current_block, 0.0) * 2.0)
+    text = combat_core_text(potion)
+    if not any(k in text for k in ("block", "defend", "armor", "\u683c\u6321", "\u9632\u5fa1", "\u62a4\u7532")):
+        return 0.0
+    nums = combat_numbers(text)
+    return max(nums) if nums else 0.0
+
+
+def potion_heal_hint(potion, max_hp=1.0):
+    potion_id = potion_id_key(potion)
+    if potion_id == "BLOOD_POTION":
+        return max(1.0, max_hp * 0.20)
+    text = combat_core_text(potion)
+    if not any(k in text for k in ("heal", "recover", "\u56de\u590d", "\u6cbb\u7597")):
+        return 0.0
+    nums = combat_numbers(text)
+    return max(nums) if nums else 0.0
+
+
 def potion_tactical_profile(candidate, state):
     potion = potion_for_candidate(candidate, state)
     text = combat_text(potion)
+    potion_id = potion_id_key(potion)
     player = (state or {}).get("player") or {}
     battle = (state or {}).get("battle") or {}
+    state_type = str((state or {}).get("state_type") or "").lower()
     enemies = battle.get("enemies") or []
     hp = safe_num(player.get("hp"), 0.0)
     max_hp = max(safe_num(player.get("max_hp"), 1.0), 1.0)
@@ -419,22 +490,52 @@ def potion_tactical_profile(candidate, state):
     net_incoming = max(0.0, incoming - block)
     round_no = safe_int(battle.get("round"), 0)
     damage = potion_damage_hint(potion)
+    block_gain = potion_block_hint(potion, block)
+    heal_gain = potion_heal_hint(potion, max_hp)
     defensive = any(k in text for k in ("block", "格挡", "weak", "虚弱"))
     scaling = any(k in text for k in ("dexterity", "敏捷", "strength", "力量"))
+    defensive_ids = {"BLOCK_POTION", "FORTIFIER", "WEAK_POTION"}
+    scaling_ids = {"DEXTERITY_POTION", "STRENGTH_POTION", "FLEX_POTION", "POWER_POTION"}
+    resource_ids = {"ENERGY_POTION", "ATTACK_POTION", "SKILL_POTION", "COLORLESS_POTION", "CLARITY"}
+    healing_ids = {"BLOOD_POTION"}
+    defensive = potion_id in defensive_ids or any(k in text for k in ("block", "weak", "\u683c\u6321", "\u865a\u5f31"))
+    scaling = potion_id in scaling_ids or any(k in text for k in ("dexterity", "strength", "\u654f\u6377", "\u529b\u91cf"))
+    resource = potion_id in resource_ids or any(k in text for k in ("energy", "free", "card", "\u80fd\u91cf", "\u514d\u8d39", "\u624b\u724c"))
+    healing = potion_id in healing_ids or heal_gain > 0
     lethal = bool(damage > 0 and candidate.target_effective_hp and damage >= candidate.target_effective_hp)
-    urgent = hp_ratio <= 0.40 or net_incoming >= max(8.0, hp * 0.35)
-    useful = (
-        lethal
-        or (damage > 0 and urgent)
-        or (defensive and incoming > 0 and (urgent or hp_ratio <= 0.55))
-        or (scaling and incoming > 0 and (round_no >= 3 or hp_ratio <= 0.55))
+    prevents_lethal = bool(
+        hp > 0
+        and net_incoming >= hp
+        and (
+            (block_gain > 0 and max(0.0, net_incoming - block_gain) < hp)
+            or (heal_gain > 0 and net_incoming < hp + heal_gain)
+        )
     )
+    severe_threat = net_incoming >= max(10.0, hp * 0.45)
+    boss_or_elite = state_type in ("boss", "elite")
+    defensive_useful = bool(defensive and incoming > 0 and (prevents_lethal or severe_threat))
+    healing_useful = bool(healing and (prevents_lethal or (hp_ratio <= 0.30 and (boss_or_elite or incoming > 0))))
+    resource_useful = bool(resource and (prevents_lethal or (boss_or_elite and hp_ratio <= 0.30 and round_no >= 3 and severe_threat)))
+    scaling_useful = bool(scaling and incoming <= 0 and boss_or_elite and round_no <= 2 and hp_ratio >= 0.45)
+    urgent = prevents_lethal or severe_threat
+    useful = lethal or defensive_useful or healing_useful or resource_useful or scaling_useful
     return {
+        "potion_id": potion_id,
         "text": text,
         "damage": damage,
+        "block_gain": block_gain,
+        "heal_gain": heal_gain,
         "defensive": defensive,
         "scaling": scaling,
+        "resource": resource,
+        "healing": healing,
         "lethal": lethal,
+        "prevents_lethal": prevents_lethal,
+        "severe_threat": severe_threat,
+        "defensive_useful": defensive_useful,
+        "healing_useful": healing_useful,
+        "resource_useful": resource_useful,
+        "scaling_useful": scaling_useful,
         "urgent": urgent,
         "useful": useful,
         "incoming": incoming,
@@ -456,6 +557,8 @@ def candidate_should_play_before_end_turn(candidate, state):
         incoming = enemy_incoming_damage(battle.get("enemies") or [])
         block = safe_num(player.get("block"), 0.0)
         net_incoming = max(0.0, incoming - block)
+        if profile["end_turn_hand_damage"] > 0:
+            return True
         if profile["self_damage"] > 0 and (hp <= profile["self_damage"] + 1 or hp_ratio <= 0.35):
             return False
         if profile["status_like"] and profile["damage"] <= 0 and profile["block_gain"] <= 0:
@@ -513,6 +616,7 @@ def tactical_candidate_adjustment(candidate, state):
         damage = profile["damage"]
         block_gain = profile["block_gain"]
         self_damage = profile["self_damage"]
+        end_turn_hand_damage = profile["end_turn_hand_damage"]
         card_type = profile["card_type"]
         exhaust_count = safe_num(player.get("exhaust_pile_count") or player.get("exhaust_count"), 0.0)
         playable_attack_count = sum(
@@ -523,7 +627,14 @@ def tactical_candidate_adjustment(candidate, state):
             and hand_card.get("can_play", False)
         )
 
-        if profile["status_like"] and damage <= 0 and block_gain <= 0:
+        if end_turn_hand_damage > 0:
+            adjustment += 12.0
+            reasons.append(f"clear_end_turn_hand_damage={end_turn_hand_damage:g}")
+            if net_incoming + hand_end_turn_damage(player.get("hand")) >= hp and hp > 0:
+                adjustment += 18.0
+                reasons.append("prevents_end_turn_lethal")
+
+        if profile["status_like"] and damage <= 0 and block_gain <= 0 and end_turn_hand_damage <= 0:
             adjustment -= 8.0
             reasons.append("status_card_penalty")
 
@@ -592,28 +703,45 @@ def tactical_candidate_adjustment(candidate, state):
 
     elif candidate.kind == "use_potion":
         profile = potion_tactical_profile(candidate, state)
+        already_used_potion = bool(state.get("_potion_used_this_turn"))
+        if already_used_potion and not (profile["lethal"] or profile["prevents_lethal"]):
+            adjustment -= 100.0
+            reasons.append("one_potion_per_turn")
         if profile["lethal"]:
             adjustment += 14.0
             reasons.append("lethal_potion")
-        elif profile["damage"] > 0 and profile["urgent"]:
-            adjustment += 7.0
-            reasons.append("urgent_damage_potion")
-        if hp_ratio <= 0.45 and incoming > 0 and profile["defensive"]:
-            adjustment += 7.0
-            reasons.append("low_hp_defensive_potion")
-        if profile["scaling"] and incoming > 0 and (profile["round_no"] >= 3 or hp_ratio <= 0.55):
+        elif profile["prevents_lethal"]:
+            adjustment += 12.0
+            reasons.append("prevents_lethal_potion")
+        elif profile["defensive_useful"]:
+            adjustment += 5.0
+            reasons.append("severe_threat_defensive_potion")
+        elif profile["healing_useful"]:
             adjustment += 4.0
-            reasons.append("scaling_potion_long_fight")
+            reasons.append("critical_heal_potion")
+        elif profile["resource_useful"]:
+            adjustment += 3.0
+            reasons.append("desperate_resource_potion")
+        elif profile["scaling_useful"]:
+            adjustment += 2.0
+            reasons.append("safe_setup_potion")
         if not profile["useful"]:
-            adjustment -= 14.0
+            adjustment -= 20.0
             reasons.append("save_potion")
         if incoming <= 0 and (profile["defensive"] or profile["scaling"]):
-            adjustment -= 3.0
+            adjustment -= 6.0
             reasons.append("no_incoming_save_potion")
 
     elif candidate.kind == "end_turn":
+        end_turn_hand_loss = hand_end_turn_damage(player.get("hand"))
         if incoming <= 0:
             adjustment += 0.5
+        if end_turn_hand_loss > 0:
+            adjustment -= min(24.0, end_turn_hand_loss * 2.0)
+            reasons.append(f"hand_end_turn_damage={end_turn_hand_loss:g}")
+        if net_incoming + end_turn_hand_loss >= hp and hp > 0:
+            adjustment -= 100.0
+            reasons.append("never_end_turn_into_hand_lethal")
         if net_incoming >= hp and hp > 0:
             adjustment -= 4.0
             reasons.append("lethal_incoming")
@@ -634,7 +762,12 @@ def score_combat_candidates(candidate_agent, state_vec, candidates, state=None):
         hp = safe_num(player.get("hp"), 0.0)
         block = safe_num(player.get("block"), 0.0)
         incoming = enemy_incoming_damage(battle.get("enemies") or [])
-        lethal_end_turn = bool(hp > 0 and max(0.0, incoming - block) >= hp and any(c.kind != "end_turn" for c in candidates))
+        end_turn_hand_loss = hand_end_turn_damage(player.get("hand"))
+        lethal_end_turn = bool(
+            hp > 0
+            and max(0.0, incoming - block) + end_turn_hand_loss >= hp
+            and any(c.kind != "end_turn" for c in candidates)
+        )
     state_part = align_feature_vector(state_vec, int(candidate_agent["state_dim"]))
     rows = []
     for candidate in candidates:
@@ -656,8 +789,13 @@ def score_combat_candidates(candidate_agent, state_vec, candidates, state=None):
                 adjustment -= 100.0
                 marker = ",".join(x for x in (marker, "never_end_turn_into_lethal") if x)
             elif candidate.kind == "use_potion":
-                adjustment += 8.0
-                marker = ",".join(x for x in (marker, "desperate_potion") if x)
+                profile = potion_tactical_profile(candidate, state)
+                if profile["lethal"] or profile["prevents_lethal"] or profile["resource_useful"]:
+                    adjustment += 8.0
+                    marker = ",".join(x for x in (marker, "desperate_potion") if x)
+                else:
+                    adjustment -= 8.0
+                    marker = ",".join(x for x in (marker, "not_a_rescue_potion") if x)
         if candidate.kind == "end_turn" and force_delay_end_turn:
             adjustment -= 100.0
             marker = ",".join(x for x in (marker, delay_reason) if x)
@@ -1562,12 +1700,87 @@ def score_card_select_for_operation(card, operation, state=None):
     return value, ["选择高价值牌"] + value_reasons[:2]
 
 
+def is_selection_state_type(state_type):
+    return str(state_type or "").lower() in ("card_select", "hand_select")
+
+
+def selection_screen_for_state(state):
+    state_type = str((state or {}).get("state_type") or "").lower()
+    if state_type == "hand_select":
+        return (state or {}).get("hand_select") or {}
+    return (state or {}).get("card_select") or {}
+
+
+def selection_memory_signature(state):
+    state_type = str((state or {}).get("state_type") or "").lower()
+    screen = selection_screen_for_state(state)
+    run = (state or {}).get("run") or {}
+    battle = (state or {}).get("battle") or {}
+    return json.dumps({
+        "state_type": state_type,
+        "screen_type": screen.get("screen_type") or screen.get("mode"),
+        "prompt": screen.get("prompt") or "",
+        "act": run.get("act"),
+        "floor": run.get("floor"),
+        "round": battle.get("round") if state_type == "hand_select" else None,
+    }, sort_keys=True, ensure_ascii=False)
+
+
+def selection_selected_count(state, screen):
+    remembered = {
+        safe_int(index, -1)
+        for index in (state or {}).get("_selection_selected_indices", [])
+    }
+    legacy_remembered = {
+        safe_int(index, -1)
+        for index in (state or {}).get("_card_select_selected_indices", [])
+    }
+    observed = screen.get("selected_cards") or []
+    return max(
+        len({index for index in remembered | legacy_remembered if index >= 0}),
+        len(observed) if isinstance(observed, list) else 0,
+    )
+
+
+def selection_target_count(screen, state_type="card_select"):
+    for key in ("required_count", "target_count", "max_select", "max_cards", "card_count"):
+        if key in (screen or {}):
+            value = safe_int(screen.get(key), 0)
+            if value > 0:
+                return min(value, 6)
+
+    text = " ".join(
+        str((screen or {}).get(key) or "").lower()
+        for key in ("prompt", "instructions_title", "instructions_description", "screen_type", "mode")
+    )
+    patterns = (
+        r"(?:select|choose|pick|discard|exhaust|upgrade|transform|remove)\s+(?:up to\s+)?(\d+)",
+        r"(\d+)\s+(?:cards|card)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            value = safe_int(match.group(1), 0)
+            if value > 0:
+                return min(value, 6)
+
+    cn_numbers = {"一": 1, "二": 2, "两": 2, "兩": 2, "三": 3, "四": 4, "五": 5}
+    for token, value in cn_numbers.items():
+        if f"{token}张" in text or f"{token}張" in text or f"{token}card" in text:
+            return value
+
+    return 1
+
+
 def choose_card_select_action(state):
     screen = state.get("card_select") or {}
     operation = detect_card_select_operation(screen)
     remembered_indices = {
         safe_int(index, -1)
-        for index in state.get("_card_select_selected_indices", [])
+        for index in (
+            state.get("_selection_selected_indices", [])
+            or state.get("_card_select_selected_indices", [])
+        )
     }
     observed_indices = {
         safe_int(card.get("index"), -1)
@@ -1575,13 +1788,16 @@ def choose_card_select_action(state):
         if isinstance(card, dict)
     }
     excluded_indices = {index for index in remembered_indices | observed_indices if index >= 0}
+    selected_count = selection_selected_count(state, screen)
+    target_count = selection_target_count(screen, "card_select")
+    preview_showing = bool(screen.get("preview_showing"))
 
-    if screen.get("can_confirm"):
+    if screen.get("can_confirm") and (preview_showing or selected_count >= target_count):
         return {"action": "confirm_selection"}, {
             "top_actions": [{"action": "confirm_selection", "confidence": 100.0, "marker": "selection_ready"}],
             "chosen_action": "confirm_selection",
             "payload": {"action": "confirm_selection"},
-            "reason": "card_select_confirm_ready",
+            "reason": f"card_select_confirm_ready selected={selected_count}/{target_count}",
         }
 
     cards = screen.get("cards") or []
@@ -1634,6 +1850,13 @@ def choose_card_select_action(state):
         safe_scored = [item for item in scored if item.get("safe")]
         if safe_scored:
             scored = safe_scored
+        elif screen.get("can_confirm") and selected_count > 0:
+            return {"action": "confirm_selection"}, {
+                "top_actions": [{"action": "confirm_selection", "confidence": 100.0, "marker": "no_more_safe_cards"}],
+                "chosen_action": "confirm_selection",
+                "payload": {"action": "confirm_selection"},
+                "reason": f"card_select_{operation}_confirm_no_more_safe_targets",
+            }
         elif screen.get("can_cancel"):
             return {"action": "cancel_selection"}, {
                 "top_actions": [{"action": "cancel_selection", "confidence": 100.0, "marker": "no_safe_card_to_remove"}],
@@ -1648,7 +1871,7 @@ def choose_card_select_action(state):
         {
             "action": f"select_card:index_{item['index']}:{item.get('id') or item.get('name')}",
             "confidence": round(max(item["score"], 0.0) * 20, 2),
-            "marker": f"operation={operation}; score={item['score']:+.2f}; {'safe' if item.get('safe') else 'unsafe'}; {' / '.join(item['reasons']) or '-'}",
+            "marker": f"operation={operation}; target={selected_count}/{target_count}; score={item['score']:+.2f}; {'safe' if item.get('safe') else 'unsafe'}; {' / '.join(item['reasons']) or '-'}",
         }
         for item in sorted(scored, key=lambda item: item["score"], reverse=True)[:6]
     ]
@@ -1657,6 +1880,112 @@ def choose_card_select_action(state):
         "chosen_action": f"select_card:index_{best['index']}:{best.get('id') or best.get('name')}",
         "payload": payload,
         "reason": f"card_select_{operation}: " + (" / ".join(best["reasons"]) or "highest score"),
+    }
+
+
+def choose_hand_select_action(state):
+    screen = state.get("hand_select") or {}
+    operation = detect_card_select_operation({
+        "screen_type": screen.get("mode"),
+        "prompt": screen.get("prompt"),
+    })
+    remembered_indices = {
+        safe_int(index, -1)
+        for index in (
+            state.get("_selection_selected_indices", [])
+            or state.get("_card_select_selected_indices", [])
+        )
+    }
+    observed_indices = {
+        safe_int(card.get("index"), -1)
+        for card in (screen.get("selected_cards") or [])
+        if isinstance(card, dict)
+    }
+    excluded_indices = {index for index in remembered_indices | observed_indices if index >= 0}
+    selected_count = selection_selected_count(state, screen)
+    target_count = selection_target_count(screen, "hand_select")
+
+    if screen.get("can_confirm") and selected_count >= target_count:
+        return {"action": "combat_confirm_selection"}, {
+            "top_actions": [{"action": "combat_confirm_selection", "confidence": 100.0, "marker": "selection_ready"}],
+            "chosen_action": "combat_confirm_selection",
+            "payload": {"action": "combat_confirm_selection"},
+            "reason": f"hand_select_confirm_ready selected={selected_count}/{target_count}",
+        }
+
+    cards = screen.get("cards") or []
+    if not cards:
+        if screen.get("can_confirm"):
+            return {"action": "combat_confirm_selection"}, {
+                "top_actions": [{"action": "combat_confirm_selection", "confidence": 100.0, "marker": "no_cards_confirm"}],
+                "chosen_action": "combat_confirm_selection",
+                "payload": {"action": "combat_confirm_selection"},
+                "reason": "hand_select_no_cards_confirm",
+            }
+        return None, {
+            "top_actions": [],
+            "chosen_action": None,
+            "payload": None,
+            "reason": "hand_select_no_cards",
+        }
+
+    scored = []
+    for fallback_index, card in enumerate(cards):
+        index = safe_int(card.get("index"), fallback_index)
+        if index in excluded_indices:
+            continue
+        score, reasons = score_card_select_for_operation(card, operation, state)
+        scored.append({
+            "index": index,
+            "id": card.get("id"),
+            "name": card.get("name"),
+            "score": round(score, 3),
+            "reasons": reasons,
+            "safe": is_safe_sacrifice_card(card) if operation in ("sacrifice", "transform") else True,
+        })
+
+    if not scored:
+        if screen.get("can_confirm"):
+            return {"action": "combat_confirm_selection"}, {
+                "top_actions": [{"action": "combat_confirm_selection", "confidence": 100.0, "marker": "all_remembered_selected"}],
+                "chosen_action": "combat_confirm_selection",
+                "payload": {"action": "combat_confirm_selection"},
+                "reason": "hand_select_confirm_after_memory",
+            }
+        return None, {
+            "top_actions": [],
+            "chosen_action": None,
+            "payload": None,
+            "reason": "hand_select_waiting_after_memory",
+        }
+
+    if operation in ("sacrifice", "transform"):
+        safe_scored = [item for item in scored if item.get("safe")]
+        if safe_scored:
+            scored = safe_scored
+        elif screen.get("can_confirm") and selected_count > 0:
+            return {"action": "combat_confirm_selection"}, {
+                "top_actions": [{"action": "combat_confirm_selection", "confidence": 100.0, "marker": "no_more_safe_cards"}],
+                "chosen_action": "combat_confirm_selection",
+                "payload": {"action": "combat_confirm_selection"},
+                "reason": f"hand_select_{operation}_confirm_no_more_safe_targets",
+            }
+
+    best = max(scored, key=lambda item: item["score"])
+    payload = {"action": "combat_select_card", "card_index": best["index"]}
+    top_actions = [
+        {
+            "action": f"combat_select_card:index_{item['index']}:{item.get('id') or item.get('name')}",
+            "confidence": round(max(item["score"], 0.0) * 20, 2),
+            "marker": f"operation={operation}; target={selected_count}/{target_count}; score={item['score']:+.2f}; {'safe' if item.get('safe') else 'unsafe'}; {' / '.join(item['reasons']) or '-'}",
+        }
+        for item in sorted(scored, key=lambda item: item["score"], reverse=True)[:6]
+    ]
+    return payload, {
+        "top_actions": top_actions,
+        "chosen_action": f"combat_select_card:index_{best['index']}:{best.get('id') or best.get('name')}",
+        "payload": payload,
+        "reason": f"hand_select_{operation}: " + (" / ".join(best["reasons"]) or "highest score"),
     }
 
 
@@ -2163,15 +2492,15 @@ def route_type_score(node_type, hp_ratio, gold, floor=0):
     if "boss" in node_type:
         return 0.0
     if "elite" in node_type:
-        if hp_ratio < 0.40:
-            return -10.0
+        if hp_ratio < 0.55:
+            return -14.0
         if floor and floor <= 7:
-            return 0.5 if hp_ratio >= 0.70 else -6.0
-        if hp_ratio >= 0.70:
-            return 5.0
-        if hp_ratio >= 0.55:
-            return 1.5
-        return -6.0
+            return 0.5 if hp_ratio >= 0.85 else -5.0
+        if hp_ratio >= 0.80:
+            return 4.0
+        if hp_ratio >= 0.65:
+            return -1.5
+        return -8.0
     if "rest" in node_type or "camp" in node_type:
         if hp_ratio < 0.35:
             return 10.0
@@ -2186,8 +2515,10 @@ def route_type_score(node_type, hp_ratio, gold, floor=0):
         if gold >= 180:
             return 3.5
         if gold >= 110:
+            return 2.0
+        if gold >= 75:
             return 1.0
-        return -3.0
+        return -1.5
     if "treasure" in node_type:
         return 4.0 if hp_ratio < 0.45 else 2.5
     if "event" in node_type or "unknown" in node_type or "ancient" in node_type or "?" in node_type:
@@ -2209,6 +2540,71 @@ def route_type_score(node_type, hp_ratio, gold, floor=0):
             return -1.0
         return -0.5 if floor and floor <= 7 else 1.0
     return 0.5
+
+
+def map_node_key(node):
+    return (safe_int(node.get("col"), -999), safe_int(node.get("row"), -999))
+
+
+def map_node_type(node):
+    return str((node or {}).get("type") or "").lower()
+
+
+def route_lookahead_adjustment(option, map_state, hp_ratio, gold, floor, max_depth=4):
+    nodes = {
+        map_node_key(node): node
+        for node in (map_state.get("nodes") or [])
+        if isinstance(node, dict)
+    }
+    start_key = map_node_key(option)
+    start_node = nodes.get(start_key, option)
+    stack = []
+    for child in start_node.get("children", []) or []:
+        if isinstance(child, (list, tuple)) and len(child) >= 2:
+            stack.append(((safe_int(child[0], -999), safe_int(child[1], -999)), 1, False))
+
+    score = 0.0
+    markers = []
+    seen = set()
+    while stack:
+        key, depth, has_rest_buffer = stack.pop()
+        if depth > max_depth or (key, depth, has_rest_buffer) in seen:
+            continue
+        seen.add((key, depth, has_rest_buffer))
+        node = nodes.get(key)
+        if not node:
+            continue
+        node_type = map_node_type(node)
+        weight = 0.16 / max(depth, 1)
+        score += route_type_score(node_type, hp_ratio, gold, floor + depth) * weight
+
+        is_rest = "rest" in node_type or "camp" in node_type
+        is_shop = "shop" in node_type or "merchant" in node_type
+        is_buffer = is_rest or (is_shop and gold >= 75)
+        buffered = has_rest_buffer or is_buffer
+        if "elite" in node_type and not has_rest_buffer:
+            if hp_ratio < 0.55:
+                penalty = 14.0 / max(depth, 1)
+            elif hp_ratio < 0.70:
+                penalty = 8.0 / max(depth, 1)
+            elif floor <= 7 and hp_ratio < 0.95:
+                penalty = 12.0 / max(depth, 1)
+            else:
+                penalty = 2.5 / max(depth, 1)
+            score -= penalty
+            markers.append(f"elite_d{depth}")
+        if is_rest and hp_ratio < 0.65:
+            score += 2.0 / max(depth, 1)
+            markers.append(f"rest_d{depth}")
+        if is_shop and gold >= 75 and hp_ratio < 0.90:
+            score += 1.5 / max(depth, 1)
+            markers.append(f"shop_d{depth}")
+
+        for child in node.get("children", []) or []:
+            if isinstance(child, (list, tuple)) and len(child) >= 2:
+                stack.append(((safe_int(child[0], -999), safe_int(child[1], -999)), depth + 1, buffered))
+
+    return score, ",".join(markers[:4])
 
 
 def choose_map_route_action(state):
@@ -2236,6 +2632,7 @@ def choose_map_route_action(state):
     hp_ratio = hp / max_hp
     gold = safe_num(player.get("gold"))
     floor = int(safe_num(run.get("floor")))
+    map_state = state.get("map") or {}
 
     scored = []
     for fallback_index, option in enumerate(options):
@@ -2245,6 +2642,8 @@ def choose_map_route_action(state):
         score += min(len(leads), 3) * 0.25
         for lead in leads[:4]:
             score += route_type_score(lead.get("type"), hp_ratio, gold, floor + 1) * 0.35
+        lookahead_score, lookahead_marker = route_lookahead_adjustment(option, map_state, hp_ratio, gold, floor)
+        score += lookahead_score
         # Avoid deterministic left-edge drift on close scores.
         score += (safe_num(option.get("col")) % 2) * 0.05
         scored.append({
@@ -2255,6 +2654,7 @@ def choose_map_route_action(state):
             "row": option.get("row"),
             "score": round(score, 3),
             "leads": len(leads),
+            "lookahead": lookahead_marker,
         })
 
     best_score = max(item["score"] for item in scored)
@@ -2273,7 +2673,7 @@ def choose_map_route_action(state):
         {
             "action": f"route:index_{item['index']}:{item['type']}",
             "confidence": item["score"],
-            "marker": f"col={item['col']} leads={item['leads']}",
+            "marker": f"col={item['col']} leads={item['leads']} {item['lookahead']}",
         }
         for item in sorted(scored, key=lambda item: item["score"], reverse=True)[:6]
     ]
@@ -2315,6 +2715,17 @@ def macro_state_signature(state):
             (c.get("index"), c.get("id"), c.get("name"))
             for c in (card_select.get("cards") or [])
         ]
+    elif state_type == "hand_select":
+        hand_select = state.get("hand_select") or {}
+        payload["mode"] = hand_select.get("mode")
+        payload["prompt"] = hand_select.get("prompt")
+        payload["can_confirm"] = hand_select.get("can_confirm")
+        payload["selected_count"] = selection_selected_count(state, hand_select)
+        payload["target_count"] = selection_target_count(hand_select, "hand_select")
+        payload["cards"] = [
+            (c.get("index"), c.get("id"), c.get("name"))
+            for c in (hand_select.get("cards") or [])
+        ]
     elif state_type == "event":
         payload["options"] = [
             (o.get("index"), o.get("title"), o.get("is_locked"), o.get("is_proceed"), o.get("was_chosen"))
@@ -2341,6 +2752,8 @@ def choose_macro_action(macro_agent, state, allow_shop=False, card_baseline_weig
         return choose_map_route_action(state)
     if state_type == "card_select":
         return choose_card_select_action(state)
+    if state_type == "hand_select":
+        return choose_hand_select_action(state)
     if state_type == "event":
         event_payload, event_info = choose_event_option_rule_action(state)
         if event_payload:
@@ -2627,6 +3040,18 @@ def set_data_source(source):
         pass
 
 
+def combat_turn_key(state):
+    run = (state or {}).get("run") or {}
+    battle = (state or {}).get("battle") or {}
+    return json.dumps({
+        "act": run.get("act"),
+        "floor": run.get("floor"),
+        "round": battle.get("round"),
+        "turn": battle.get("turn"),
+        "state_type": (state or {}).get("state_type"),
+    }, sort_keys=True, ensure_ascii=False)
+
+
 def run_agent():
     processed_dir = os.path.join(os.path.dirname(__file__), "ProcessedParams")
     macro_processed_dir = os.path.join(os.path.dirname(__file__), "ProcessedMacroParams")
@@ -2649,6 +3074,7 @@ def run_agent():
     last_data_source = None
     last_macro_decision_key = None
     card_select_memory = {}
+    potion_used_turn_key = None
 
     while True:
         agent_sleep(0.8)
@@ -2674,7 +3100,7 @@ def run_agent():
             
         battle = state.get("battle", {})
         state_type = state.get("state_type", "unknown")
-        if state_type != "card_select" and card_select_memory:
+        if not is_selection_state_type(state_type) and card_select_memory:
             card_select_memory.clear()
         is_play = battle.get("is_play_phase", False)
         turn = battle.get("turn", "unknown")
@@ -2707,13 +3133,15 @@ def run_agent():
                 agent_sleep(4.0, control)
                 continue
 
-            if control.get("macro_enabled", False) and state_type in ("map", "rewards", "card_reward", "card_select", "event", "rest_site", "shop", "fake_merchant", "treasure"):
+            if control.get("macro_enabled", False) and state_type in ("map", "rewards", "card_reward", "card_select", "hand_select", "event", "rest_site", "shop", "fake_merchant", "treasure"):
                 allow_shop = bool(control.get("macro_shop_enabled", False))
                 card_baseline_weight = safe_num(control.get("macro_card_reward_weight"), 0.35)
                 card_select_key = None
-                if state_type == "card_select":
-                    card_select_key = macro_state_signature(state)
-                    state["_card_select_selected_indices"] = sorted(card_select_memory.get(card_select_key, set()))
+                if is_selection_state_type(state_type):
+                    card_select_key = selection_memory_signature(state)
+                    remembered_selection = sorted(card_select_memory.get(card_select_key, set()))
+                    state["_selection_selected_indices"] = remembered_selection
+                    state["_card_select_selected_indices"] = remembered_selection
                 payload, macro_info = choose_macro_action(
                     macro_agent,
                     state,
@@ -2747,12 +3175,12 @@ def run_agent():
                     raw_payload = payload
                     payload = payload_with_policy(payload, macro_policy_name, macro_model_version)
                     success = send_action(payload)
-                    if state_type == "card_select" and card_select_key and success:
+                    if is_selection_state_type(state_type) and card_select_key and success:
                         action_name = raw_payload.get("action")
-                        if action_name == "select_card":
+                        if action_name in ("select_card", "combat_select_card"):
                             selected = card_select_memory.setdefault(card_select_key, set())
-                            selected.add(safe_int(raw_payload.get("index"), -1))
-                        elif action_name in ("confirm_selection", "cancel_selection"):
+                            selected.add(safe_int(raw_payload.get("index", raw_payload.get("card_index")), -1))
+                        elif action_name in ("confirm_selection", "cancel_selection", "combat_confirm_selection"):
                             card_select_memory.pop(card_select_key, None)
                     last_macro_decision_key = decision_key
                     if not success and last_data_source != "human":
@@ -2778,6 +3206,8 @@ def run_agent():
         energy = player_state.get("energy", 0)
         enemies = battle.get("enemies", [])
         alive_enemies = get_alive_enemies(enemies)
+        current_turn_key = combat_turn_key(state)
+        state["_potion_used_this_turn"] = (current_turn_key == potion_used_turn_key)
         legal_candidates = enumerate_combat_actions(state)
         legal_candidate_catalog = public_candidate_catalog(legal_candidates, limit=24)
             
@@ -2869,6 +3299,8 @@ def run_agent():
                     success = send_action(payload)
                     state_after = fetch_game_state()
                     append_ai_action_log(session_id, payload, state, state_after, success, active_policy_name, active_model_version)
+                    if success and chosen_candidate.kind == "use_potion":
+                        potion_used_turn_key = current_turn_key
                     if success:
                         agent_sleep(1.5, control)
                     else:
