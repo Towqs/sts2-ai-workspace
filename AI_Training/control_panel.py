@@ -901,6 +901,7 @@ def status_payload():
             "online": "error" not in game,
             "error": game.get("error"),
             "state_type": game.get("state_type"),
+            "message": game.get("message"),
             "character": game.get("player", {}).get("character"),
             "hp": game.get("player", {}).get("hp"),
             "max_hp": game.get("player", {}).get("max_hp"),
@@ -2558,11 +2559,20 @@ function escapeHtml(value) {
     "'":"&#39;"
   }[ch]));
 }
-function phaseInfo(game) {
+function phaseInfo(game, activeRun) {
   if (!game.online) return {label:"未连接", cls:"off", detail:`游戏 API 离线：${game.error || "无响应"}`};
   const raw = String(game.state_type || "unknown");
   const lower = raw.toLowerCase();
-  if (lower.includes("menu")) return {label:"主菜单", cls:"warn", detail:"游戏已连接，当前不在一局游戏内"};
+  if (lower.includes("menu")) {
+    const recent = activeRun && activeRun.run_id
+      ? `；最近 Run ${activeRun.run_id} 最后更新 ${activeRun.last_time || "-"}`
+      : "";
+    return {
+      label:"主菜单",
+      cls:"warn",
+      detail:`Mod API 返回主菜单，当前没有可读取的玩家/楼层数据${recent}`
+    };
+  }
   if (lower.includes("monster") || lower.includes("combat")) return {label:"战斗中", cls:"on", detail:`${game.character || ""} HP ${game.hp ?? "?"}/${game.max_hp ?? "?"} 能量 ${game.energy ?? "?"}`};
   if (lower.includes("shop") || lower.includes("merchant")) {
     return {label:"商店中", cls:"warn", detail:game.shop_poll_guard ? `${raw}；商店保护中，减少自动刷新` : raw};
@@ -3107,7 +3117,7 @@ async function refresh() {
 }
 function renderStatus(s) {
   const active = s.current_data && s.current_data.active_run;
-  const phase = phaseInfo(s.game);
+  const phase = phaseInfo(s.game, active);
 
   document.getElementById("ai_enabled").checked = !!s.control.ai_enabled;
   document.getElementById("macro_enabled").checked = !!s.control.macro_enabled;
