@@ -2068,9 +2068,9 @@ INDEX_HTML = r"""<!doctype html>
       </section>
 
       <section class="fold-panel">
-        <details>
+        <details open>
           <summary>
-            <span class="fold-title">模型与进程</span>
+            <span class="fold-title">AI 模型状态</span>
             <span id="modelBadge" class="pill">-</span>
           </summary>
           <div class="fold-body">
@@ -2997,7 +2997,7 @@ function renderModelHealth(models, aiProcess, control, runtime, monsterProfiles)
   const candidateMeta = candidate.metadata || {};
   const macroSummary = macro.summary || {};
   const macroMeta = macro.metadata || {};
-  const ready = !!combat.ready && !!macro.ready;
+  const ready = !!combat.ready && !!candidate.ready && !!macro.ready;
   const needsRestart = !!aiProcess.needs_restart;
   const warnings = [];
   if (!combat.ready) warnings.push("战斗 BC 模型缺失，需要重训。");
@@ -3007,14 +3007,14 @@ function renderModelHealth(models, aiProcess, control, runtime, monsterProfiles)
   if (runtime && runtime.agent_ready === false) warnings.push(`当前 Python 缺少 AI 依赖：${(runtime.missing || []).join(", ")}。网页能开，但启动 AI / 重训会失败。`);
   if (control.macro_enabled && !macro.ready) warnings.push("宏观开关已打开，但宏观模型不可用。");
   if (control.macro_enabled && !control.macro_shop_enabled) warnings.push("商店保护已开启：AI 不会买东西，也不会自动离开商店。");
-  setPill("modelBadge", ready ? (needsRestart ? "需重启" : "可用") : "缺模型", ready ? (needsRestart ? "warn" : "on") : "off");
+  setPill("modelBadge", ready ? (needsRestart ? "需重启" : "模型齐") : "缺模型", ready ? (needsRestart ? "warn" : "on") : "off");
 
   const restartNotice = needsRestart
     ? `<div class="notice warn"><b>需要重启 AI。</b>当前 AI 进程仍可能在跑旧代码，点击左侧“重启 AI”后宏观模型才会进入运行时。</div>`
     : "";
   const warningHtml = warnings.length
     ? `<div class="warning-list">${warnings.map(w => `<div><span class="pill warn">注意</span> ${w}</div>`).join("")}</div>`
-    : `<div class="notice good">战斗模型和宏观模型都已就绪。</div>`;
+    : `<div class="notice good">战斗模型、候选动作模型和宏观模型都已就绪。</div>`;
 
   document.getElementById("modelHealth").innerHTML = `
     <div class="kv"><span>战斗模型</span><span><span class="pill ${combat.ready ? "on" : "off"}">${combat.ready ? "可用" : "缺失"}</span> 样本 ${combatMeta.samples || "-"}，特征 ${combatMeta.features || "旧版"} ${combat.model && combat.model.mtime ? combat.model.mtime : ""}</span></div>
