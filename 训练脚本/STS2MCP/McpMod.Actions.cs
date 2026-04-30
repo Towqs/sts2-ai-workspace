@@ -593,7 +593,14 @@ public static partial class McpMod
             {
                 var backBtn = FindFirst<NBackButton>(merchRoom);
                 if (backBtn is { IsEnabled: true })
+                {
                     backBtn.ForceClick();
+                    return new Dictionary<string, object?>
+                    {
+                        ["status"] = "ok",
+                        ["message"] = "Closing shop inventory before proceeding"
+                    };
+                }
             }
             if (merchRoom.ProceedButton.IsEnabled)
             {
@@ -613,7 +620,14 @@ public static partial class McpMod
                 {
                     var backBtn = FindFirst<NBackButton>(fmNode);
                     if (backBtn is { IsEnabled: true })
+                    {
                         backBtn.ForceClick();
+                        return new Dictionary<string, object?>
+                        {
+                            ["status"] = "ok",
+                            ["message"] = "Closing fake merchant inventory before proceeding"
+                        };
+                    }
                 }
                 var proceedBtn = FindFirst<NProceedButton>(fmNode);
                 if (proceedBtn is { IsEnabled: true })

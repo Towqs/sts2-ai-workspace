@@ -179,14 +179,8 @@ public static partial class McpMod
             }
             else
             {
-                // Auto-open the shopkeeper's inventory if not already open.
-                // NMerchantRoom.Inventory (UI node) can be null before the scene is fully ready;
-                // OpenInventory() itself accesses Inventory.IsOpen, so guard against null.
-                var merchUI = NMerchantRoom.Instance;
-                if (merchUI?.Inventory != null && !merchUI.Inventory.IsOpen)
-                {
-                    merchUI.OpenInventory();
-                }
+                // State reads must not mutate the shop UI. Auto-opening the inventory here
+                // reopens shops after the player/AI closes them and can disable the proceed button.
                 result["state_type"] = "shop";
                 result["shop"] = BuildShopState(merchantRoom, runState);
             }
@@ -635,22 +629,16 @@ public static partial class McpMod
             return state;
         }
 
-        // Auto-open the inventory if the merchant button is still available
+        // Build shop inventory from the FakeMerchant model
+        var shopState = BuildFakeMerchantShopItems(fakeMerchant.Inventory);
+
+        // State reads must not click the merchant button. Shop execution can open the
+        // inventory when it needs to buy; polling should not steal focus or block proceed.
         if (fakeMerchantNode != null)
         {
             var inventoryUI = FindFirst<NMerchantInventory>(fakeMerchantNode);
-            if (inventoryUI != null && !inventoryUI.IsOpen)
-            {
-                // ForceClick the merchant button to go through the proper signal chain
-                // (disables proceed button, wires InventoryClosed callback, etc.)
-                var merchantButton = fakeMerchantNode.MerchantButton;
-                if (merchantButton != null && merchantButton.Visible && merchantButton.IsEnabled)
-                    merchantButton.ForceClick();
-            }
+            shopState["inventory_open"] = inventoryUI?.IsOpen ?? false;
         }
-
-        // Build shop inventory from the FakeMerchant model
-        var shopState = BuildFakeMerchantShopItems(fakeMerchant.Inventory);
 
         // Proceed button
         if (fakeMerchantNode != null)
@@ -839,6 +827,7 @@ public static partial class McpMod
 
         var proceedButton = NMerchantRoom.Instance?.ProceedButton;
         state["can_proceed"] = proceedButton?.IsEnabled ?? false;
+        state["inventory_open"] = NMerchantRoom.Instance?.Inventory?.IsOpen ?? false;
 
         return state;
     }

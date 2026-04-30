@@ -1589,6 +1589,14 @@ def choose_shop_rule_action(state, state_type):
             "payload": payload,
             "reason": "shop_rule_no_positive_purchase",
         }
+    if state_type in ("shop", "fake_merchant"):
+        payload = {"action": "proceed"}
+        return payload, {
+            "top_actions": [{"action": "proceed", "confidence": 80.0, "marker": "close_shop_inventory"}],
+            "chosen_action": "proceed",
+            "payload": payload,
+            "reason": "shop_rule_close_inventory",
+        }
     return None, {
         "top_actions": [],
         "chosen_action": None,
