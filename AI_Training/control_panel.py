@@ -31,6 +31,7 @@ EXPORT_DIR = WORKSPACE / "Data_Packages"
 ASSETS_DIR = AI_DIR / "assets"
 DOCS_DIR = WORKSPACE / "docs"
 MODEL_ZOO_DIR = AI_DIR / "ModelZoo"
+AUTO_MODEL_KEEP_LIMIT = 5
 CONTROL_PATH = AI_DIR / "control_state.json"
 AI_LOGIC_PATH = AI_DIR / "ai_logic_state.json"
 LLM_CONFIG_PATH = AI_DIR / "model_config.json"
@@ -751,6 +752,7 @@ def run_training_background():
         with TRAIN_LOCK:
             LAST_TRAIN.update({"running": True, "started": datetime.now().isoformat(timespec="seconds"), "finished": None, "output": ""})
             output = []
+            success = True
             try:
                 for cmd in [
                     [str(PYTHON_EXE), str(AI_DIR / "monster_profile_builder.py")],
@@ -766,8 +768,21 @@ def run_training_background():
                     if proc.stderr:
                         output.append(proc.stderr)
                     if proc.returncode != 0:
+                        success = False
+                        output.append(f"ERROR: command exited with {proc.returncode}")
                         break
+                if success:
+                    snapshot = create_model_snapshot(retention="auto", activate=True)
+                    if snapshot.get("status") == "ok":
+                        output.append(f"模型快照已自动保存：{snapshot.get('label')} ({snapshot.get('model_id')})")
+                        cleanup = cleanup_auto_model_snapshots()
+                        if cleanup.get("deleted"):
+                            output.append("自动模型已清理旧版本：" + ", ".join(cleanup["deleted"]))
+                    else:
+                        output.append("ERROR: 自动保存模型快照失败：" + json.dumps(snapshot, ensure_ascii=False))
+                        success = False
             except Exception as exc:
+                success = False
                 output.append(f"ERROR: {exc}")
             LAST_TRAIN.update({"running": False, "finished": datetime.now().isoformat(timespec="seconds"), "output": "\n".join(output)[-12000:]})
 
@@ -898,11 +913,16 @@ def model_package_status(model_id):
     candidate_meta = read_json(root / "ProcessedParams" / "candidate_metadata.json", {})
     macro_meta = read_json(root / "ProcessedMacroParams" / "metadata.json", {})
     macro_summary = read_json(root / "ProcessedMacroParams" / "training_summary.json", {})
+    retention = manifest.get("retention") or ("auto" if model_id.startswith("auto_train_") else "manual")
+    pinned = bool(manifest.get("pinned") or retention == "manual")
     return {
         "id": model_id,
         "label": manifest.get("label") or model_id,
         "description": manifest.get("description", ""),
         "created_at": manifest.get("created_at", ""),
+        "source": manifest.get("source", ""),
+        "retention": retention,
+        "pinned": pinned,
         "complete": not missing,
         "missing": missing,
         "size": total_size,
@@ -923,6 +943,117 @@ def model_package_status(model_id):
     }
 
 
+def copy_current_model_artifacts(target_root):
+    missing = []
+    copied = []
+    for dirname, filenames in MODEL_ARTIFACTS.items():
+        dst_dir = target_root / dirname
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        for filename in filenames:
+            src = AI_DIR / dirname / filename
+            if not src.exists():
+                missing.append(f"{dirname}/{filename}")
+                continue
+            dst = dst_dir / filename
+            shutil.copy2(src, dst)
+            copied.append(str(dst.relative_to(target_root)))
+    return missing, copied
+
+
+def set_active_model_id(model_id):
+    control = read_control()
+    control["active_model_id"] = model_id
+    write_json(CONTROL_PATH, control)
+
+
+def create_model_snapshot(label="", retention="auto", description="", activate=False):
+    retention = "manual" if retention == "manual" else "auto"
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    package_id = f"{'manual_keep' if retention == 'manual' else 'auto_train'}_{stamp}_{uuid.uuid4().hex[:6]}"
+    root = MODEL_ZOO_DIR / package_id
+    MODEL_ZOO_DIR.mkdir(parents=True, exist_ok=True)
+    missing, copied = copy_current_model_artifacts(root)
+    if missing:
+        if root.exists():
+            shutil.rmtree(root, ignore_errors=True)
+        return {"status": "error", "error": "model artifacts missing", "missing": missing}
+
+    created_at = datetime.now().isoformat(timespec="seconds")
+    default_label = f"{'永久保留模型' if retention == 'manual' else '自动训练模型'} {created_at.replace('T', ' ')}"
+    manifest = {
+        "id": package_id,
+        "label": str(label or default_label).strip()[:80],
+        "description": str(description or ("手动永久保留的本地训练模型。" if retention == "manual" else "训练完成后自动保存的模型快照。")).strip()[:300],
+        "created_at": created_at,
+        "source": "training_snapshot",
+        "retention": retention,
+        "pinned": retention == "manual",
+        "artifacts": copied,
+    }
+    write_json(root / "manifest.json", manifest)
+    if activate:
+        set_active_model_id(package_id)
+    return {
+        "status": "ok",
+        "model_id": package_id,
+        "label": manifest["label"],
+        "retention": retention,
+        "pinned": manifest["pinned"],
+        "package": model_package_status(package_id),
+    }
+
+
+def cleanup_auto_model_snapshots(keep_limit=AUTO_MODEL_KEEP_LIMIT):
+    active = safe_model_id(read_control().get("active_model_id"))
+    autos = []
+    if not MODEL_ZOO_DIR.exists():
+        return {"deleted": [], "kept": 0, "limit": keep_limit}
+    for item in MODEL_ZOO_DIR.iterdir():
+        if not item.is_dir():
+            continue
+        manifest = read_json(item / "manifest.json", {})
+        retention = manifest.get("retention") or ("auto" if item.name.startswith("auto_train_") else "manual")
+        if retention != "auto" or manifest.get("pinned"):
+            continue
+        created_at = str(manifest.get("created_at") or "")
+        autos.append((created_at, item.stat().st_mtime, item))
+
+    autos.sort(key=lambda row: (row[0], row[1]), reverse=True)
+    deleted = []
+    kept_ids = []
+    for _created, _mtime, item in autos:
+        if item.name == active or len(kept_ids) < keep_limit:
+            kept_ids.append(item.name)
+            continue
+        shutil.rmtree(item, ignore_errors=True)
+        deleted.append(item.name)
+    return {"deleted": deleted, "kept": len(kept_ids), "limit": keep_limit}
+
+
+def update_model_package(model_id, label=None, description=None, pin=False):
+    model_id = safe_model_id(model_id)
+    if not model_id:
+        return {"status": "error", "error": "invalid model_id"}
+    root = MODEL_ZOO_DIR / model_id
+    if not root.exists() or not root.is_dir():
+        return {"status": "error", "error": "model package not found"}
+    manifest = read_json(root / "manifest.json", {})
+    manifest.setdefault("id", model_id)
+    manifest.setdefault("created_at", datetime.fromtimestamp(root.stat().st_mtime).isoformat(timespec="seconds"))
+    if label is not None:
+        next_label = str(label or "").strip()
+        if not next_label:
+            return {"status": "error", "error": "label cannot be empty"}
+        manifest["label"] = next_label[:80]
+    if description is not None:
+        manifest["description"] = str(description or "").strip()[:300]
+    if pin:
+        manifest["pinned"] = True
+        manifest["retention"] = "manual"
+    write_json(root / "manifest.json", manifest)
+    return {"status": "ok", "package": model_package_status(model_id)}
+
+
 def model_registry_status(active_model_id=None):
     packages = []
     if MODEL_ZOO_DIR.exists():
@@ -936,6 +1067,7 @@ def model_registry_status(active_model_id=None):
     return {
         "active_model_id": active,
         "active_label": active_package["label"] if active_package else ("本地当前模型" if active == "local" else active),
+        "auto_keep_limit": AUTO_MODEL_KEEP_LIMIT,
         "packages": packages,
     }
 
@@ -3071,6 +3203,9 @@ function escapeHtml(value) {
     "'":"&#39;"
   }[ch]));
 }
+function jsString(value) {
+  return JSON.stringify(String(value ?? ""));
+}
 function phaseInfo(game, activeRun) {
   if (!game.online) return {label:"未连接", cls:"off", detail:`游戏 API 离线：${game.error || "无响应"}`};
   const raw = String(game.state_type || "unknown");
@@ -4095,6 +4230,7 @@ function renderModelHealth(models, aiProcess, control, runtime, monsterProfiles)
   const registry = models.registry || {};
   const packages = registry.packages || [];
   const activeModelId = registry.active_model_id || "local";
+  const autoKeepLimit = registry.auto_keep_limit || 5;
   const packageOptions = packages.map(pkg =>
     `<option value="${escapeHtml(pkg.id)}" ${pkg.id === activeModelId ? "selected" : ""}>${escapeHtml(pkg.label || pkg.id)}</option>`
   ).join("");
@@ -4103,12 +4239,25 @@ function renderModelHealth(models, aiProcess, control, runtime, monsterProfiles)
     const sources = summary.accepted_sources || {};
     const combatSources = sources.combat || {};
     const macroSources = sources.macro || {};
+    const isPinned = !!pkg.pinned || pkg.retention === "manual";
+    const rowId = `modelLabel_${pkg.id}`;
     return `<tr>
       <td><code>${escapeHtml(pkg.id)}</code><br><span class="fine">${escapeHtml(pkg.created_at || "")}</span></td>
-      <td>${escapeHtml(pkg.label || pkg.id)}<br><span class="fine">${escapeHtml(pkg.description || "")}</span></td>
+      <td>
+        <input id="${escapeHtml(rowId)}" type="text" value="${escapeHtml(pkg.label || pkg.id)}" style="min-width:180px;width:100%;max-width:260px">
+        <div class="fine">${escapeHtml(pkg.description || "")}</div>
+      </td>
       <td>战斗 ${summary.combat_samples || 0} / 候选 ${summary.candidate_rows || 0}<br><span class="fine">宏观 ${summary.macro_samples || 0}，AI ${summary.include_ai ? "已纳入" : "未纳入"}</span></td>
       <td><span class="fine">C: H${combatSources.human || 0}/AI${combatSources.ai || 0}<br>M: H${macroSources.human || 0}/AI${macroSources.ai || 0}</span></td>
-      <td><span class="pill ${pkg.complete ? "on" : "off"}">${pkg.complete ? "完整" : "缺文件"}</span><br><span class="fine">${formatBytes(pkg.size || 0)}</span></td>
+      <td>
+        <span class="pill ${pkg.complete ? "on" : "off"}">${pkg.complete ? "完整" : "缺文件"}</span><br>
+        <span class="pill ${isPinned ? "on" : "info"}">${isPinned ? "永久保留" : "自动保留"}</span><br>
+        <span class="fine">${formatBytes(pkg.size || 0)}</span>
+      </td>
+      <td>
+        <button onclick="renameModelPackage(${jsString(pkg.id)})">保存名称</button>
+        <button onclick="pinModelPackage(${jsString(pkg.id)})" ${isPinned ? "disabled" : ""}>永久保留</button>
+      </td>
     </tr>`;
   }).join("");
   const modelSwitchHtml = `
@@ -4124,12 +4273,20 @@ function renderModelHealth(models, aiProcess, control, runtime, monsterProfiles)
         <button class="primary" onclick="activateModelPackage()" ${packages.length ? "" : "disabled"}>切换到选中模型</button>
         <button onclick="restartAI()">重启 AI</button>
       </div>
+      <div class="field" style="margin-top:10px">
+        <span>永久保存当前模型</span>
+        <input id="manualModelName" type="text" placeholder="例如：第一关稳定版">
+      </div>
+      <div class="button-row" style="margin-top:8px">
+        <button onclick="saveCurrentModelSnapshot()">永久保存</button>
+      </div>
       <div id="modelSwitchResult" class="fine" style="margin-top:6px">当前启用：${escapeHtml(registry.active_label || activeModelId)}。切换后需要重启 AI 进程。</div>
+      <div class="fine" style="margin-top:6px">训练完成会自动保存模型快照，只保留最近 ${autoKeepLimit} 个；点“永久保留”的模型不会被自动清理。</div>
     </div>
     <div class="table-wrap" style="margin-top:10px">
       <table>
-        <thead><tr><th>ID</th><th>说明</th><th>样本</th><th>来源</th><th>状态</th></tr></thead>
-        <tbody>${packageRows || '<tr><td colspan=5>暂无可切换模型包</td></tr>'}</tbody>
+        <thead><tr><th>ID</th><th>名称</th><th>样本</th><th>来源</th><th>状态</th><th>操作</th></tr></thead>
+        <tbody>${packageRows || '<tr><td colspan=6>暂无可切换模型包</td></tr>'}</tbody>
       </table>
     </div>`;
 
@@ -4490,6 +4647,41 @@ async function activateModelPackage(){
   }
   refresh();
 }
+async function renameModelPackage(model_id){
+  const resultEl = document.getElementById("modelSwitchResult");
+  const input = document.getElementById(`modelLabel_${model_id}`);
+  const label = input ? input.value.trim() : "";
+  if (!model_id || !label) {
+    if (resultEl) resultEl.textContent = "模型名称不能为空。";
+    return;
+  }
+  const result = await api("/api/model/update", {model_id, label});
+  if (resultEl) resultEl.textContent = result.status === "ok" ? "模型名称已保存。" : (result.error || "保存失败");
+  refresh();
+}
+async function pinModelPackage(model_id){
+  const resultEl = document.getElementById("modelSwitchResult");
+  const input = document.getElementById(`modelLabel_${model_id}`);
+  const label = input ? input.value.trim() : "";
+  const body = {model_id, pin:true};
+  if (label) body.label = label;
+  const result = await api("/api/model/update", body);
+  if (resultEl) resultEl.textContent = result.status === "ok" ? "该模型已设为永久保留。" : (result.error || "保留失败");
+  refresh();
+}
+async function saveCurrentModelSnapshot(){
+  const resultEl = document.getElementById("modelSwitchResult");
+  const input = document.getElementById("manualModelName");
+  const label = input ? input.value.trim() : "";
+  const result = await api("/api/model/snapshot", {label});
+  if (result.status === "ok") {
+    if (input) input.value = "";
+    if (resultEl) resultEl.textContent = `已永久保存当前模型：${result.label || result.model_id}`;
+  } else if (resultEl) {
+    resultEl.textContent = result.error || "保存失败";
+  }
+  refresh();
+}
 async function proceed(){ await api("/api/proceed", {}); refresh(); }
 async function markRun(run_id, discarded){ await api("/api/run", {run_id, discarded}); refresh(); }
 async function setQuality(run_id, quality){ await api("/api/quality", {run_id, quality}); refresh(); }
@@ -4623,6 +4815,20 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, run_training_background())
             elif self.path == "/api/model/activate":
                 self._json(200, activate_model_package(body.get("model_id")))
+            elif self.path == "/api/model/snapshot":
+                self._json(200, create_model_snapshot(
+                    label=body.get("label", ""),
+                    retention="manual",
+                    description=body.get("description", ""),
+                    activate=bool(body.get("activate", False)),
+                ))
+            elif self.path == "/api/model/update":
+                self._json(200, update_model_package(
+                    body.get("model_id"),
+                    label=body.get("label") if "label" in body else None,
+                    description=body.get("description") if "description" in body else None,
+                    pin=bool(body.get("pin", False)),
+                ))
             elif self.path == "/api/export":
                 self._json(200, export_database_package())
             elif self.path == "/api/run":

@@ -23,6 +23,7 @@ AI_Training/ProcessedMacroParams/
 !AI_Training/ModelZoo/**/*.json
 !AI_Training/ModelZoo/**/*.pth
 !AI_Training/ModelZoo/**/*.md
+AI_Training/ModelZoo/auto_train_*/
 
 # Runtime control state
 AI_Training/control_state.json
