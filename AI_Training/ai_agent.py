@@ -225,8 +225,13 @@ def enemy_incoming_damage(enemies):
 def card_for_candidate(candidate, state):
     player = (state or {}).get("player") or {}
     hand = player.get("hand") or []
+    for card in hand:
+        if isinstance(card, dict) and safe_int(card.get("index"), -9999) == candidate.card_index:
+            return card
     if 0 <= candidate.card_index < len(hand) and isinstance(hand[candidate.card_index], dict):
-        return hand[candidate.card_index]
+        card = hand[candidate.card_index]
+        if str(card.get("id") or card.get("name") or "") == candidate.card_id:
+            return card
     for card in hand:
         if isinstance(card, dict) and str(card.get("id") or card.get("name") or "") == candidate.card_id:
             return card
