@@ -33,6 +33,7 @@ DEFAULT_CONTROL = {
     "ai_enabled": True,
     "macro_enabled": False,
     "macro_shop_enabled": False,
+    "macro_card_reward_weight": 0.35,
     "record_ai_actions": True,
     "include_ai_in_training": False,
 }
@@ -385,6 +386,17 @@ def macro_label_to_payload(label, state, allow_shop=False):
             return {"action": "select_card_reward", "card_index": index}, "available"
         return None, "card_index_out_of_range"
 
+    if label.startswith("choose_card:"):
+        if state_type != "card_reward":
+            return None, "not_card_reward"
+        wanted = label.split(":", 1)[1].lower()
+        cards = ((state.get("card_reward") or {}).get("cards") or [])
+        for fallback_index, card in enumerate(cards):
+            fields = (card.get("id"), card.get("name"), card.get("card_id"), card.get("card_name"))
+            if any(str(value or "").lower() == wanted for value in fields):
+                return {"action": "select_card_reward", "card_index": int(card.get("index", fallback_index))}, "available"
+        return None, "card_unavailable"
+
     if label == "skip_reward":
         if state_type == "card_reward" and (state.get("card_reward") or {}).get("can_skip"):
             return {"action": "skip_card_reward"}, "available"
@@ -459,6 +471,354 @@ def safe_num(value, default=0.0):
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def safe_int(value, default=0):
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def card_blob(card):
+    parts = []
+    for key in ("id", "name", "type", "description", "target_type", "rarity"):
+        value = card.get(key)
+        if value is not None:
+            parts.append(str(value))
+    keywords = card.get("keywords")
+    if keywords:
+        try:
+            parts.append(json.dumps(keywords, ensure_ascii=False))
+        except Exception:
+            parts.append(str(keywords))
+    return " ".join(parts).lower()
+
+
+def normalized_card_type(card_or_type):
+    value = card_or_type.get("type") if isinstance(card_or_type, dict) else card_or_type
+    text = str(value or "").strip().lower()
+    if "attack" in text or "攻击" in text:
+        return "attack"
+    if "skill" in text or "技能" in text:
+        return "skill"
+    if "power" in text or "能力" in text:
+        return "power"
+    if "curse" in text or "诅咒" in text:
+        return "curse"
+    if "status" in text or "状态" in text:
+        return "status"
+    return "other"
+
+
+def has_any(text, keywords):
+    return any(keyword in text for keyword in keywords)
+
+
+def card_traits(card):
+    text = card_blob(card)
+    ctype = normalized_card_type(card)
+    cost = safe_num(card.get("cost"), 0.0)
+    rarity = str(card.get("rarity") or "").lower()
+    return {
+        "type": ctype,
+        "cost": cost,
+        "rarity": rarity,
+        "is_attack": ctype == "attack",
+        "is_skill": ctype == "skill",
+        "is_power": ctype == "power",
+        "damage": ctype == "attack" or has_any(text, ("damage", "伤害")),
+        "block": ctype == "skill" and has_any(text, ("block", "格挡", "防御", "护甲")),
+        "draw": has_any(text, ("draw", "抽", "card draw", "抽牌")),
+        "aoe": has_any(text, ("all enemies", "aoe", "所有敌人", "全部敌人", "全体", "每个敌人")),
+        "scaling": has_any(text, ("strength", "dexterity", "focus", "力量", "敏捷", "集中", "每回合", "whenever", "永久")),
+    }
+
+
+def deck_profile_from_state(state):
+    player = state.get("player") or {}
+    deck = player.get("deck") or player.get("cards") or []
+    overview = player.get("deck_overview") or {}
+    profile = {
+        "total": safe_int(player.get("deck_size") or player.get("deck_total") or len(deck)),
+        "attack": 0,
+        "skill": 0,
+        "power": 0,
+        "other": 0,
+        "draw": 0,
+        "aoe": 0,
+        "scaling": 0,
+    }
+
+    if isinstance(deck, list) and deck:
+        for card in deck:
+            if not isinstance(card, dict):
+                continue
+            traits = card_traits(card)
+            ctype = traits["type"]
+            profile[ctype if ctype in ("attack", "skill", "power") else "other"] += 1
+            profile["draw"] += 1 if traits["draw"] else 0
+            profile["aoe"] += 1 if traits["aoe"] else 0
+            profile["scaling"] += 1 if traits["scaling"] or traits["is_power"] else 0
+        profile["total"] = max(profile["total"], sum(profile[k] for k in ("attack", "skill", "power", "other")))
+    elif isinstance(overview, dict):
+        for key, count in overview.items():
+            ctype = normalized_card_type(key)
+            bucket = ctype if ctype in ("attack", "skill", "power") else "other"
+            profile[bucket] += safe_int(count)
+        profile["total"] = max(profile["total"], sum(profile[k] for k in ("attack", "skill", "power", "other")))
+
+    total = max(profile["total"], 1)
+    profile["attack_ratio"] = round(profile["attack"] / total, 3)
+    profile["skill_ratio"] = round(profile["skill"] / total, 3)
+    profile["power_ratio"] = round(profile["power"] / total, 3)
+    return profile
+
+
+def public_deck_profile(profile):
+    return {
+        "total": profile.get("total", 0),
+        "attack": profile.get("attack", 0),
+        "skill": profile.get("skill", 0),
+        "power": profile.get("power", 0),
+        "draw": profile.get("draw", 0),
+        "aoe": profile.get("aoe", 0),
+        "scaling": profile.get("scaling", 0),
+        "attack_ratio": profile.get("attack_ratio", 0),
+        "skill_ratio": profile.get("skill_ratio", 0),
+    }
+
+
+def score_reward_card(card, profile, state):
+    traits = card_traits(card)
+    run = state.get("run") or {}
+    player = state.get("player") or {}
+    act = safe_int(run.get("act"), 1)
+    floor = safe_int(run.get("floor"), 0)
+    hp = safe_num(player.get("hp"), 0.0)
+    max_hp = max(safe_num(player.get("max_hp"), 1.0), 1.0)
+    hp_ratio = hp / max_hp
+    deck_size = max(safe_int(profile.get("total")), 1)
+    attack = safe_int(profile.get("attack"))
+    skill = safe_int(profile.get("skill"))
+    power = safe_int(profile.get("power"))
+    attack_ratio = safe_num(profile.get("attack_ratio"))
+    skill_ratio = safe_num(profile.get("skill_ratio"))
+
+    score = 0.0
+    reasons = []
+
+    if traits["is_attack"]:
+        if act <= 1 and floor <= 8:
+            score += 2.0
+            reasons.append("Act1前期需要输出")
+        if attack < 5:
+            score += 1.8
+            reasons.append("攻击牌偏少")
+        if attack_ratio < 0.32:
+            score += 1.2
+            reasons.append("攻击比例低")
+        if attack_ratio > 0.45 and deck_size >= 16:
+            score -= 1.0
+            reasons.append("攻击比例已高")
+
+    if traits["is_skill"]:
+        if skill_ratio < 0.30 and deck_size >= 12:
+            score += 1.2
+            reasons.append("技能牌偏少")
+        if act >= 2:
+            score += 0.8
+            reasons.append("中后期需要防御/功能")
+        if hp_ratio < 0.55 and traits["block"]:
+            score += 1.4
+            reasons.append("低血量优先格挡")
+
+    if traits["is_power"]:
+        if floor >= 8 or act >= 2:
+            score += 1.2
+            reasons.append("需要长期成长")
+        if power < 2:
+            score += 0.8
+            reasons.append("能力牌偏少")
+        if act <= 1 and floor <= 5:
+            score -= 0.5
+            reasons.append("前期能力牌过慢")
+
+    if traits["draw"]:
+        if deck_size >= 18 and safe_int(profile.get("draw")) < 2:
+            score += 1.6
+            reasons.append("牌组变厚需要过牌")
+        elif safe_int(profile.get("draw")) < 1:
+            score += 0.8
+            reasons.append("缺少过牌")
+
+    if traits["aoe"] and safe_int(profile.get("aoe")) < 1:
+        score += 1.3
+        reasons.append("缺少AOE")
+
+    if traits["scaling"] and (act >= 2 or floor >= 10):
+        score += 1.1
+        reasons.append("中后期补成长")
+
+    if "rare" in traits["rarity"]:
+        score += 0.35
+        reasons.append("稀有牌")
+    elif "uncommon" in traits["rarity"]:
+        score += 0.15
+        reasons.append("罕见牌")
+
+    if traits["cost"] >= 3:
+        penalty = 0.8 if act <= 1 and floor <= 8 else 0.25
+        score -= penalty
+        reasons.append("高费用")
+
+    if deck_size >= 28 and score < 1.0:
+        score -= 0.7
+        reasons.append("牌组已厚")
+
+    return round(score, 3), reasons[:3]
+
+
+def score_skip_card_reward(card_scores, profile, state):
+    run = state.get("run") or {}
+    act = safe_int(run.get("act"), 1)
+    floor = safe_int(run.get("floor"), 0)
+    deck_size = safe_int(profile.get("total"))
+    best = max(card_scores) if card_scores else 0.0
+    if deck_size >= 30 and best < 1.25:
+        return 2.0, ["牌组过厚且候选不强"]
+    if deck_size >= 24 and best < 0.5:
+        return 1.0, ["候选牌收益低"]
+    if act <= 1 and floor <= 8 and deck_size < 18:
+        return -2.0, ["前期不建议跳过"]
+    return -1.0, ["默认优先拿有效牌"]
+
+
+def card_reward_baseline_entries(state):
+    cards = ((state.get("card_reward") or {}).get("cards") or [])
+    profile = deck_profile_from_state(state)
+    entries = []
+    card_scores = []
+    for fallback_index, card in enumerate(cards):
+        if not isinstance(card, dict):
+            continue
+        index = safe_int(card.get("index"), fallback_index)
+        score, reasons = score_reward_card(card, profile, state)
+        card_scores.append(score)
+        entries.append({
+            "label": f"choose_card:index_{index}",
+            "payload": {"action": "select_card_reward", "card_index": index},
+            "score": score,
+            "reasons": reasons,
+            "card": card,
+        })
+    if (state.get("card_reward") or {}).get("can_skip"):
+        skip_score, skip_reasons = score_skip_card_reward(card_scores, profile, state)
+        entries.append({
+            "label": "skip_reward",
+            "payload": {"action": "skip_card_reward"},
+            "score": skip_score,
+            "reasons": skip_reasons,
+            "card": {},
+        })
+    return entries, profile
+
+
+def choose_card_reward_baseline_action(state, card_baseline_weight=1.0):
+    entries, profile = card_reward_baseline_entries(state)
+    if not entries:
+        return None, {
+            "top_actions": [],
+            "chosen_action": None,
+            "payload": None,
+            "reason": "no_card_reward_options",
+            "deck_profile": public_deck_profile(profile),
+            "reward_baseline": {"mode": "baseline_only", "weight": card_baseline_weight},
+        }
+    entries.sort(key=lambda item: item["score"], reverse=True)
+    best = entries[0]
+    top_actions = [
+        {
+            "action": item["label"],
+            "confidence": round(max(item["score"], 0.0) * 20, 2),
+            "marker": f"baseline={item['score']:+.2f}; {' / '.join(item['reasons']) or '-'}",
+        }
+        for item in entries[:6]
+    ]
+    return best["payload"], {
+        "top_actions": top_actions,
+        "chosen_action": best["label"],
+        "payload": best["payload"],
+        "reason": "card_reward_baseline: " + (" / ".join(best["reasons"]) or "highest score"),
+        "deck_profile": public_deck_profile(profile),
+        "reward_baseline": {
+            "mode": "baseline_only",
+            "weight": card_baseline_weight,
+            "chosen_score": best["score"],
+            "chosen_reason": best["reasons"],
+        },
+    }
+
+
+def choose_card_reward_mixed_action(macro_agent, state, outputs, probs, card_baseline_weight):
+    baseline_entries, profile = card_reward_baseline_entries(state)
+    baseline_by_label = {entry["label"]: entry for entry in baseline_entries}
+    baseline_by_payload = {json.dumps(entry["payload"], sort_keys=True): entry for entry in baseline_entries}
+    ranked = []
+
+    for idx, logit in enumerate(outputs):
+        label = macro_agent["id_to_action"].get(idx, "UNKNOWN")
+        if label in ("UNKNOWN", "PAD"):
+            continue
+        if not (label.startswith("choose_card:") or label == "skip_reward"):
+            continue
+        payload, status = macro_label_to_payload(label, state)
+        if not payload:
+            continue
+        entry = baseline_by_label.get(label) or baseline_by_payload.get(json.dumps(payload, sort_keys=True))
+        baseline_score = safe_num((entry or {}).get("score"))
+        reasons = (entry or {}).get("reasons", [])
+        adjusted = float(logit.item()) + card_baseline_weight * baseline_score
+        ranked.append({
+            "label": label,
+            "payload": payload,
+            "status": status,
+            "prob": float(probs[idx].item()) * 100.0,
+            "baseline_score": baseline_score,
+            "adjusted": adjusted,
+            "reasons": reasons,
+        })
+
+    if not ranked:
+        return choose_card_reward_baseline_action(state, card_baseline_weight)
+
+    ranked.sort(key=lambda item: item["adjusted"], reverse=True)
+    best = ranked[0]
+    top_actions = [
+        {
+            "action": item["label"],
+            "confidence": round(item["prob"], 2),
+            "marker": (
+                f"{item['status']}; baseline={item['baseline_score']:+.2f}; "
+                f"mixed={item['adjusted']:+.2f}; {' / '.join(item['reasons']) or '-'}"
+            ),
+        }
+        for item in ranked[:6]
+    ]
+    return best["payload"], {
+        "top_actions": top_actions,
+        "chosen_action": best["label"],
+        "payload": best["payload"],
+        "reason": "card_reward_mixed: " + (" / ".join(best["reasons"]) or best["status"]),
+        "deck_profile": public_deck_profile(profile),
+        "reward_baseline": {
+            "mode": "model_plus_baseline",
+            "weight": card_baseline_weight,
+            "chosen_score": round(best["baseline_score"], 3),
+            "chosen_mixed_score": round(best["adjusted"], 3),
+            "chosen_reason": best["reasons"],
+        },
+    }
 
 
 def route_type_score(node_type, hp_ratio, gold):
@@ -601,11 +961,14 @@ def macro_state_signature(state):
     return json.dumps(payload, sort_keys=True, ensure_ascii=False)
 
 
-def choose_macro_action(macro_agent, state, allow_shop=False):
-    if str(state.get("state_type") or "").lower() == "map":
+def choose_macro_action(macro_agent, state, allow_shop=False, card_baseline_weight=0.35):
+    state_type = str(state.get("state_type") or "").lower()
+    if state_type == "map":
         return choose_map_route_action(state)
 
     if not macro_agent:
+        if state_type == "card_reward":
+            return choose_card_reward_baseline_action(state, card_baseline_weight)
         return None, {
             "top_actions": [],
             "chosen_action": None,
@@ -629,6 +992,9 @@ def choose_macro_action(macro_agent, state, allow_shop=False):
         outputs = macro_agent["model"](state_tensor)
         probs = torch.softmax(outputs[0], dim=0)
         sorted_indices = torch.argsort(outputs[0], descending=True)
+
+    if state_type == "card_reward":
+        return choose_card_reward_mixed_action(macro_agent, state, outputs[0], probs, card_baseline_weight)
 
     top_actions = []
     chosen_payload = None
@@ -938,7 +1304,13 @@ def run_agent():
 
             if control.get("macro_enabled", False) and state_type in ("map", "rewards", "card_reward", "event", "rest_site", "shop", "fake_merchant", "treasure"):
                 allow_shop = bool(control.get("macro_shop_enabled", False))
-                payload, macro_info = choose_macro_action(macro_agent, state, allow_shop=allow_shop)
+                card_baseline_weight = safe_num(control.get("macro_card_reward_weight"), 0.35)
+                payload, macro_info = choose_macro_action(
+                    macro_agent,
+                    state,
+                    allow_shop=allow_shop,
+                    card_baseline_weight=card_baseline_weight,
+                )
                 decision_key = json.dumps({
                     "signature": macro_state_signature(state),
                     "payload": payload,
@@ -954,6 +1326,8 @@ def run_agent():
                     "chosen_action": macro_info.get("chosen_action"),
                     "payload": payload,
                     "reason": macro_info.get("reason"),
+                    "deck_profile": macro_info.get("deck_profile"),
+                    "reward_baseline": macro_info.get("reward_baseline"),
                 })
                 if payload and decision_key != last_macro_decision_key:
                     print(Fore.GREEN + Style.BRIGHT + f"  >>> MACRO EXECUTE: {macro_info.get('chosen_action')}")

@@ -80,6 +80,7 @@ DEFAULT_CONTROL = {
     "ai_enabled": False,
     "macro_enabled": False,
     "macro_shop_enabled": False,
+    "macro_card_reward_weight": 0.35,
     "record_ai_actions": True,
     "include_ai_in_training": False,
     "next_run_mode": "auto",
@@ -145,6 +146,11 @@ def update_control(patch):
                 data[key] = patch[key] if patch[key] in ("auto", "new", "continue") else "auto"
             elif key == "min_training_quality":
                 data[key] = patch[key] if patch[key] in QUALITY_ORDER else "unknown"
+            elif key == "macro_card_reward_weight":
+                try:
+                    data[key] = max(0.0, min(float(patch[key]), 2.0))
+                except (TypeError, ValueError):
+                    data[key] = DEFAULT_CONTROL[key]
             elif key == "collection_enabled":
                 enabled = bool(patch[key])
                 was_enabled = bool(data.get("collection_enabled", True))
@@ -970,8 +976,8 @@ INDEX_HTML = r"""<!doctype html>
       background:
         radial-gradient(circle at 12% 8%, rgba(209,162,58,.12), transparent 26%),
         radial-gradient(circle at 90% 3%, rgba(47,111,120,.10), transparent 22%),
-        linear-gradient(90deg, rgba(23,33,38,.035) 1px, transparent 1px) 0 0 / 44px 44px,
-        linear-gradient(0deg, rgba(23,33,38,.028) 1px, transparent 1px) 0 0 / 44px 44px,
+        linear-gradient(90deg, rgba(23,33,38,.075) 1px, transparent 1px) 0 0 / 44px 44px,
+        linear-gradient(0deg, rgba(23,33,38,.060) 1px, transparent 1px) 0 0 / 44px 44px,
         var(--bg);
       font-size:14px;
       line-height:1.45;
@@ -980,13 +986,13 @@ INDEX_HTML = r"""<!doctype html>
     body::before {
       content:"";
       position:fixed;
-      right:-72px;
-      top:150px;
-      width:280px;
-      height:280px;
+      left:50%;
+      top:382px;
+      width:310px;
+      height:310px;
       background:url("/assets/sts2_ai_logo.png") center / contain no-repeat;
-      opacity:.035;
-      transform:rotate(-10deg);
+      opacity:.042;
+      transform:translateX(-50%) rotate(-10deg);
       pointer-events:none;
       z-index:0;
     }
@@ -1027,14 +1033,16 @@ INDEX_HTML = r"""<!doctype html>
     header::after {
       content:"";
       position:absolute;
-      right:34px;
-      top:34px;
-      width:148px;
-      height:104px;
+      left:50%;
+      top:28px;
+      width:170px;
+      height:120px;
       background:
-        linear-gradient(135deg, transparent 0 34%, rgba(47,111,120,.10) 35% 37%, transparent 38%),
-        linear-gradient(90deg, rgba(47,111,120,.08) 0 34px, transparent 34px 52px, rgba(209,162,58,.10) 52px 86px, transparent 86px);
+        linear-gradient(135deg, transparent 0 34%, rgba(47,111,120,.13) 35% 37%, transparent 38%),
+        linear-gradient(90deg, rgba(47,111,120,.10) 0 34px, transparent 34px 52px, rgba(209,162,58,.12) 52px 86px, transparent 86px);
       clip-path:polygon(8% 38%, 36% 8%, 72% 16%, 94% 42%, 78% 82%, 36% 94%, 10% 70%);
+      transform:translateX(-50%);
+      opacity:.85;
       pointer-events:none;
     }
     .topbar {
@@ -1080,17 +1088,22 @@ INDEX_HTML = r"""<!doctype html>
       pointer-events:none;
     }
     .brand-mark::before {
-      inset:10px;
+      inset:8px;
       transform:rotate(45deg);
-      background:rgba(47,111,120,.035);
+      border-color:rgba(47,111,120,.28);
+      border-radius:15px;
+      background:linear-gradient(135deg, rgba(255,254,250,.82), rgba(237,245,242,.72));
+      box-shadow:inset 0 0 0 1px rgba(255,255,255,.70), 0 12px 28px rgba(38,55,58,.08);
     }
     .brand-mark::after {
-      right:0;
-      top:4px;
-      width:24px;
-      height:24px;
-      background:var(--accent-bg);
+      right:5px;
+      top:6px;
+      width:26px;
+      height:26px;
+      border-color:rgba(209,162,58,.34);
+      background:rgba(251,244,223,.72);
       transform:rotate(12deg);
+      opacity:.92;
     }
     .brand-logo {
       position:relative;
@@ -1098,12 +1111,13 @@ INDEX_HTML = r"""<!doctype html>
       width:86px;
       height:86px;
       object-fit:contain;
-      filter:none;
-      background:#fff;
-      border:1px solid var(--line-strong);
-      border-radius:10px;
-      padding:10px;
-      box-shadow:0 10px 26px rgba(38,55,58,.13);
+      filter:drop-shadow(0 2px 0 rgba(255,255,255,.72)) drop-shadow(0 8px 14px rgba(38,55,58,.12));
+      background:transparent;
+      border:0;
+      border-radius:0;
+      padding:6px;
+      box-shadow:none;
+      opacity:.94;
     }
     .brand-copy { min-width:0; }
     h1 { margin:0; font-size:29px; letter-spacing:0; line-height:1.1; }
@@ -3368,13 +3382,19 @@ function renderAiLogic(logic) {
   const payload = logic.payload ? JSON.stringify(logic.payload) : "-";
   setPill("aiDecisionBadge", mode === "macro" ? `宏观 ${logic.chosen_action || "-"}` : (logic.chosen_action || "有决策"), mode === "macro" ? "warn" : "info");
   if (mode === "macro") {
+    const deck = logic.deck_profile || {};
+    const baseline = logic.reward_baseline || {};
+    const baselineReason = (baseline.chosen_reason || []).join(" / ") || "-";
     document.getElementById("aiLogic").innerHTML = `
       <div class="kv"><span>类型</span><span class="strong">宏观决策</span></div>
       <div class="kv"><span>时间</span><span>${logic.time || "-"}</span></div>
       <div class="kv"><span>场景</span><span>${logic.state_type || "-"}</span></div>
       <div class="kv"><span>执行</span><span class="strong">${logic.chosen_action || "-"}</span></div>
       <div class="kv"><span>Payload</span><code>${payload}</code></div>
-      <div class="kv"><span>原因</span><span>${logic.reason || "-"}</span></div>`;
+      <div class="kv"><span>原因</span><span>${logic.reason || "-"}</span></div>
+      ${baseline.mode ? `<div class="kv"><span>选卡基准</span><span>${baseline.mode}，权重 ${baseline.weight ?? "-"}，分 ${baseline.chosen_score ?? "-"}</span></div>` : ""}
+      ${baseline.mode ? `<div class="kv"><span>基准理由</span><span>${escapeHtml(baselineReason)}</span></div>` : ""}
+      ${deck.total ? `<div class="kv"><span>牌组结构</span><span>${deck.total} 张；攻 ${deck.attack || 0} / 技 ${deck.skill || 0} / 能 ${deck.power || 0}；抽 ${deck.draw || 0} / AOE ${deck.aoe || 0}</span></div>` : ""}`;
   } else {
     document.getElementById("aiLogic").innerHTML = `
       <div class="kv"><span>类型</span><span class="strong">战斗决策</span></div>

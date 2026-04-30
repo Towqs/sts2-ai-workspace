@@ -402,6 +402,31 @@ public static partial class McpMod
         }
         state["potions"] = potions;
 
+        try
+        {
+            var deck = new List<Dictionary<string, object?>>();
+            var deckOverview = new Dictionary<string, int>();
+            foreach (var card in player.Deck.Cards)
+            {
+                string type = card.Type.ToString();
+                if (!deckOverview.ContainsKey(type))
+                    deckOverview[type] = 0;
+                deckOverview[type]++;
+
+                var cardInfo = BuildCardInfo(card);
+                cardInfo["deck_index"] = deck.Count;
+                deck.Add(cardInfo);
+            }
+            state["deck"] = deck;
+            state["deck_size"] = deck.Count;
+            state["deck_overview"] = deckOverview;
+        }
+        catch
+        {
+            state["deck_size"] = 0;
+            state["deck_overview"] = new Dictionary<string, int>();
+        }
+
         return state;
     }
 
