@@ -179,6 +179,38 @@ def combat_number_hint(item, mode):
     return nums[0] if nums else 0
 
 
+def known_card_effect_hints(card):
+    card_id = str(card.get("id") or "").upper()
+    text = combat_text(card)
+    damage = 0.0
+    block = 0.0
+
+    known_damage = {
+        "STRIKE": 6.0,
+        "STRIKE_IRONCLAD": 6.0,
+        "BASH": 8.0,
+        "ANGER": 6.0,
+        "HEADBUTT": 9.0,
+        "THUNDERCLAP": 4.0,
+        "SWORD_BOOMERANG": 9.0,
+        "FORGOTTEN_RITUAL": 10.0,
+    }
+    known_block = {
+        "DEFEND": 5.0,
+        "DEFEND_IRONCLAD": 5.0,
+        "DRUM_OF_BATTLE": 5.0,
+    }
+    if card_id in known_damage:
+        damage = known_damage[card_id]
+    elif "attack" in text or "攻击" in text:
+        damage = 6.0
+    if card_id in known_block:
+        block = known_block[card_id]
+    elif "defend" in text or "防御" in text or "block" in text or "格挡" in text:
+        block = 5.0
+    return damage, block
+
+
 def card_self_damage(card):
     text = combat_text(card)
     card_key = f"{card.get('id') or ''} {card.get('name') or ''} {text}".lower()
@@ -267,6 +299,11 @@ def card_effect_profile(card):
     card_type = str(card.get("type") or "").lower()
     damage = combat_number_hint(card, "attack")
     block_gain = combat_number_hint(card, "block")
+    known_damage, known_block = known_card_effect_hints(card)
+    if damage <= 0:
+        damage = known_damage
+    if block_gain <= 0:
+        block_gain = known_block
     self_damage = card_self_damage(card)
     status_like_ids = {
         "SLIMED",
@@ -360,7 +397,7 @@ def candidate_should_play_before_end_turn(candidate, state):
         incoming = enemy_incoming_damage(battle.get("enemies") or [])
         block = safe_num(player.get("block"), 0.0)
         net_incoming = max(0.0, incoming - block)
-        if profile["self_damage"] > 0 and (hp <= profile["self_damage"] + 1 or hp_ratio <= 0.25):
+        if profile["self_damage"] > 0 and (hp <= profile["self_damage"] + 1 or hp_ratio <= 0.35):
             return False
         if profile["status_like"] and profile["damage"] <= 0 and profile["block_gain"] <= 0:
             return False
@@ -423,7 +460,7 @@ def tactical_candidate_adjustment(candidate, state):
             reasons.append("status_card_penalty")
 
         if self_damage > 0:
-            if hp <= self_damage + 1 or hp_ratio <= 0.25:
+            if hp <= self_damage + 1 or hp_ratio <= 0.35:
                 return -100.0, f"blocked_self_damage hp={hp:g} cost={self_damage:g}"
             adjustment -= 2.0
             reasons.append(f"self_damage={self_damage:g}")
@@ -442,6 +479,13 @@ def tactical_candidate_adjustment(candidate, state):
             elif block_gain > 0 and damage <= 0 and block + block_gain > incoming + 6 and not profile["has_utility"]:
                 adjustment -= 4.0
                 reasons.append("overblock_penalty")
+            if net_incoming >= hp and hp > 0:
+                if block_gain > 0:
+                    adjustment += 12.0
+                    reasons.append("lethal_block")
+                elif damage > 0 and not (candidate.target_effective_hp and damage >= candidate.target_effective_hp):
+                    adjustment -= 6.0
+                    reasons.append("nonlethal_attack_under_lethal")
             if net_incoming >= max(8.0, hp * 0.35) and block_gain > 0:
                 adjustment += 5.0
                 reasons.append("high_threat_block")
@@ -490,6 +534,14 @@ def score_combat_candidates(candidate_agent, state_vec, candidates, state=None):
     model = candidate_agent["model"]
     device = candidate_agent["device"]
     force_delay_end_turn, delay_reason = should_force_delay_end_turn(candidates, state)
+    lethal_end_turn = False
+    if state:
+        player = state.get("player") or {}
+        battle = state.get("battle") or {}
+        hp = safe_num(player.get("hp"), 0.0)
+        block = safe_num(player.get("block"), 0.0)
+        incoming = enemy_incoming_damage(battle.get("enemies") or [])
+        lethal_end_turn = bool(hp > 0 and max(0.0, incoming - block) >= hp and any(c.kind != "end_turn" for c in candidates))
     state_part = align_feature_vector(state_vec, int(candidate_agent["state_dim"]))
     rows = []
     for candidate in candidates:
@@ -506,6 +558,13 @@ def score_combat_candidates(candidate_agent, state_vec, candidates, state=None):
     ranked = []
     for candidate, logit, prob in zip(candidates, logits.detach().cpu().numpy(), probs):
         adjustment, marker = tactical_candidate_adjustment(candidate, state)
+        if lethal_end_turn:
+            if candidate.kind == "end_turn":
+                adjustment -= 100.0
+                marker = ",".join(x for x in (marker, "never_end_turn_into_lethal") if x)
+            elif candidate.kind == "use_potion":
+                adjustment += 8.0
+                marker = ",".join(x for x in (marker, "desperate_potion") if x)
         if candidate.kind == "end_turn" and force_delay_end_turn:
             adjustment -= 100.0
             marker = ",".join(x for x in (marker, delay_reason) if x)
