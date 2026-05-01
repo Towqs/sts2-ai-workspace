@@ -41,7 +41,7 @@ SERVER_STATE_PATH = AI_DIR / "control_panel_state.json"
 DEFAULT_PYTHON_EXE = WORKSPACE / ".venv" / "Scripts" / "python.exe"
 AGENT_PATH = AI_DIR / "ai_agent.py"
 LLM_AGENT_PATH = AI_DIR / "llm_agent.py"
-API_URL = "http://localhost:15526/api/v1/singleplayer"
+API_URL = "http://127.0.0.1:15526/api/v1/singleplayer"
 
 MODEL_ARTIFACTS = {
     "ProcessedParams": [
@@ -138,7 +138,12 @@ LAST_EXPORT = {"path": None, "filename": None, "created": None, "size": 0, "file
 LLM_TEST_STATE = {"running": False, "last_started": 0.0, "last_finished": 0.0}
 GAME_CACHE = {"state": None, "ts": 0.0}
 PYTHON_RUNTIME_CACHE = {"ts": 0.0, "data": None}
+PYTHON_RUNTIME_LOCK = threading.Lock()
+DASHBOARD_DATA_CACHE = {"ts": 0.0, "data": None}
+DASHBOARD_DATA_LOCK = threading.Lock()
 APP_VERSION_CACHE = {"ts": 0.0, "data": None}
+PYTHON_RUNTIME_CACHE_TTL_SEC = 300
+DASHBOARD_DATA_CACHE_TTL_SEC = 8
 REQUIRED_AGENT_MODULES = ["requests", "torch", "numpy", "colorama"]
 REQUIRED_TRAINING_MODULES = ["numpy", "torch"]
 
@@ -482,62 +487,91 @@ def ensure_llm_profiles_initialized():
         write_json(LLM_CONFIG_PATH, _upsert_current_llm_profile(data))
 
 
-def python_runtime_status(force=False):
-    now = time.time()
-    cached = PYTHON_RUNTIME_CACHE.get("data")
-    if cached and not force and now - float(PYTHON_RUNTIME_CACHE.get("ts") or 0) < 60:
-        return cached
-
+def provisional_python_runtime_status():
     modules = sorted(set(REQUIRED_AGENT_MODULES + REQUIRED_TRAINING_MODULES))
-    code = (
-        "import importlib, json, sys;"
-        f"mods={modules!r};"
-        "missing=[];"
-        "\nfor m in mods:\n"
-        "    try:\n"
-        "        importlib.import_module(m)\n"
-        "    except Exception:\n"
-        "        missing.append(m)\n"
-        "print(json.dumps({'executable': sys.executable, 'version': sys.version.split()[0], 'missing': missing}))"
-    )
-    status = {
+    return {
         "executable": str(PYTHON_EXE),
         "version": "",
         "ok": False,
-        "missing": modules,
-        "agent_ready": False,
-        "training_ready": False,
-        "message": "",
+        "checking": True,
+        "missing": [],
+        "agent_ready": None,
+        "training_ready": None,
+        "message": "正在检查 Python 环境",
     }
+
+
+def _refresh_python_runtime_cache(blocking=True):
+    acquired = PYTHON_RUNTIME_LOCK.acquire(blocking=blocking)
+    if not acquired:
+        return False
     try:
-        proc = subprocess.run(
-            [str(PYTHON_EXE), "-c", code],
-            cwd=str(WORKSPACE),
-            capture_output=True,
-            text=True,
-            timeout=12,
+        modules = sorted(set(REQUIRED_AGENT_MODULES + REQUIRED_TRAINING_MODULES))
+        code = (
+            "import importlib, json, sys;"
+            f"mods={modules!r};"
+            "missing=[];"
+            "\nfor m in mods:\n"
+            "    try:\n"
+            "        importlib.import_module(m)\n"
+            "    except Exception:\n"
+            "        missing.append(m)\n"
+            "print(json.dumps({'executable': sys.executable, 'version': sys.version.split()[0], 'missing': missing}))"
         )
-        if proc.returncode == 0:
-            payload = json.loads((proc.stdout or "{}").strip().splitlines()[-1])
-            missing = payload.get("missing") or []
-            status.update({
-                "executable": payload.get("executable") or str(PYTHON_EXE),
-                "version": payload.get("version") or "",
-                "ok": True,
-                "missing": missing,
-                "agent_ready": not any(m in missing for m in REQUIRED_AGENT_MODULES),
-                "training_ready": not any(m in missing for m in REQUIRED_TRAINING_MODULES),
-                "message": "ok" if not missing else "缺少模块：" + ", ".join(missing),
-            })
-        else:
-            detail = (proc.stderr or proc.stdout or "").strip()
-            status["message"] = detail[-500:] if detail else f"Python exited {proc.returncode}"
-    except Exception as exc:
-        status["message"] = str(exc)
+        status = {
+            "executable": str(PYTHON_EXE),
+            "version": "",
+            "ok": False,
+            "checking": False,
+            "missing": modules,
+            "agent_ready": False,
+            "training_ready": False,
+            "message": "",
+        }
+        try:
+            proc = subprocess.run(
+                [str(PYTHON_EXE), "-c", code],
+                cwd=str(WORKSPACE),
+                capture_output=True,
+                text=True,
+                timeout=12,
+            )
+            if proc.returncode == 0:
+                payload = json.loads((proc.stdout or "{}").strip().splitlines()[-1])
+                missing = payload.get("missing") or []
+                status.update({
+                    "executable": payload.get("executable") or str(PYTHON_EXE),
+                    "version": payload.get("version") or "",
+                    "ok": True,
+                    "missing": missing,
+                    "agent_ready": not any(m in missing for m in REQUIRED_AGENT_MODULES),
+                    "training_ready": not any(m in missing for m in REQUIRED_TRAINING_MODULES),
+                    "message": "ok" if not missing else "缺少模块：" + ", ".join(missing),
+                })
+            else:
+                detail = (proc.stderr or proc.stdout or "").strip()
+                status["message"] = detail[-500:] if detail else f"Python exited {proc.returncode}"
+        except Exception as exc:
+            status["message"] = str(exc)
 
-    PYTHON_RUNTIME_CACHE.update({"ts": now, "data": status})
-    return status
+        PYTHON_RUNTIME_CACHE.update({"ts": time.time(), "data": status})
+        return True
+    finally:
+        PYTHON_RUNTIME_LOCK.release()
 
+
+def python_runtime_status(force=False, background=False):
+    now = time.time()
+    cached = PYTHON_RUNTIME_CACHE.get("data")
+    if cached and not force and now - float(PYTHON_RUNTIME_CACHE.get("ts") or 0) < PYTHON_RUNTIME_CACHE_TTL_SEC:
+        return cached
+    if background:
+        if not PYTHON_RUNTIME_LOCK.locked():
+            threading.Thread(target=_refresh_python_runtime_cache, kwargs={"blocking": False}, daemon=True).start()
+        return cached or provisional_python_runtime_status()
+
+    _refresh_python_runtime_cache(blocking=True)
+    return PYTHON_RUNTIME_CACHE.get("data") or provisional_python_runtime_status()
 
 def post_game_action(payload):
     req = Request(
@@ -1302,11 +1336,67 @@ def restart_ai():
     return start_ai()
 
 
+def provisional_dashboard_data(message="正在读取 run 数据..."):
+    return {
+        "runs": [],
+        "current_data": {"active_run": None, "warning": message},
+        "recent_records": [],
+        "evaluation": {"generated_at": "", "policies": [], "recent_runs": [], "total_runs": 0},
+        "dashboard_loading": True,
+    }
+
+
+def _build_dashboard_data():
+    return {
+        "runs": latest_runs(),
+        "current_data": current_data_summary(),
+        "recent_records": recent_records(),
+        "evaluation": evaluation_summary(limit=50),
+        "dashboard_loading": False,
+    }
+
+
+def _refresh_dashboard_data_cache(blocking=True):
+    acquired = DASHBOARD_DATA_LOCK.acquire(blocking=blocking)
+    if not acquired:
+        return False
+    try:
+        try:
+            data = _build_dashboard_data()
+        except Exception as exc:
+            data = DASHBOARD_DATA_CACHE.get("data") or provisional_dashboard_data(f"run 数据读取失败：{exc}")
+            data = dict(data)
+            data["dashboard_error"] = str(exc)
+        DASHBOARD_DATA_CACHE.update({"ts": time.time(), "data": data})
+        return True
+    finally:
+        DASHBOARD_DATA_LOCK.release()
+
+
+def dashboard_data_status(force=False, background=False):
+    now = time.time()
+    cached = DASHBOARD_DATA_CACHE.get("data")
+    if cached and not force and now - float(DASHBOARD_DATA_CACHE.get("ts") or 0) < DASHBOARD_DATA_CACHE_TTL_SEC:
+        return cached
+    if background:
+        if not DASHBOARD_DATA_LOCK.locked():
+            threading.Thread(target=_refresh_dashboard_data_cache, kwargs={"blocking": False}, daemon=True).start()
+        return cached or provisional_dashboard_data()
+
+    _refresh_dashboard_data_cache(blocking=True)
+    return DASHBOARD_DATA_CACHE.get("data") or provisional_dashboard_data()
+
+
+def invalidate_dashboard_data_cache():
+    DASHBOARD_DATA_CACHE["ts"] = 0.0
+
+
 def status_payload():
     control = read_control()
     game = get_game_state_for_dashboard(control)
     ai_process = ai_process_status()
     models = models_status()
+    dashboard = dashboard_data_status(background=True)
     return {
         "control": control,
         "ai_pid": ai_process.get("pid"),
@@ -1326,11 +1416,13 @@ def status_payload():
             "energy": game.get("player", {}).get("energy"),
             "shop_poll_guard": game.get("shop_poll_guard", False),
         },
-        "runs": latest_runs(),
-        "current_data": current_data_summary(),
-        "recent_records": recent_records(),
-        "evaluation": evaluation_summary(limit=50),
-        "python_runtime": python_runtime_status(),
+        "runs": dashboard.get("runs", []),
+        "current_data": dashboard.get("current_data") or provisional_dashboard_data()["current_data"],
+        "recent_records": dashboard.get("recent_records", []),
+        "evaluation": dashboard.get("evaluation", {}),
+        "dashboard_loading": dashboard.get("dashboard_loading", False),
+        "dashboard_error": dashboard.get("dashboard_error", ""),
+        "python_runtime": python_runtime_status(background=True),
         "ai_logic": ai_logic_snapshot(),
         "llm": {
             "config": read_llm_config(mask_key=True),
@@ -1378,6 +1470,10 @@ INDEX_HTML = r"""<!doctype html>
       --accent-bg:#fbf4df;
       --shadow:0 18px 46px rgba(38,55,58,.08);
       --shadow-soft:0 8px 24px rgba(38,55,58,.06);
+      --ease-smooth:cubic-bezier(.2,.8,.2,1);
+      --ease-settle:cubic-bezier(.16,1,.3,1);
+      --parallax-back:0px;
+      --parallax-soft:0px;
     }
     * { box-sizing:border-box; }
     body {
@@ -1419,7 +1515,7 @@ INDEX_HTML = r"""<!doctype html>
       height:310px;
       background:url("/assets/sts2_ai_logo.png") center / contain no-repeat;
       opacity:.042;
-      transform:translateX(-50%) rotate(-10deg);
+      transform:translateX(-50%) translateY(var(--parallax-back)) rotate(-10deg);
       pointer-events:none;
       z-index:0;
     }
@@ -1468,7 +1564,7 @@ INDEX_HTML = r"""<!doctype html>
         linear-gradient(135deg, transparent 0 34%, rgba(47,111,120,.13) 35% 37%, transparent 38%),
         linear-gradient(90deg, rgba(47,111,120,.10) 0 34px, transparent 34px 52px, rgba(209,162,58,.12) 52px 86px, transparent 86px);
       clip-path:polygon(8% 38%, 36% 8%, 72% 16%, 94% 42%, 78% 82%, 36% 94%, 10% 70%);
-      transform:translateX(-50%);
+      transform:translateX(-50%) translateY(var(--parallax-soft));
       opacity:.85;
       pointer-events:none;
     }
@@ -1521,6 +1617,12 @@ INDEX_HTML = r"""<!doctype html>
       border-radius:9px;
       background:rgba(255,254,250,.72);
       box-shadow:0 4px 14px rgba(38,55,58,.04);
+      transition:transform .20s var(--ease-smooth), box-shadow .20s var(--ease-smooth), border-color .20s var(--ease-smooth);
+    }
+    .version-item:hover {
+      transform:translateY(-1px);
+      border-color:rgba(47,111,120,.24);
+      box-shadow:0 8px 18px rgba(38,55,58,.07);
     }
     .version-item b {
       color:var(--primary-strong);
@@ -1541,6 +1643,19 @@ INDEX_HTML = r"""<!doctype html>
       text-overflow:ellipsis;
       white-space:nowrap;
       font-size:11px;
+    }
+    .formula-tuned {
+      transition-timing-function:var(--ease-smooth);
+    }
+    button:focus-visible,
+    input:focus-visible,
+    select:focus-visible,
+    .module-action:focus-visible,
+    .module-size-button:focus-visible {
+      outline:0;
+      box-shadow:
+        0 0 0 2px rgba(255,254,250,.96),
+        0 0 0 5px rgba(47,111,120,.24);
     }
     .guide-button {
       min-height:32px;
@@ -1628,6 +1743,12 @@ INDEX_HTML = r"""<!doctype html>
       min-height:112px;
       box-shadow:var(--shadow-soft);
       overflow:hidden;
+      transition:transform .22s var(--ease-smooth), box-shadow .22s var(--ease-smooth), border-color .22s var(--ease-smooth);
+    }
+    .status-card:hover {
+      transform:translateY(-2px);
+      border-color:rgba(47,111,120,.28);
+      box-shadow:0 14px 32px rgba(38,55,58,.10);
     }
     .status-card::before {
       content:"";
@@ -1692,6 +1813,12 @@ INDEX_HTML = r"""<!doctype html>
       padding:16px;
       box-shadow:var(--shadow);
       overflow:hidden;
+      transition:transform .22s var(--ease-smooth), box-shadow .22s var(--ease-smooth), border-color .22s var(--ease-smooth);
+    }
+    .live-panel:hover {
+      transform:translateY(-1px);
+      border-color:rgba(47,111,120,.24);
+      box-shadow:0 20px 48px rgba(38,55,58,.10);
     }
     .live-panel::before {
       content:"";
@@ -1720,6 +1847,12 @@ INDEX_HTML = r"""<!doctype html>
       background:var(--surface-soft);
       color:var(--ink);
       overflow:hidden;
+      transition:transform .20s var(--ease-smooth), box-shadow .20s var(--ease-smooth), border-color .20s var(--ease-smooth);
+    }
+    .activity-item:hover {
+      transform:translateY(-2px);
+      border-color:rgba(47,111,120,.24);
+      box-shadow:0 10px 24px rgba(38,55,58,.08);
     }
     .activity-item::after {
       content:"";
@@ -1770,6 +1903,11 @@ INDEX_HTML = r"""<!doctype html>
       padding:17px;
       box-shadow:var(--shadow-soft);
       overflow:hidden;
+      transition:transform .22s var(--ease-smooth), box-shadow .22s var(--ease-smooth), border-color .22s var(--ease-smooth);
+    }
+    section:hover {
+      border-color:rgba(47,111,120,.22);
+      box-shadow:0 12px 30px rgba(38,55,58,.08);
     }
     section::after {
       content:"";
@@ -1801,7 +1939,7 @@ INDEX_HTML = r"""<!doctype html>
       padding:14px 15px;
       list-style:none;
       background:rgba(255,254,250,.96);
-      transition:background .15s ease, border-color .15s ease;
+      transition:background .18s var(--ease-smooth), border-color .18s var(--ease-smooth);
     }
     .fold-panel summary:hover { background:var(--surface-tint); }
     .fold-panel summary::-webkit-details-marker { display:none; }
@@ -1865,10 +2003,14 @@ INDEX_HTML = r"""<!doctype html>
       align-items:center;
       gap:8px;
       min-width:0;
+      overflow:hidden;
+      text-overflow:ellipsis;
+      white-space:nowrap;
     }
     .section-head h2::before {
       content:"";
       width:18px;
+      flex:0 0 18px;
       height:13px;
       border:1px solid rgba(47,111,120,.40);
       transform:skew(-18deg);
@@ -1898,6 +2040,10 @@ INDEX_HTML = r"""<!doctype html>
     }
     .kv:last-child { border-bottom:0; }
     .kv span:first-child { color:var(--muted); font-weight:750; }
+    .kv > * {
+      min-width:0;
+      overflow-wrap:anywhere;
+    }
     .muted { color:var(--muted); }
     .fine { color:var(--muted); font-size:12px; }
     .strong { font-weight:850; }
@@ -1915,9 +2061,9 @@ INDEX_HTML = r"""<!doctype html>
       font-weight:800;
       color:var(--ink);
       box-shadow:none;
-      transition:background .15s ease, border-color .15s ease, transform .15s ease;
+      transition:background .18s var(--ease-smooth), border-color .18s var(--ease-smooth), transform .18s var(--ease-smooth);
     }
-    button:hover { border-color:var(--primary); background:var(--primary-bg); }
+    button:hover { border-color:var(--primary); background:var(--primary-bg); transform:translateY(-1px); }
     button:active { transform:translateY(1px); }
     button:disabled { cursor:not-allowed; opacity:.55; }
     button.primary { background:var(--primary); color:#fff; border-color:var(--primary); }
@@ -2322,7 +2468,7 @@ INDEX_HTML = r"""<!doctype html>
       border-radius:12px;
       user-select:none;
       -webkit-user-select:none;
-      transition:background .15s ease, border-color .15s ease, opacity .15s ease, transform .15s ease;
+      transition:background .18s var(--ease-smooth), border-color .18s var(--ease-smooth), opacity .18s var(--ease-smooth), transform .18s var(--ease-smooth);
     }
     .module-item:hover { background:var(--surface-tint); }
     .module-item.active {
@@ -2364,7 +2510,7 @@ INDEX_HTML = r"""<!doctype html>
       border-radius:18px;
       align-items:start;
       align-content:flex-start;
-      transition:background .15s ease, outline-color .15s ease;
+      transition:background .18s var(--ease-smooth), outline-color .18s var(--ease-smooth);
     }
     .workspace.drop-ready {
       outline:2px dashed rgba(47,111,120,.45);
@@ -2375,11 +2521,23 @@ INDEX_HTML = r"""<!doctype html>
       flex:0 0 100%;
       width:100%;
       max-width:100%;
-      min-width:min(280px, 100%);
+      min-width:min(360px, 100%);
       min-height:96px;
       align-self:start;
+      container-type:inline-size;
       will-change:transform;
-      transition:opacity .15s ease, transform .15s ease, box-shadow .15s ease, border-color .15s ease;
+      user-select:none;
+      -webkit-user-select:none;
+      transition:opacity .18s var(--ease-smooth), transform .22s var(--ease-smooth), box-shadow .22s var(--ease-smooth), border-color .22s var(--ease-smooth);
+    }
+    .module-card input,
+    .module-card textarea {
+      user-select:text;
+      -webkit-user-select:text;
+    }
+    .module-card:hover {
+      transform:translateY(-1px);
+      box-shadow:0 12px 30px rgba(38,55,58,.08);
     }
     .module-card[data-size="compact"] {
       flex-basis:calc((100% - 32px) / 3);
@@ -2399,7 +2557,8 @@ INDEX_HTML = r"""<!doctype html>
     }
     .module-card.has-custom-height {
       height:var(--module-height);
-      overflow:auto;
+      overflow-x:hidden;
+      overflow-y:auto;
       padding-bottom:26px;
     }
     .module-card[data-size="compact"] {
@@ -2471,6 +2630,9 @@ INDEX_HTML = r"""<!doctype html>
       transition:none;
       box-shadow:0 0 0 3px rgba(209,162,58,.32), 0 18px 42px rgba(38,55,58,.18);
     }
+    .module-card.resizing-card:hover {
+      transform:none;
+    }
     .module-card > .section-head {
       cursor:grab;
       user-select:none;
@@ -2483,6 +2645,7 @@ INDEX_HTML = r"""<!doctype html>
       display:flex;
       align-items:center;
       justify-content:flex-end;
+      flex-wrap:wrap;
       gap:7px;
       min-width:0;
       user-select:none;
@@ -2526,7 +2689,7 @@ INDEX_HTML = r"""<!doctype html>
       font-size:12px;
       color:var(--muted);
       background:transparent;
-      transition:background .15s ease, color .15s ease, transform .15s ease;
+      transition:background .18s var(--ease-smooth), color .18s var(--ease-smooth), transform .18s var(--ease-smooth);
     }
     .module-size-button:hover { transform:translateY(-1px); }
     .module-size-button.active {
@@ -2551,6 +2714,31 @@ INDEX_HTML = r"""<!doctype html>
     }
     .module-resize-handle:hover {
       opacity:1;
+    }
+    @container (max-width: 520px) {
+      .module-card > .section-head {
+        grid-template-columns:1fr;
+        align-items:start;
+        gap:9px;
+      }
+      .module-card > .section-head h2 {
+        max-width:100%;
+      }
+      .module-card .module-actions {
+        width:100%;
+        justify-content:flex-start;
+      }
+      .module-card .section-head .pill {
+        min-width:0;
+        max-width:100%;
+      }
+      .module-card .kv {
+        grid-template-columns:1fr;
+        gap:4px;
+      }
+      .module-card .kv span:first-child {
+        font-size:12px;
+      }
     }
     .drag-ghost {
       position:fixed;
@@ -2625,6 +2813,13 @@ INDEX_HTML = r"""<!doctype html>
       .guide-actions { grid-template-columns:1fr; }
       .fold-panel summary { grid-template-columns:minmax(0, 1fr) 78px 28px; }
       .fold-panel summary .pill { width:78px; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        transition-duration:.01ms !important;
+        animation-duration:.01ms !important;
+        scroll-behavior:auto !important;
+      }
     }
   </style>
 </head>
@@ -3279,7 +3474,7 @@ const MODULE_SIZE_LABELS = {
   normal: "中",
   wide: "大"
 };
-const MODULE_MIN_WIDTH = 280;
+const MODULE_MIN_WIDTH = 360;
 const MODULE_MIN_HEIGHT = 96;
 const MODULE_MAX_HEIGHT = 900;
 const MODULE_STORAGE_KEY = "sts2_control_panel_modules";
@@ -3428,6 +3623,14 @@ function moduleElement(id) {
 function clampNumber(value, min, max) {
   return Math.max(min, Math.min(max, value));
 }
+function smoothstep01(value) {
+  const t = clampNumber(value, 0, 1);
+  return t * t * (3 - 2 * t);
+}
+function motionDurationFromDistance(dx, dy) {
+  const distance = Math.sqrt(dx * dx + dy * dy);
+  return Math.round(150 + smoothstep01(distance / 900) * 170);
+}
 function workspaceInnerWidth() {
   const workspace = document.getElementById("workspace");
   return workspace ? Math.max(MODULE_MIN_WIDTH, workspace.clientWidth) : 1200;
@@ -3477,7 +3680,7 @@ function animateWorkspaceFrom(rects) {
           {transform:`translate(${dx}px, ${dy}px)`},
           {transform:"translate(0, 0)"}
         ],
-        {duration:230, easing:"cubic-bezier(.2,.8,.2,1)"}
+        {duration:motionDurationFromDistance(dx, dy), easing:"cubic-bezier(.2,.8,.2,1)"}
       );
       animation.onfinish = () => card.classList.remove("is-animating");
       animation.oncancel = () => card.classList.remove("is-animating");
@@ -4705,11 +4908,25 @@ document.addEventListener("selectstart", event => {
 });
 document.addEventListener("dragstart", clearDragSelection, true);
 document.addEventListener("dragend", clearDragUi, true);
+let parallaxFrame = 0;
+function updateFormulaParallax() {
+  parallaxFrame = 0;
+  const y = window.scrollY || document.documentElement.scrollTop || 0;
+  const t = smoothstep01(Math.min(y / 900, 1));
+  document.documentElement.style.setProperty("--parallax-back", `${Math.round(t * 18)}px`);
+  document.documentElement.style.setProperty("--parallax-soft", `${Math.round(t * 10)}px`);
+}
+function requestFormulaParallax() {
+  if (parallaxFrame) return;
+  parallaxFrame = window.requestAnimationFrame(updateFormulaParallax);
+}
 syncModuleUI();
 refresh();
+updateFormulaParallax();
 setInterval(refresh, 5000);
 window.addEventListener("resize", positionGuide);
 window.addEventListener("scroll", positionGuide, true);
+window.addEventListener("scroll", requestFormulaParallax, {passive:true});
 window.addEventListener("keydown", event => {
   if (event.key === "Escape") {
     closeGuide();
@@ -4727,8 +4944,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", content_type + "; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
         try:
+            self.end_headers()
             self.wfile.write(data)
         except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
             return
@@ -4740,8 +4957,11 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         if download:
             self.send_header("Content-Disposition", f'attachment; filename="{path.name}"')
-        self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.end_headers()
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            return
 
     def _json(self, status, payload):
         self._send(status, json.dumps(payload, ensure_ascii=False), "application/json")
@@ -4832,9 +5052,13 @@ class Handler(BaseHTTPRequestHandler):
             elif self.path == "/api/export":
                 self._json(200, export_database_package())
             elif self.path == "/api/run":
-                self._json(200, set_run_discarded(body["run_id"], bool(body.get("discarded"))))
+                result = set_run_discarded(body["run_id"], bool(body.get("discarded")))
+                invalidate_dashboard_data_cache()
+                self._json(200, result)
             elif self.path == "/api/quality":
-                self._json(200, set_run_label(body["run_id"], body.get("quality", "unknown"), body.get("note", "")))
+                result = set_run_label(body["run_id"], body.get("quality", "unknown"), body.get("note", ""))
+                invalidate_dashboard_data_cache()
+                self._json(200, result)
             elif self.path == "/api/proceed":
                 try:
                     self._json(200, post_game_action({"action": "proceed"}))
@@ -4859,6 +5083,8 @@ def main():
     ensure_active_model_available()
     if not DISCARDED_PATH.exists():
         write_json(DISCARDED_PATH, {"discarded": []})
+    threading.Thread(target=_refresh_python_runtime_cache, kwargs={"blocking": False}, daemon=True).start()
+    threading.Thread(target=_refresh_dashboard_data_cache, kwargs={"blocking": False}, daemon=True).start()
     server = ThreadingHTTPServer(("127.0.0.1", 8765), Handler)
     print("STS2 AI control panel: http://127.0.0.1:8765")
     server.serve_forever()
