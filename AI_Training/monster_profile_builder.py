@@ -15,7 +15,13 @@ SCHEMA_TURN = "monster_turn_v1"
 SCHEMA_ENCOUNTER = "encounter_v1"
 SCHEMA_PROFILE = "monster_profiles_v1"
 SCHEMA_ENCOUNTER_PROFILE = "encounter_profiles_v1"
+SCHEMA_DAMAGE_ANOMALIES = "monster_damage_anomalies_v1"
 SCHEMA_VOCAB = "monster_vocab_v1"
+
+NORMAL_DAMAGE_MIN_SAMPLES = 4
+NORMAL_DAMAGE_MIN_EXCESS = 8.0
+NORMAL_DAMAGE_MIN_ABSOLUTE = 12.0
+BOSS_FLOORS = {17, 34, 51}
 
 INPUT_GLOBS = [
     "action_logs_*.jsonl",
@@ -403,6 +409,158 @@ def top(counter, limit=12):
     return [{"key": key, "count": count} for key, count in counter.most_common(limit)]
 
 
+def percentile(values, ratio):
+    values = sorted(float(v) for v in values)
+    if not values:
+        return 0.0
+    if len(values) == 1:
+        return values[0]
+    position = (len(values) - 1) * ratio
+    lower = int(position)
+    upper = min(lower + 1, len(values) - 1)
+    weight = position - lower
+    return values[lower] * (1.0 - weight) + values[upper] * weight
+
+
+def mean_value(values):
+    return sum(values) / len(values) if values else 0.0
+
+
+def stdev_value(values):
+    if len(values) <= 1:
+        return 0.0
+    avg = mean_value(values)
+    variance = sum((value - avg) ** 2 for value in values) / len(values)
+    return variance ** 0.5
+
+
+def damage_severity(excess, ratio):
+    if excess >= 20 or ratio >= 2.0:
+        return "high"
+    if excess >= 12 or ratio >= 1.6:
+        return "medium"
+    return "low"
+
+
+def is_normal_monster_encounter(encounter):
+    if str(encounter.get("state_type") or "").lower() != "monster":
+        return False
+    act = safe_int(encounter.get("act"), 0)
+    floor = safe_int(encounter.get("floor"), 0)
+    if act <= 0 or floor <= 0:
+        return False
+    if floor in BOSS_FLOORS:
+        return False
+    key = str(encounter.get("encounter_key") or "").upper()
+    if "BOSS" in key or "ELITE" in key:
+        return False
+    return True
+
+
+def normal_monster_damage_doc(finalized_encounters):
+    samples = defaultdict(list)
+    details = defaultdict(list)
+    for encounter in finalized_encounters:
+        if not is_normal_monster_encounter(encounter):
+            continue
+        hp_start = safe_int(encounter.get("player_hp_start"), 0)
+        if hp_start <= 0:
+            continue
+        hp_lost = max(0, safe_int(encounter.get("hp_lost"), 0))
+        detail = {
+            "run_id": encounter.get("run_id"),
+            "combat_id": encounter.get("combat_id"),
+            "source": encounter.get("source"),
+            "act": safe_int(encounter.get("act"), 0),
+            "floor": safe_int(encounter.get("floor"), 0),
+            "encounter_key": encounter.get("encounter_key"),
+            "hp_lost": hp_lost,
+            "player_hp_start": hp_start,
+            "player_hp_end": safe_int(encounter.get("player_hp_end"), 0),
+            "turns": safe_int(encounter.get("turns"), 0),
+            "result": encounter.get("result"),
+            "monsters": encounter.get("monsters") or [],
+            "files": encounter.get("files") or [],
+            "actions": encounter.get("actions") or {},
+            "cards_played": encounter.get("cards_played") or {},
+            "potions_used": encounter.get("potions_used") or {},
+        }
+        for monster in encounter.get("monsters") or []:
+            samples[monster].append(float(hp_lost))
+            details[monster].append(detail)
+
+    baselines = {}
+    anomalies = []
+    for monster, values in sorted(samples.items()):
+        count = len(values)
+        avg = mean_value(values)
+        stdev = stdev_value(values)
+        p50 = percentile(values, 0.50)
+        p75 = percentile(values, 0.75)
+        p90 = percentile(values, 0.90)
+        max_loss = max(values) if values else 0.0
+        reliable = count >= NORMAL_DAMAGE_MIN_SAMPLES
+        if reliable:
+            threshold = max(avg + max(NORMAL_DAMAGE_MIN_EXCESS, stdev * 1.25), p75 + NORMAL_DAMAGE_MIN_EXCESS)
+        else:
+            threshold = max(avg + max(12.0, avg * 0.8), p90 + 6.0)
+        threshold = round(threshold, 2)
+        baselines[monster] = {
+            "samples": count,
+            "reliable": reliable,
+            "avg_hp_lost": round(avg, 2),
+            "median_hp_lost": round(p50, 2),
+            "p75_hp_lost": round(p75, 2),
+            "p90_hp_lost": round(p90, 2),
+            "max_hp_lost": round(max_loss, 2),
+            "stdev_hp_lost": round(stdev, 2),
+            "anomaly_threshold": threshold,
+            "anomaly_count": 0,
+        }
+        if not reliable:
+            continue
+        for detail in details[monster]:
+            hp_lost = float(detail["hp_lost"])
+            if hp_lost < threshold or hp_lost < NORMAL_DAMAGE_MIN_ABSOLUTE:
+                continue
+            excess = hp_lost - avg
+            ratio = hp_lost / max(avg, 1.0)
+            baselines[monster]["anomaly_count"] += 1
+            anomalies.append({
+                "monster_key": monster,
+                "severity": damage_severity(excess, ratio),
+                "hp_lost": int(hp_lost),
+                "avg_hp_lost": round(avg, 2),
+                "threshold": threshold,
+                "excess_vs_avg": round(excess, 2),
+                "ratio_vs_avg": round(ratio, 2),
+                **detail,
+            })
+
+    anomalies.sort(key=lambda item: (item["severity"] != "high", -item["excess_vs_avg"], -item["hp_lost"], item["monster_key"]))
+    return {
+        "schema_version": SCHEMA_DAMAGE_ANOMALIES,
+        "generated_at": generated_at(),
+        "rules": {
+            "scope": "normal monster fights only (state_type == monster, valid act/floor, excluding boss floors and explicit boss/elite keys)",
+            "excluded_boss_floors": sorted(BOSS_FLOORS),
+            "min_samples_for_threshold": NORMAL_DAMAGE_MIN_SAMPLES,
+            "min_excess_hp": NORMAL_DAMAGE_MIN_EXCESS,
+            "min_absolute_hp_lost": NORMAL_DAMAGE_MIN_ABSOLUTE,
+            "threshold": "max(avg + max(min_excess_hp, stdev * 1.25), p75 + min_excess_hp) when sample count is reliable",
+        },
+        "summary": {
+            "monster_baselines": len(baselines),
+            "reliable_monsters": sum(1 for item in baselines.values() if item["reliable"]),
+            "anomalies": len(anomalies),
+            "high_severity": sum(1 for item in anomalies if item["severity"] == "high"),
+            "medium_severity": sum(1 for item in anomalies if item["severity"] == "medium"),
+        },
+        "monsters": baselines,
+        "anomalies": anomalies[:200],
+    }
+
+
 def init_profile():
     return {
         "names": Counter(),
@@ -630,6 +788,8 @@ def build_profiles(data_dir=DATA_DIR, monster_dir=MONSTER_DIR, processed_dir=PRO
     for date, rows in sorted(encounters_by_date.items()):
         write_jsonl(monster_dir / f"encounters_{date}.jsonl", rows)
 
+    damage_anomaly_doc = normal_monster_damage_doc(finalized_encounters)
+    damage_baselines = damage_anomaly_doc.get("monsters", {})
     monster_profiles = {
         "schema_version": SCHEMA_PROFILE,
         "generated_at": generated_at(),
@@ -640,12 +800,15 @@ def build_profiles(data_dir=DATA_DIR, monster_dir=MONSTER_DIR, processed_dir=PRO
             "monster_turn_rows": sum(len(rows) for rows in turns_by_date.values()),
             "encounters": len(finalized_encounters),
             "monsters": len(profiles),
+            "normal_monster_damage_baselines": damage_anomaly_doc["summary"]["monster_baselines"],
+            "damage_anomalies": damage_anomaly_doc["summary"]["anomalies"],
         },
         "monsters": {},
     }
     for key, profile in sorted(profiles.items()):
         seen = max(1, profile["turn_observations"])
         encounters_seen = max(1, profile["encounters_seen"])
+        damage_stats = damage_baselines.get(key, {})
         monster_profiles["monsters"][key] = {
             "display_name": profile["names"].most_common(1)[0][0] if profile["names"] else key,
             "ids": top(profile["ids"], 8),
@@ -653,6 +816,7 @@ def build_profiles(data_dir=DATA_DIR, monster_dir=MONSTER_DIR, processed_dir=PRO
             "encounters_seen": profile["encounters_seen"],
             "win_rate": round(profile["wins"] / encounters_seen, 4) if profile["encounters_seen"] else None,
             "avg_hp_lost": round(profile["hp_lost_sum"] / encounters_seen, 2) if profile["encounters_seen"] else None,
+            "normal_damage": damage_stats or None,
             "avg_turns": round(profile["turns_sum"] / encounters_seen, 2) if profile["encounters_seen"] else None,
             "avg_incoming_damage": round(profile["incoming_damage_sum"] / seen, 2),
             "max_incoming_damage": profile["max_incoming_damage"],
@@ -688,6 +852,7 @@ def build_profiles(data_dir=DATA_DIR, monster_dir=MONSTER_DIR, processed_dir=PRO
 
     write_json(monster_dir / "monster_profiles.json", monster_profiles)
     write_json(monster_dir / "encounter_profiles.json", encounter_profile_doc)
+    write_json(monster_dir / "monster_damage_anomalies.json", damage_anomaly_doc)
     write_json(monster_dir / "monster_build_summary.json", monster_profiles["summary"])
     write_text(monster_dir / "README_MONSTER_DATA.md", monster_readme())
 
@@ -755,6 +920,7 @@ Files:
 - encounters_YYYY-MM-DD.jsonl: one row per combat encounter summary.
 - monster_profiles.json: aggregated monster-level play patterns.
 - encounter_profiles.json: aggregated encounter-composition patterns.
+- monster_damage_anomalies.json: normal-monster HP-loss baselines and outlier encounters.
 - monster_build_summary.json: generation counts for dashboard and audit.
 
 The raw logs remain the source of truth. Generated files should be rebuilt after new runs are collected.
