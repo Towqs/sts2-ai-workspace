@@ -2769,6 +2769,59 @@ def map_node_type(node):
     return str((node or {}).get("type") or "").lower()
 
 
+def is_route_buffer_node(node_type, gold):
+    return (
+        "rest" in node_type
+        or "camp" in node_type
+        or (("shop" in node_type or "merchant" in node_type) and gold >= 75)
+    )
+
+
+def route_elite_risk(option, map_state, gold, max_depth=7):
+    nodes = {
+        map_node_key(node): node
+        for node in (map_state.get("nodes") or [])
+        if isinstance(node, dict)
+    }
+    start_key = map_node_key(option)
+
+    def scan(key, depth, buffered, path):
+        if depth > max_depth or key in path:
+            return None, None
+        node = nodes.get(key)
+        if not node:
+            return None, None
+        node_type = map_node_type(node)
+        if buffered:
+            return None, None
+        if "elite" in node_type:
+            return depth, depth
+        if is_route_buffer_node(node_type, gold):
+            return None, None
+
+        child_keys = []
+        for child in node.get("children", []) or []:
+            if isinstance(child, (list, tuple)) and len(child) >= 2:
+                child_keys.append((safe_int(child[0], -999), safe_int(child[1], -999)))
+        if not child_keys:
+            return None, None
+
+        nearest = []
+        forced = []
+        for child_key in child_keys:
+            child_nearest, child_forced = scan(child_key, depth + 1, False, path | {key})
+            if child_nearest is not None:
+                nearest.append(child_nearest)
+            if child_forced is not None:
+                forced.append(child_forced)
+
+        nearest_depth = min(nearest) if nearest else None
+        forced_depth = min(forced) if forced and len(forced) == len(child_keys) else None
+        return nearest_depth, forced_depth
+
+    return scan(start_key, 0, False, set())
+
+
 def route_lookahead_adjustment(option, map_state, hp_ratio, gold, floor, max_depth=4):
     nodes = {
         map_node_key(node): node
@@ -2784,6 +2837,16 @@ def route_lookahead_adjustment(option, map_state, hp_ratio, gold, floor, max_dep
 
     score = 0.0
     markers = []
+    nearest_elite_depth, forced_elite_depth = route_elite_risk(option, map_state, gold, max_depth=7)
+    if forced_elite_depth is not None and floor + forced_elite_depth <= 8:
+        penalty = 32.0 / max(forced_elite_depth, 1)
+        if hp_ratio < 0.95:
+            penalty += 8.0 / max(forced_elite_depth, 1)
+        score -= penalty
+        markers.append(f"forced_elite_d{forced_elite_depth}")
+    elif nearest_elite_depth is not None and floor + nearest_elite_depth <= 8:
+        score -= 8.0 / max(nearest_elite_depth, 1)
+        markers.append(f"early_elite_d{nearest_elite_depth}")
     seen = set()
     while stack:
         key, depth, has_rest_buffer = stack.pop()
