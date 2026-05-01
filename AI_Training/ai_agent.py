@@ -705,8 +705,7 @@ def tactical_candidate_adjustment(candidate, state):
         profile = potion_tactical_profile(candidate, state)
         already_used_potion = bool(state.get("_potion_used_this_turn"))
         if already_used_potion and not (profile["lethal"] or profile["prevents_lethal"]):
-            adjustment -= 100.0
-            reasons.append("one_potion_per_turn")
+            return -1000.0, "one_potion_per_turn_hard"
         if profile["lethal"]:
             adjustment += 14.0
             reasons.append("lethal_potion")
@@ -930,6 +929,144 @@ def get_can_proceed(state, state_type):
     return False
 
 
+def reward_item_type(item):
+    return str(item.get("type") or item.get("category") or "").lower()
+
+
+def reward_matches_type(item, reward_type):
+    item_type = reward_item_type(item)
+    return item_type == reward_type or (reward_type == "card" and item_type == "special_card")
+
+
+def potion_is_empty_slot(potion):
+    potion_id = potion_id_key(potion)
+    name = str(potion.get("name") or potion.get("potion_name") or "").strip().upper()
+    return (not potion_id and not name) or potion_id in ("EMPTY", "EMPTY_POTION_SLOT", "NONE")
+
+
+def filled_potions(player):
+    return [
+        potion
+        for potion in (player.get("potions") or [])
+        if isinstance(potion, dict) and not potion_is_empty_slot(potion)
+    ]
+
+
+def potion_slot_capacity(player):
+    filled = len(filled_potions(player))
+    for key in ("potion_slots_total", "max_potions", "potion_capacity", "potion_slots"):
+        value = player.get(key)
+        if isinstance(value, (list, tuple)):
+            return max(len(value), 0)
+        if isinstance(value, dict):
+            return max(len(value), 0)
+        count = safe_int(value, 0)
+        if count > 0:
+            return count
+    return max(3, filled)
+
+
+def potion_slots_full(player):
+    potions = filled_potions(player)
+    filled = max(safe_int(player.get("potion_slots_filled"), len(potions)), len(potions))
+    capacity = potion_slot_capacity(player)
+    return bool(capacity > 0 and filled >= capacity)
+
+
+def normalize_potion_like(item):
+    if not isinstance(item, dict):
+        return {}
+    return {
+        "id": item.get("potion_id") or item.get("id") or item.get("item_id"),
+        "name": item.get("potion_name") or item.get("name") or item.get("item_name"),
+        "description": (
+            item.get("potion_description")
+            or item.get("description")
+            or item.get("item_description")
+        ),
+        "type": item.get("type") or item.get("category"),
+        "slot": item.get("slot"),
+    }
+
+
+def potion_keep_value(potion):
+    potion = normalize_potion_like(potion)
+    potion_id = potion_id_key(potion)
+    text = combat_text(potion)
+    known = {
+        "FIRE_POTION": 4.5,
+        "EXPLOSIVE_AMPOULE": 4.0,
+        "POWDERED_DEMISE": 4.0,
+        "BLOOD_POTION": 3.8,
+        "BLOCK_POTION": 3.5,
+        "ENERGY_POTION": 3.4,
+        "STRENGTH_POTION": 3.2,
+        "FORTIFIER": 3.2,
+        "ANCIENT_POTION": 3.0,
+        "WEAK_POTION": 2.8,
+        "VULNERABILITY_POTION": 2.8,
+        "DEXTERITY_POTION": 2.8,
+        "SPEED_POTION": 2.7,
+        "DROPLET_OF_PRECOGNITION": 2.6,
+        "MAZALETHS_GIFT": 2.6,
+        "CLARITY": 2.4,
+        "FLEX_POTION": 2.2,
+        "COLORLESS_POTION": 2.1,
+        "ATTACK_POTION": 2.0,
+        "SKILL_POTION": 2.0,
+    }
+    score = known.get(potion_id, 1.5)
+    if has_any(text, ("deal", "damage", "attack", "strength", "vulnerable", "fire")):
+        score += 0.5
+    if has_any(text, ("block", "heal", "recover", "weak")):
+        score += 0.4
+    if has_any(text, ("energy", "draw", "card", "free")):
+        score += 0.3
+    return round(score, 3)
+
+
+def potion_slot_number(potion, fallback_index):
+    slot = safe_int(potion.get("slot"), -1)
+    return slot if slot >= 0 else fallback_index
+
+
+def reward_potion_payload(state, item, fallback_index):
+    player = state.get("player") or {}
+    reward_potion = normalize_potion_like(item)
+    reward_index = int(item.get("index", fallback_index))
+    if not potion_slots_full(player):
+        return {"action": "claim_reward", "index": reward_index}, "available"
+
+    inventory = filled_potions(player)
+    if not inventory:
+        return {"action": "claim_reward", "index": reward_index}, "available_no_inventory"
+
+    valued = [
+        (potion_keep_value(potion), potion_slot_number(potion, idx), potion)
+        for idx, potion in enumerate(inventory)
+    ]
+    valued.sort(key=lambda row: row[0])
+    worst_value, worst_slot, worst_potion = valued[0]
+    reward_value = potion_keep_value(reward_potion)
+    reward_name = reward_potion.get("name") or reward_potion.get("id") or "reward_potion"
+    worst_name = worst_potion.get("name") or worst_potion.get("id") or f"slot_{worst_slot}"
+    if reward_value >= worst_value + 0.75:
+        return (
+            {"action": "discard_potion", "slot": int(worst_slot)},
+            f"full_potion_slots_discard slot={worst_slot} replace={worst_name}->{reward_name} {worst_value:.2f}->{reward_value:.2f}",
+        )
+    return (
+        None,
+        f"skip_full_potion_reward keep={worst_name}:{worst_value:.2f} reward={reward_name}:{reward_value:.2f}",
+    )
+
+
+def reward_item_claim_payload(state, item, fallback_index):
+    if reward_item_type(item) == "potion":
+        return reward_potion_payload(state, item, fallback_index)
+    return {"action": "claim_reward", "index": int(item.get("index", fallback_index))}, "available"
+
+
 def rest_option_blob(option):
     parts = []
     for key in ("id", "option_id", "title", "name", "description", "option_title"):
@@ -1074,12 +1211,15 @@ def macro_label_to_payload(label, state, allow_shop=False):
     if label.startswith("claim_reward:"):
         if state_type != "rewards":
             return None, "not_rewards"
-        reward_type = label.split(":", 1)[1].lower()
+        reward_type = label.split(":", 1)[1].lower().split(" ", 1)[0]
+        last_status = f"reward_{reward_type}_unavailable"
         for fallback_index, item in enumerate(get_items_for_state(state, state_type)):
-            item_type = str(item.get("type") or item.get("category") or "").lower()
-            if item_type == reward_type or (reward_type == "card" and item_type == "special_card"):
-                return {"action": "claim_reward", "index": int(item.get("index", fallback_index))}, "available"
-        return None, f"reward_{reward_type}_unavailable"
+            if reward_matches_type(item, reward_type):
+                payload, status = reward_item_claim_payload(state, item, fallback_index)
+                if payload:
+                    return payload, status
+                last_status = status
+        return None, last_status
 
     if label.startswith("choose_card:index_"):
         if state_type != "card_reward":
@@ -1165,6 +1305,15 @@ def macro_fallback_payload(state):
         rewards = state.get("rewards") or {}
         if not rewards.get("items") and rewards.get("can_proceed"):
             return {"action": "proceed"}, "rewards_empty_proceed"
+        if rewards.get("can_proceed"):
+            claimable = False
+            for fallback_index, item in enumerate(get_items_for_state(state, state_type)):
+                payload, _ = reward_item_claim_payload(state, item, fallback_index)
+                if payload:
+                    claimable = True
+                    break
+            if not claimable:
+                return {"action": "proceed"}, "rewards_no_claimable_proceed"
     if state_type in ("rest_site", "treasure") and get_can_proceed(state, state_type):
         return {"action": "proceed"}, f"{state_type}_proceed"
     return None, ""
@@ -2694,11 +2843,22 @@ def macro_state_signature(state):
             for o in ((state.get("map") or {}).get("next_options") or [])
         ]
     elif state_type == "rewards":
+        player = state.get("player") or {}
+        potions = filled_potions(player)
         payload["items"] = [
             (i.get("index"), i.get("type"), i.get("description"))
             for i in ((state.get("rewards") or {}).get("items") or [])
         ]
         payload["can_proceed"] = (state.get("rewards") or {}).get("can_proceed")
+        payload["potion_slots_filled"] = max(
+            safe_int(player.get("potion_slots_filled"), len(potions)),
+            len(potions),
+        )
+        payload["potion_slots_capacity"] = potion_slot_capacity(player)
+        payload["potions"] = [
+            (p.get("slot"), p.get("id") or p.get("potion_id"), p.get("name") or p.get("potion_name"))
+            for p in potions
+        ]
     elif state_type == "card_reward":
         payload["cards"] = [
             (c.get("index"), c.get("id"), c.get("name"))
