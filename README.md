@@ -45,7 +45,38 @@ git clone https://github.com/Towqs/sts2-ai-workspace.git
 cd sts2-ai-workspace
 ```
 
-### 2. 安装 Python 依赖
+### 2. 一键安装环境和游戏 Mod
+
+新人请优先运行：
+
+```text
+一键安装环境与Mod.bat
+```
+
+它会做三件事：
+
+- 创建/更新 Python 虚拟环境并安装依赖。
+- 自动定位《Slay the Spire 2》安装目录；找不到时会要求手动输入。
+- 编译并安装游戏内 **STS2 MCP** Mod 到游戏 `mods` 目录。
+
+如果自动定位失败，也可以手动指定游戏目录：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Setup_Environment.ps1 -GameDir "D:\SteamLibrary\steamapps\common\Slay the Spire 2"
+```
+
+安装完成后，必须启动游戏并在 **Settings -> Mods** 里启用 `STS2 MCP`。  
+启用后可以打开下面地址验证 Mod API 是否在线：
+
+```text
+http://localhost:15526/
+```
+
+看到 `Hello from STS2 MCP` 或 `status: ok`，说明游戏内 MCP 已经装好。
+
+### 3. 手动安装方式（可选）
+
+如果不使用一键安装，可以手动安装 Python 依赖：
 
 ```powershell
 python -m venv .venv
@@ -58,18 +89,20 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install numpy requests colorama
 ```
 
-### 3. 构建并安装 Mod
+然后构建并安装 Mod：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\训练脚本\STS2MCP\build.ps1 -GameDir "<Slay the Spire 2 安装目录>"
 ```
 
-把构建产物放进游戏 `mods` 目录：
+把构建产物放进游戏 `mods` 根目录，并把 manifest 改名为 `STS2_MCP.json`：
 
-- `训练脚本/STS2MCP/out/STS2_MCP/STS2_MCP.dll`
-- `训练脚本/STS2MCP/out/STS2_MCP/mod_manifest.json`
+- `训练脚本/STS2MCP/out/STS2_MCP/STS2_MCP.dll` -> `<game_install>/mods/STS2_MCP.dll`
+- `训练脚本/STS2MCP/mod_manifest.json` -> `<game_install>/mods/STS2_MCP.json`
 
-### 4. 启动控制台
+注意：不要只启动 AI 控制台。游戏里没有启用 `STS2 MCP` 时，控制台会显示游戏未连接，AI 也无法读状态或执行动作。
+
+### 4. 启动控制台和 AI
 
 推荐直接双击：
 

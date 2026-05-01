@@ -1,5 +1,17 @@
 # 一键启动说明
 
+第一次使用请先运行仓库根目录的 `一键安装环境与Mod.bat`。它会安装 Python 依赖，并把游戏内必须启用的 `STS2 MCP` Mod 安装到《Slay the Spire 2》的 `mods` 目录。
+
+安装完成后，需要启动游戏，在 **Settings -> Mods** 里启用 `STS2 MCP`。如果没有启用这个游戏内 Mod，控制台会显示游戏未连接，AI 无法读取状态或执行动作。
+
+启用后可以打开下面地址验证 Mod API 是否在线：
+
+```text
+http://localhost:15526/
+```
+
+看到 `Hello from STS2 MCP` 或 `status: ok`，再继续启动 AI 控制台。
+
 推荐双击仓库根目录的 `start_all.bat`。
 
 `一键启动全部.bat` 仍然保留，但它只是包装 `start_all.bat`。如果 Windows、快捷方式或压缩包对中文文件名处理不稳定，直接用 ASCII 文件名的 `start_all.bat`。
