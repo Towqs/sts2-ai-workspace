@@ -184,6 +184,16 @@ def card_id_key(card):
     return str(card.get("id") or card.get("card_id") or "").upper()
 
 
+def card_play_cost(card, energy=0.0):
+    cost = card.get("cost_for_turn", card.get("cost", 0))
+    if str(cost).upper() == "X":
+        return max(float(energy or 0.0), 0.0)
+    try:
+        return max(float(cost), 0.0)
+    except (TypeError, ValueError):
+        return 99.0
+
+
 def known_card_effect_hints(card):
     card_id = card_id_key(card)
     text = combat_text(card)
@@ -222,13 +232,19 @@ def known_card_utility_hints(card):
     card_id = card_id_key(card)
     text = combat_text(card)
     scaling_ids = {"FIGHT_ME", "SETUP_STRIKE", "INFLAME", "DEMON_FORM"}
+    setup_attack_ids = {"BASH", "THUNDERCLAP", "FIGHT_ME", "SETUP_STRIKE", "FORGOTTEN_RITUAL"}
     energy_ids = {"BLOODLETTING", "FORGOTTEN_RITUAL"}
     power_ids = {"DRUM_OF_BATTLE"}
+    setup_attack_terms = (
+        "vulnerable", "weak", "strength", "dexterity", "draw", "energy", "apply", "gain",
+        "易伤", "虚弱", "力量", "敏捷", "抽", "能量", "施加", "获得",
+    )
     return {
         "scaling": card_id in scaling_ids or has_any(text, ("strength", "dexterity", "力量", "敏捷")),
         "energy": card_id in energy_ids or has_any(text, ("energy", "能量", "ironclad_energy")),
         "exhaust_synergy": card_id == "FORGOTTEN_RITUAL" or has_any(text, ("本回合消耗", "if you exhausted", "if you exhaust")),
         "power": card_id in power_ids or "power" in str(card.get("type") or "").lower() or "能力" in str(card.get("type") or ""),
+        "setup_attack": card_id in setup_attack_ids or has_any(text, setup_attack_terms),
     }
 
 
@@ -415,10 +431,13 @@ def card_effect_profile(card):
         "dexterity", "敏捷", "energy", "能量", "exhaust", "消耗", "upgrade", "升级",
         "apply", "给予",
     )
+    is_attack = "attack" in card_type or "攻击" in card_type or damage > 0
     return {
         "text": text,
         "card_id": card_id,
         "card_type": card_type,
+        "cost": card_play_cost(card),
+        "is_attack": is_attack,
         "damage": damage,
         "block_gain": block_gain,
         "self_damage": self_damage,
@@ -429,7 +448,30 @@ def card_effect_profile(card):
         "energy": utility_hints["energy"],
         "exhaust_synergy": utility_hints["exhaust_synergy"],
         "power_like": utility_hints["power"] or "power" in card_type,
+        "setup_attack": bool(
+            is_attack
+            and (
+                utility_hints["setup_attack"]
+                or utility_hints["scaling"]
+                or utility_hints["energy"]
+                or utility_hints["exhaust_synergy"]
+            )
+        ),
     }
+
+
+def playable_setup_attack_exists(player, energy, exclude_index=None):
+    for hand_index, hand_card in enumerate(player.get("hand", []) or []):
+        if not isinstance(hand_card, dict) or not hand_card.get("can_play", False):
+            continue
+        card_index = safe_int(hand_card.get("index"), hand_index)
+        if exclude_index is not None and card_index == exclude_index:
+            continue
+        if card_play_cost(hand_card, energy) > energy:
+            continue
+        if card_effect_profile(hand_card)["setup_attack"]:
+            return True
+    return False
 
 
 def potion_damage_hint(potion):
@@ -604,6 +646,7 @@ def tactical_candidate_adjustment(candidate, state):
     max_hp = max(safe_num(player.get("max_hp"), 1.0), 1.0)
     hp_ratio = hp / max_hp
     block = safe_num(player.get("block"), 0.0)
+    energy = safe_num(player.get("energy"), 0.0)
     incoming = enemy_incoming_damage(enemies)
     net_incoming = max(0.0, incoming - block)
     damage_ineffective = enemies_damage_ineffective(enemies)
@@ -623,9 +666,15 @@ def tactical_candidate_adjustment(candidate, state):
             1
             for hand_card in player.get("hand", []) or []
             if isinstance(hand_card, dict)
-            and str(hand_card.get("type") or "").lower() == "attack"
             and hand_card.get("can_play", False)
+            and card_effect_profile(hand_card)["is_attack"]
         )
+        card_cost = card_play_cost(card, energy)
+        is_attack = bool(profile["is_attack"])
+        setup_attack = bool(profile["setup_attack"])
+        has_setup_attack_waiting = playable_setup_attack_exists(player, energy, exclude_index=candidate.card_index)
+        stable_or_free = net_incoming < hp or card_cost <= 0 or block_gain > 0
+        candidate_lethal = bool(damage > 0 and candidate.target_effective_hp and damage >= candidate.target_effective_hp)
 
         if end_turn_hand_damage > 0:
             adjustment += 12.0
@@ -643,6 +692,27 @@ def tactical_candidate_adjustment(candidate, state):
                 return -100.0, f"blocked_self_damage hp={hp:g} cost={self_damage:g}"
             adjustment -= 2.0
             reasons.append(f"self_damage={self_damage:g}")
+
+        if is_attack and damage > 0 and card_cost <= 0 and not profile["status_like"]:
+            adjustment += 10.0
+            reasons.append("zero_cost_attack")
+            if profile["has_utility"]:
+                adjustment += 3.0
+                reasons.append("zero_cost_utility_attack")
+
+        if setup_attack and playable_attack_count >= 2 and stable_or_free:
+            adjustment += 12.0
+            reasons.append("setup_attack_before_plain")
+        elif (
+            is_attack
+            and damage > 0
+            and not setup_attack
+            and has_setup_attack_waiting
+            and stable_or_free
+            and not candidate_lethal
+        ):
+            adjustment -= 6.0
+            reasons.append("setup_attack_available")
 
         if incoming <= 0:
             if damage > 0 or "attack" in card_type:
