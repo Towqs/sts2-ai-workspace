@@ -1,4 +1,6 @@
+import base64
 import json
+import io
 import os
 import signal
 import shutil
@@ -10,7 +12,7 @@ import uuid
 import zipfile
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -58,6 +60,8 @@ MODEL_ARTIFACTS = {
         "training_summary.json",
     ],
 }
+
+MODEL_IMPORT_MAX_BYTES = 128 * 1024 * 1024
 
 
 def python_exe_runs(candidate):
@@ -1086,6 +1090,136 @@ def update_model_package(model_id, label=None, description=None, pin=False):
         manifest["retention"] = "manual"
     write_json(root / "manifest.json", manifest)
     return {"status": "ok", "package": model_package_status(model_id)}
+
+
+def delete_model_package(model_id):
+    model_id = safe_model_id(model_id)
+    if not model_id:
+        return {"status": "error", "error": "invalid model_id"}
+    active = safe_model_id(read_control().get("active_model_id"))
+    if model_id == active:
+        return {"status": "error", "error": "无法删除当前启用的模型"}
+    root = MODEL_ZOO_DIR / model_id
+    if not root.exists() or not root.is_dir():
+        return {"status": "error", "error": "未找到模型包"}
+    shutil.rmtree(root, ignore_errors=True)
+    return {"status": "ok"}
+
+
+def infer_model_id_from_manifest(manifest, fallback=""):
+    if isinstance(manifest, dict):
+        manifest_id = safe_model_id(manifest.get("id"))
+        if manifest_id:
+            return manifest_id
+    return safe_model_id(fallback)
+
+
+def normalize_import_member(name):
+    path = PurePosixPath(str(name or ""))
+    if path.is_absolute():
+        return None
+    parts = [part for part in path.parts if part not in ("", ".")]
+    if not parts or any(part == ".." for part in parts):
+        return None
+    return parts
+
+
+def import_model_package_archive(filename, content_b64):
+    raw_name = Path(str(filename or "")).name
+    if not raw_name or Path(raw_name).suffix.lower() != ".zip":
+        return {"status": "error", "error": "only .zip model packages are supported"}
+    if not content_b64:
+        return {"status": "error", "error": "missing archive content"}
+
+    try:
+        archive_bytes = base64.b64decode(content_b64.encode("ascii"), validate=True)
+    except Exception:
+        return {"status": "error", "error": "invalid archive encoding"}
+
+    if not archive_bytes:
+        return {"status": "error", "error": "archive is empty"}
+    if len(archive_bytes) > MODEL_IMPORT_MAX_BYTES:
+        return {
+            "status": "error",
+            "error": "archive is too large",
+            "limit_mb": round(MODEL_IMPORT_MAX_BYTES / (1024 * 1024)),
+        }
+
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(archive_bytes))
+    except zipfile.BadZipFile:
+        return {"status": "error", "error": "invalid zip archive"}
+
+    with zf:
+        members = [info for info in zf.infolist() if not info.is_dir()]
+        if not members:
+            return {"status": "error", "error": "archive has no files"}
+
+        normalized = []
+        for info in members:
+            parts = normalize_import_member(info.filename)
+            if not parts:
+                return {"status": "error", "error": f"invalid archive entry: {info.filename}"}
+            normalized.append((info, parts))
+
+        manifest_parts = None
+        for _info, parts in normalized:
+            if parts[-1] == "manifest.json":
+                manifest_parts = parts
+                break
+        if not manifest_parts:
+            return {"status": "error", "error": "manifest.json not found in archive"}
+
+        root_prefix = manifest_parts[:-1]
+        try:
+            manifest = json.loads(zf.read("/".join(manifest_parts)).decode("utf-8"))
+        except Exception as exc:
+            return {"status": "error", "error": f"manifest.json is invalid: {exc}"}
+
+        inferred_id = infer_model_id_from_manifest(manifest, fallback=root_prefix[-1] if root_prefix else Path(raw_name).stem)
+        if not inferred_id:
+            return {"status": "error", "error": "cannot determine model package id"}
+
+        root = MODEL_ZOO_DIR / inferred_id
+        if root.exists():
+            return {"status": "error", "error": f"model package already exists: {inferred_id}"}
+
+        MODEL_ZOO_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            for info, parts in normalized:
+                relative_parts = parts[len(root_prefix):] if root_prefix and parts[:len(root_prefix)] == root_prefix else parts
+                if not relative_parts:
+                    continue
+                target = root.joinpath(*relative_parts)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with zf.open(info, "r") as src, open(target, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+
+            manifest_path = root / "manifest.json"
+            imported_manifest = read_json(manifest_path, {})
+            imported_manifest["id"] = inferred_id
+            imported_manifest.setdefault("label", imported_manifest.get("label") or inferred_id)
+            imported_manifest.setdefault("created_at", datetime.now().isoformat(timespec="seconds"))
+            imported_manifest.setdefault("source", imported_manifest.get("source") or "imported_zip")
+            imported_manifest["imported_at"] = datetime.now().isoformat(timespec="seconds")
+            imported_manifest["import_filename"] = raw_name
+            write_json(manifest_path, imported_manifest)
+
+            status = model_package_status(inferred_id)
+            if not status:
+                raise ValueError("imported package cannot be indexed")
+            if not status.get("complete"):
+                missing = status.get("missing", [])
+                raise ValueError("imported package is incomplete: " + ", ".join(missing))
+            return {
+                "status": "ok",
+                "model_id": inferred_id,
+                "package": status,
+            }
+        except Exception as exc:
+            if root.exists():
+                shutil.rmtree(root, ignore_errors=True)
+            return {"status": "error", "error": str(exc)}
 
 
 def model_registry_status(active_model_id=None):
@@ -2518,6 +2652,7 @@ INDEX_HTML = r"""<!doctype html>
       background:rgba(229,242,243,.45);
     }
     .module-card {
+      position:relative;
       flex:0 0 100%;
       width:100%;
       max-width:100%;
@@ -2585,6 +2720,155 @@ INDEX_HTML = r"""<!doctype html>
     }
     .module-card[data-size="wide"] pre {
       max-height:420px;
+    }
+    .model-panel {
+      display:grid;
+      gap:14px;
+    }
+    .model-summary-grid {
+      display:grid;
+      grid-template-columns:repeat(auto-fit, minmax(220px, 1fr));
+      gap:10px;
+    }
+    .model-manager-grid {
+      display:grid;
+      grid-template-columns:minmax(280px, 360px) minmax(0, 1fr);
+      gap:14px;
+      align-items:start;
+    }
+    .model-panel-block {
+      border:1px solid var(--line);
+      border-radius:14px;
+      background:linear-gradient(135deg, #fff, var(--surface-soft));
+      padding:14px;
+      display:grid;
+      gap:10px;
+      min-width:0;
+    }
+    .model-panel-block h3 {
+      margin:0;
+      font-size:14px;
+      color:var(--ink);
+      font-weight:850;
+    }
+    .model-panel-copy {
+      color:var(--muted);
+      font-size:12px;
+      line-height:1.6;
+    }
+    .model-actions-grid {
+      display:grid;
+      gap:10px;
+    }
+    .model-import-row {
+      display:grid;
+      gap:8px;
+    }
+    .model-import-row input[type="file"] {
+      width:100%;
+      min-width:0;
+    }
+    .model-table-wrap {
+      display:grid;
+      gap:10px;
+    }
+    .model-pkg-card {
+      border:1px solid var(--line);
+      border-radius:14px;
+      background:linear-gradient(135deg, #fff 60%, var(--surface-soft));
+      padding:14px 16px;
+      display:grid;
+      gap:8px;
+      transition:border-color .2s, box-shadow .2s;
+    }
+    .model-pkg-card:hover {
+      border-color:var(--primary);
+      box-shadow:0 4px 16px rgba(47,111,120,.08);
+    }
+    .model-pkg-card.is-active {
+      border-color:var(--good);
+      background:linear-gradient(135deg, var(--good-bg) 30%, #fff);
+    }
+    .model-pkg-card-head {
+      display:flex;
+      align-items:center;
+      gap:8px;
+      flex-wrap:wrap;
+    }
+    .model-pkg-card-head .pkg-label {
+      font-weight:700;
+      font-size:14px;
+      color:var(--ink);
+      flex:1;
+      min-width:0;
+    }
+    .model-pkg-card-head .pill {
+      flex-shrink:0;
+    }
+    .model-pkg-card-meta {
+      display:flex;
+      flex-wrap:wrap;
+      gap:6px 16px;
+      font-size:12px;
+      color:var(--muted);
+    }
+    .model-pkg-card-meta span {
+      white-space:nowrap;
+    }
+    .model-pkg-card-actions {
+      display:flex;
+      flex-wrap:wrap;
+      gap:6px;
+      align-items:center;
+      padding-top:4px;
+      border-top:1px solid var(--line);
+    }
+    .model-pkg-card-actions input[type="text"] {
+      flex:1;
+      min-width:120px;
+      max-width:260px;
+    }
+    .model-pkg-card-actions button {
+      font-size:12px;
+      padding:4px 10px;
+    }
+    .model-pkg-desc {
+      font-size:11px;
+      color:var(--soft);
+      line-height:1.5;
+    }
+    .model-table th,
+    .model-table td {
+      white-space:normal;
+      overflow-wrap:anywhere;
+    }
+    .model-table td code {
+      display:inline-block;
+      max-width:100%;
+      white-space:normal;
+    }
+    .model-row-actions {
+      display:flex;
+      flex-wrap:wrap;
+      gap:8px;
+      align-items:center;
+    }
+    .model-label-input {
+      width:100%;
+      min-width:0;
+    }
+    .model-source-lines {
+      display:grid;
+      gap:4px;
+    }
+    .model-status-stack {
+      display:grid;
+      gap:6px;
+      justify-items:start;
+    }
+    .model-table-empty {
+      padding:16px;
+      color:var(--muted);
     }
     .module-card.is-hidden { display:none; }
     .module-card.is-collapsed {
@@ -2735,6 +3019,9 @@ INDEX_HTML = r"""<!doctype html>
       .module-card .kv {
         grid-template-columns:1fr;
         gap:4px;
+      }
+      .model-manager-grid {
+        grid-template-columns:1fr;
       }
       .module-card .kv span:first-child {
         font-size:12px;
@@ -3401,6 +3688,9 @@ function escapeHtml(value) {
 function jsString(value) {
   return JSON.stringify(String(value ?? ""));
 }
+function escapeAttr(value) {
+  return escapeHtml(value).replace(/`/g, "&#96;");
+}
 function phaseInfo(game, activeRun) {
   if (!game.online) return {label:"未连接", cls:"off", detail:`游戏 API 离线：${game.error || "无响应"}`};
   const raw = String(game.state_type || "unknown");
@@ -3462,7 +3752,7 @@ const MODULE_IDS = ["ai_logic", "llm_logic", "model_status", "current_data", "ru
 const MODULE_DEFAULT_SIZES = {
   ai_logic: "normal",
   llm_logic: "normal",
-  model_status: "normal",
+  model_status: "wide",
   current_data: "wide",
   runs: "wide",
   records: "wide",
@@ -4339,7 +4629,7 @@ function renderStatus(s) {
   renderPolicyEvaluation(s.evaluation || {});
   renderLiveActivity(s.recent_records || []);
   renderRecentRecords(s.recent_records || []);
-  renderModelHealth(s.models || {}, s.ai_process || {}, s.control || {}, s.python_runtime || {}, s.monster_profiles || {});
+  renderModelHealthV2(s.models || {}, s.ai_process || {}, s.control || {}, s.python_runtime || {}, s.monster_profiles || {});
   renderAiLogic(s.ai_logic);
   renderLLMLogic(s.llm && s.llm.logic, llmCfg);
 
@@ -4403,6 +4693,10 @@ function renderCurrentData(data) {
     <div class="warning-list">${warnings || '<div><span class="pill on">正常</span> 最近 run 有数据写入</div>'}</div>`;
 }
 function renderModelHealth(models, aiProcess, control, runtime, monsterProfiles) {
+  const modelHealthDiv = document.getElementById("modelHealth");
+  if (modelHealthDiv && (modelHealthDiv.contains(document.activeElement) || modelHealthDiv.matches(':hover') || modelHealthDiv.querySelector('input:focus, select:focus, [data-editing="1"]'))) {
+    return;
+  }
   const combat = models.combat || {};
   const candidate = models.candidate || {};
   const macro = models.macro || {};
@@ -4503,6 +4797,166 @@ function renderModelHealth(models, aiProcess, control, runtime, monsterProfiles)
     <div class="kv"><span>宏观执行</span><span><span class="pill ${control.macro_enabled ? "warn" : "info"}">${control.macro_enabled ? "开启" : "关闭"}</span> ${control.macro_enabled ? "会自动点地图/奖励/选卡" : "只显示战斗托管"}</span></div>
     <div class="kv"><span>商店保护</span><span><span class="pill ${control.macro_shop_enabled ? "warn" : "on"}">${control.macro_shop_enabled ? "允许购买" : "保护中"}</span> ${control.macro_shop_enabled ? "AI 可买明确商品；不自动删牌" : "AI 不碰商店，避免抢操作"}</span></div>
     ${modelSwitchHtml}
+    ${restartNotice}
+    ${warningHtml}`;
+}
+function renderModelHealthV2(models, aiProcess, control, runtime, monsterProfiles) {
+  const modelHealthDiv = document.getElementById("modelHealth");
+  if (modelHealthDiv && (modelHealthDiv.contains(document.activeElement) || modelHealthDiv.matches(':hover') || modelHealthDiv.querySelector('input:focus, select:focus, [data-editing="1"]'))) {
+    return;
+  }
+  const combat = models.combat || {};
+  const candidate = models.candidate || {};
+  const macro = models.macro || {};
+  const monster = monsterProfiles || {};
+  const monsterSummary = monster.summary || {};
+  const combatMeta = combat.metadata || {};
+  const candidateMeta = candidate.metadata || {};
+  const macroSummary = macro.summary || {};
+  const macroMeta = macro.metadata || {};
+  const ready = !!combat.ready && !!candidate.ready && !!macro.ready;
+  const needsRestart = !!aiProcess.needs_restart;
+  const warnings = [];
+  if (!combat.ready) warnings.push("战斗 BC 模型缺失，需要重新训练。");
+  if (!candidate.ready) warnings.push("候选动作评分模型缺失，AI 会回退到旧的战斗 BC。");
+  if (!macro.ready) warnings.push("宏观 BC 模型缺失，需要先训练宏观模型。");
+  if (needsRestart) warnings.push("AI 进程早于当前 ai_agent.py，需要重启 AI 后新逻辑才会生效。");
+  if (runtime && runtime.agent_ready === false) warnings.push(`当前 Python 缺少 AI 依赖：${(runtime.missing || []).join(", ")}。网页能开，但启动 AI 或训练会失败。`);
+  if (control.macro_enabled && !macro.ready) warnings.push("宏观开关已打开，但宏观模型当前不可用。");
+  if (control.macro_enabled && !control.macro_shop_enabled) warnings.push("商店保护已开启：AI 不会买东西，也不会自动离开商店。");
+  setPill("modelBadge", ready ? (needsRestart ? "需重启" : "模型齐") : "缺模型", ready ? (needsRestart ? "warn" : "on") : "off");
+
+  const restartNotice = needsRestart
+    ? `<div class="notice warn"><b>需要重启 AI。</b> 当前 AI 进程可能还在运行旧代码，重启后新的模型和宏观逻辑才会进入运行时。</div>`
+    : "";
+  const warningHtml = warnings.length
+    ? `<div class="warning-list">${warnings.map(w => `<div><span class="pill warn">注意</span> ${escapeHtml(w)}</div>`).join("")}</div>`
+    : `<div class="notice good">战斗模型、候选动作模型和宏观模型都已就绪。</div>`;
+
+  const registry = models.registry || {};
+  const packages = registry.packages || [];
+  const activeModelId = registry.active_model_id || "local";
+  const autoKeepLimit = registry.auto_keep_limit || 5;
+  const packageOptions = packages.map(pkg =>
+    `<option value="${escapeHtml(pkg.id)}" ${pkg.id === activeModelId ? "selected" : ""}>${escapeHtml(pkg.label || pkg.id)}</option>`
+  ).join("");
+  const packageCount = packages.length;
+  const importHint = packageCount
+    ? `已找到 ${packageCount} 个模型包，导入后会立刻出现在列表里。`
+    : "当前还没有模型包，可以先导入别人分享的 zip 模型包。";
+
+  const packageCards = packages.map(pkg => {
+    const summary = pkg.summary || {};
+    const sources = summary.accepted_sources || {};
+    const combatSources = sources.combat || {};
+    const macroSources = sources.macro || {};
+    const isPinned = !!pkg.pinned || pkg.retention === "manual";
+    const isActive = pkg.id === activeModelId;
+    const rowId = `modelLabel_${pkg.id}`;
+    const createdDate = (pkg.created_at || "").replace("T", " ");
+    return `<div class="model-pkg-card ${isActive ? 'is-active' : ''}">
+      <div class="model-pkg-card-head">
+        <span class="pkg-label">${escapeHtml(pkg.label || pkg.id)}</span>
+        ${isActive ? '<span class="pill on">当前启用</span>' : ''}
+        <span class="pill ${pkg.complete ? "on" : "off"}">${pkg.complete ? "完整" : "缺文件"}</span>
+        <span class="pill ${isPinned ? "on" : "info"}">${isPinned ? "永久保留" : "自动清理"}</span>
+      </div>
+      <div class="model-pkg-card-meta">
+        <span>战斗 ${summary.combat_samples || 0}</span>
+        <span>候选 ${summary.candidate_rows || 0}</span>
+        <span>宏观 ${summary.macro_samples || 0}</span>
+        <span>${formatBytes(pkg.size || 0)}</span>
+        <span>C:H${combatSources.human||0}/A${combatSources.ai||0}</span>
+        <span>M:H${macroSources.human||0}/A${macroSources.ai||0}</span>
+        <span>${summary.include_ai ? "AI已纳入" : ""}</span>
+      </div>
+      ${pkg.description ? `<div class="model-pkg-desc">${escapeHtml(pkg.description)}</div>` : ''}
+      <div class="model-pkg-card-meta">
+        <span>ID: ${escapeHtml(pkg.id)}</span>
+        <span>${escapeHtml(createdDate)}</span>
+      </div>
+      <div class="model-pkg-card-actions">
+        <input id="${escapeAttr(rowId)}" type="text" value="${escapeAttr(pkg.label || pkg.id)}" onfocus="this.dataset.editing='1'" onblur="this.dataset.editing=''">
+        <button onclick="renameModelPackage(${jsString(pkg.id)})">保存名称</button>
+        <button onclick="pinModelPackage(${jsString(pkg.id)})" ${isPinned ? "disabled" : ""}>永久保留</button>
+        <button onclick="activateModelById(${jsString(pkg.id)})" ${isActive ? "disabled" : ""}>切换启用</button>
+        <button class="off" onclick="deleteModelPackage(${jsString(pkg.id)})" ${isActive ? "disabled" : ""}>删除</button>
+      </div>
+    </div>`;
+  }).join("");
+
+  const modelSwitchHtml = `
+    <div class="model-panel">
+      <div class="model-summary-grid">
+        <div class="compact-card">
+          <div class="compact-card-title">当前启用</div>
+          <div class="row"><span class="pill info">${escapeHtml(registry.active_label || activeModelId)}</span></div>
+          <div class="fine">ID: ${escapeHtml(activeModelId)}</div>
+        </div>
+        <div class="compact-card">
+          <div class="compact-card-title">可管理模型包</div>
+          <div class="row"><span class="pill on">${packageCount}</span></div>
+          <div class="fine">自动保留最多 ${autoKeepLimit} 个快照，永久保留不会被清理。</div>
+        </div>
+      </div>
+      <div class="model-manager-grid">
+        <div class="model-actions-grid">
+          <div class="model-panel-block">
+            <h3>训练模型切换</h3>
+            <div class="field">
+              <span>模型包</span>
+              <select id="modelPackageSelect" ${packages.length ? "" : "disabled"}>
+                ${packageOptions || '<option value="">暂无模型包</option>'}
+              </select>
+            </div>
+            <div class="button-row">
+              <button class="primary" onclick="activateModelPackage()" ${packages.length ? "" : "disabled"}>切换到选中模型</button>
+              <button onclick="restartAI()">重启 AI</button>
+            </div>
+            <div class="model-panel-copy">切换后重启 AI，运行中的 agent 才会重新加载新模型。</div>
+          </div>
+          <div class="model-panel-block">
+            <h3>当前模型快照</h3>
+            <div class="field">
+              <span>永久保存当前模型</span>
+              <input id="manualModelName" type="text" placeholder="例如：第一关稳定版">
+            </div>
+            <div class="button-row">
+              <button onclick="saveCurrentModelSnapshot()">永久保存</button>
+            </div>
+            <div class="model-panel-copy">把当前运行目录里的模型整理成一个可切换模型包。</div>
+          </div>
+          <div class="model-panel-block">
+            <h3>导入别人的模型包</h3>
+            <div class="model-import-row">
+              <input id="modelImportFile" type="file" accept=".zip,application/zip">
+              <button onclick="importModelPackage()">导入 zip 模型包</button>
+            </div>
+            <div class="model-panel-copy">${escapeHtml(importHint)}</div>
+          </div>
+          <div id="modelSwitchResult" class="notice">当前启用：${escapeHtml(registry.active_label || activeModelId)}。切换后需要重启 AI 进程。</div>
+        </div>
+        <div class="model-panel-block">
+          <h3>模型包列表（${packageCount} 个）</h3>
+          <div class="model-table-wrap">
+            ${packageCards || '<div class="model-table-empty">暂无可切换模型包</div>'}
+          </div>
+        </div>
+      </div>
+    </div>`;
+
+  document.getElementById("modelHealth").innerHTML = `
+    <div class="model-panel">
+      <div class="kv"><span>战斗模型</span><span><span class="pill ${combat.ready ? "on" : "off"}">${combat.ready ? "可用" : "缺失"}</span> 样本 ${combatMeta.samples || "-"}，特征 ${combatMeta.features || "旧版"} ${combat.model && combat.model.mtime ? combat.model.mtime : ""}</span></div>
+      <div class="kv"><span>候选动作模型</span><span><span class="pill ${candidate.ready ? "on" : "warn"}">${candidate.ready ? "线上优先" : "回退旧 BC"}</span> 行 ${candidateMeta.samples || 0}，正例 ${candidateMeta.positives || 0}，组 ${candidateMeta.groups || 0}，Top1 ${candidateMeta.best_group_top1 ? Number(candidateMeta.best_group_top1).toFixed(1) + "%" : "-"}</span></div>
+      <div class="kv"><span>宏观模型</span><span><span class="pill ${macro.ready ? "on" : "off"}">${macro.ready ? "可用" : "缺失"}</span> 样本 ${macroSummary.samples || macroMeta.samples || 0}，动作 ${macroSummary.actions || macroMeta.classes || 0}</span></div>
+      <div class="kv"><span>怪物画像</span><span><span class="pill ${monster.ready ? "on" : "warn"}">${monster.ready ? "可用" : "待生成"}</span> 怪物 ${monsterSummary.monsters || 0}，战斗 ${monsterSummary.encounters || 0}，回合样本 ${monsterSummary.monster_turn_rows || 0}</span></div>
+      <div class="kv"><span>Python</span><span><span class="pill ${runtime && runtime.agent_ready ? "on" : "warn"}">${runtime && runtime.agent_ready ? "依赖可用" : "缺依赖"}</span> ${escapeHtml((runtime && runtime.executable) || "-")} ${runtime && runtime.version ? `(${runtime.version})` : ""}</span></div>
+      <div class="kv"><span>AI 进程</span><span>${aiProcess.pid ? `PID ${aiProcess.pid}` : "未启动"}${aiProcess.started_at ? `，启动于 ${aiProcess.started_at}` : ""}</span></div>
+      <div class="kv"><span>宏观执行</span><span><span class="pill ${control.macro_enabled ? "warn" : "info"}">${control.macro_enabled ? "开启" : "关闭"}</span> ${control.macro_enabled ? "会自动点地图、奖励和选卡" : "只显示战斗托管"}</span></div>
+      <div class="kv"><span>商店保护</span><span><span class="pill ${control.macro_shop_enabled ? "warn" : "on"}">${control.macro_shop_enabled ? "允许购买" : "保护中"}</span> ${control.macro_shop_enabled ? "AI 可以购买明确商品，但不会自动删牌" : "AI 不碰商店，避免抢操作"}</span></div>
+      ${modelSwitchHtml}
+    </div>
     ${restartNotice}
     ${warningHtml}`;
 }
@@ -4885,6 +5339,56 @@ async function saveCurrentModelSnapshot(){
   }
   refresh();
 }
+async function importModelPackage(){
+  const resultEl = document.getElementById("modelSwitchResult");
+  const input = document.getElementById("modelImportFile");
+  const file = input && input.files && input.files[0];
+  if (!file) {
+    if (resultEl) resultEl.textContent = "请先选择一个 zip 模型包。";
+    return;
+  }
+  if (!/\.zip$/i.test(file.name || "")) {
+    if (resultEl) resultEl.textContent = "目前只支持导入 .zip 模型包。";
+    return;
+  }
+  if (resultEl) resultEl.textContent = `正在导入 ${file.name} ...`;
+  const bytes = await file.arrayBuffer();
+  const uint8 = new Uint8Array(bytes);
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let i = 0; i < uint8.length; i += chunkSize) {
+    binary += String.fromCharCode(...uint8.subarray(i, i + chunkSize));
+  }
+  const content_base64 = btoa(binary);
+  const result = await api("/api/model/import", {filename:file.name, content_base64});
+  if (result.status === "ok") {
+    if (input) input.value = "";
+    if (resultEl) resultEl.textContent = `导入成功：${(result.package && result.package.label) || result.model_id}`;
+  } else if (resultEl) {
+    resultEl.textContent = result.error || "导入失败";
+  }
+  refresh();
+}
+async function deleteModelPackage(model_id){
+  if (!confirm(`确定要彻底删除模型包 ${model_id} 吗？此操作不可恢复。`)) return;
+  const resultEl = document.getElementById("modelSwitchResult");
+  if (resultEl) resultEl.textContent = "正在删除...";
+  const result = await api("/api/model/delete", {model_id});
+  if (resultEl) resultEl.textContent = result.status === "ok" ? "模型包已删除。" : (result.error || "删除失败");
+  refresh();
+}
+async function activateModelById(model_id){
+  const resultEl = document.getElementById("modelSwitchResult");
+  if (!model_id) return;
+  if (resultEl) resultEl.textContent = "正在切换模型包...";
+  const result = await api("/api/model/activate", {model_id});
+  if (result.status === "ok") {
+    if (resultEl) resultEl.textContent = `已切换到 ${result.active_label || result.active_model_id}。${result.needs_restart ? "请重启 AI 后生效。" : "下次启动 AI 时生效。"}`;
+  } else if (resultEl) {
+    resultEl.textContent = result.error || "切换失败";
+  }
+  refresh();
+}
 async function proceed(){ await api("/api/proceed", {}); refresh(); }
 async function markRun(run_id, discarded){ await api("/api/run", {run_id, discarded}); refresh(); }
 async function setQuality(run_id, quality){ await api("/api/quality", {run_id, quality}); refresh(); }
@@ -5049,6 +5553,13 @@ class Handler(BaseHTTPRequestHandler):
                     description=body.get("description") if "description" in body else None,
                     pin=bool(body.get("pin", False)),
                 ))
+            elif self.path == "/api/model/import":
+                self._json(200, import_model_package_archive(
+                    body.get("filename", ""),
+                    body.get("content_base64", ""),
+                ))
+            elif self.path == "/api/model/delete":
+                self._json(200, delete_model_package(body.get("model_id")))
             elif self.path == "/api/export":
                 self._json(200, export_database_package())
             elif self.path == "/api/run":
