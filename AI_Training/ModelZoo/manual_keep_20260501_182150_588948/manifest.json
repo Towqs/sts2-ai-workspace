@@ -1,0 +1,20 @@
+{
+  "id": "manual_keep_20260501_182150_588948",
+  "label": "永久保留模型 2026-05-01 18:21:50",
+  "description": "手动永久保留的本地训练模型。",
+  "created_at": "2026-05-01T18:21:50",
+  "source": "training_snapshot",
+  "retention": "manual",
+  "pinned": true,
+  "artifacts": [
+    "ProcessedParams\\bc_model_best.pth",
+    "ProcessedParams\\candidate_bc_model_best.pth",
+    "ProcessedParams\\vocab.json",
+    "ProcessedParams\\metadata.json",
+    "ProcessedParams\\candidate_metadata.json",
+    "ProcessedMacroParams\\macro_bc_model_best.pth",
+    "ProcessedMacroParams\\vocab.json",
+    "ProcessedMacroParams\\metadata.json",
+    "ProcessedMacroParams\\training_summary.json"
+  ]
+}

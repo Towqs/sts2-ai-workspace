@@ -164,6 +164,66 @@ function Test-PanelReady {
     }
 }
 
+function Set-PanelPort {
+    param([int]$Port)
+    $script:PanelPort = $Port
+    $script:PanelUrl = "http://127.0.0.1:$Port"
+}
+
+function Test-PanelPortFree {
+    param([int]$Port)
+    $listener = $null
+    try {
+        $address = [System.Net.IPAddress]::Parse("127.0.0.1")
+        $listener = [System.Net.Sockets.TcpListener]::new($address, $Port)
+        $listener.Start()
+        return $true
+    } catch {
+        return $false
+    } finally {
+        if ($listener) {
+            $listener.Stop()
+        }
+    }
+}
+
+function Find-FreePanelPort {
+    param(
+        [int]$StartPort,
+        [int]$Limit = 20
+    )
+    for ($port = $StartPort; $port -lt ($StartPort + $Limit); $port++) {
+        if (Test-PanelPortFree $port) {
+            return $port
+        }
+    }
+    throw "No free local panel port found from $StartPort to $($StartPort + $Limit - 1)."
+}
+
+function Test-PanelUsesCurrentUi {
+    try {
+        $response = Invoke-WebRequest -Uri "$PanelUrl/" -UseBasicParsing -TimeoutSec 4
+        $html = [string]$response.Content
+        return ($html.Contains("renderTrainingComposition") -and $html.Contains("trainCompositionMain"))
+    } catch {
+        return $false
+    }
+}
+
+function Get-PanelPortPid {
+    try {
+        $lines = netstat -ano | Select-String (":$PanelPort\s")
+        foreach ($line in $lines) {
+            $text = [string]$line
+            if ($text -match "LISTENING\s+(\d+)\s*$") {
+                return $Matches[1]
+            }
+        }
+    } catch {
+    }
+    return ""
+}
+
 function Test-CommandLineProcess {
     param([string[]]$Needles)
     if (-not $Needles -or $Needles.Count -eq 0) {
@@ -285,13 +345,25 @@ $controlLogQ = Quote-PSLiteral $ControlLog
 $venvPathCommand = if ($UseVenvSitePackages) { "`$env:PYTHONPATH = $venvSiteQ" } else { "" }
 
 if (Test-PanelReady) {
-    Write-Host "Control panel is already running."
-} else {
+    if (Test-PanelUsesCurrentUi) {
+        Write-Host "Control panel is already running."
+    } else {
+        $panelPid = Get-PanelPortPid
+        $pidHint = if ($panelPid) { " PID $panelPid" } else { "" }
+        $oldUrl = $PanelUrl
+        $fallbackPort = Find-FreePanelPort -StartPort ($PanelPort + 1)
+        Set-PanelPort $fallbackPort
+        Write-Warning "A stale control panel$pidHint is already using $oldUrl. Starting a fresh panel on $PanelUrl instead."
+    }
+}
+
+if (-not (Test-PanelReady)) {
     $controlCommand = @"
 Set-Location -LiteralPath $rootQ
 `$env:PYTHONIOENCODING = 'utf-8'
 `$env:PYTHONUTF8 = '1'
 `$env:STS2_AI_PYTHON = $pythonQ
+`$env:STS2_AI_PANEL_PORT = '$PanelPort'
 $venvPathCommand
 & $pythonQ -X utf8 $panelQ 2>&1 | Tee-Object -FilePath $controlLogQ -Append
 "@

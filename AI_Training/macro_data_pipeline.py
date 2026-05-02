@@ -1,5 +1,6 @@
 import json
 import os
+import time
 from collections import Counter
 from pathlib import Path
 
@@ -482,6 +483,7 @@ def encode_record(vocab, record):
 
 
 def build_dataset():
+    start_time = time.time()
     files = macro_files()
     print(f"Found {len(files)} macro files.")
     ctx = FilterContext(files)
@@ -509,6 +511,7 @@ def build_dataset():
     class_counts = Counter()
     source_counts = Counter()
     quality_counts = Counter()
+    accepted_runs = {}  # run_id -> {source, quality, samples}
     for record in records:
         label = norm_action_label(record)
         action_id = vocab.get("actions", label)
@@ -517,8 +520,14 @@ def build_dataset():
         x_rows.append(encode_record(vocab, record))
         y_rows.append(action_id)
         class_counts[label] += 1
-        source_counts[record.get("source") or "unknown"] += 1
-        quality_counts[ctx.run_quality(record.get("run_id"))] += 1
+        source = record.get("source") or "unknown"
+        source_counts[source] += 1
+        run_id = record.get("run_id") or "unknown"
+        quality = ctx.run_quality(run_id)
+        quality_counts[quality] += 1
+        if run_id not in accepted_runs:
+            accepted_runs[run_id] = {"source": source, "quality": quality, "samples": 0}
+        accepted_runs[run_id]["samples"] += 1
 
     if x_rows:
         x_data = np.vstack(x_rows).astype(np.float32)
@@ -527,11 +536,30 @@ def build_dataset():
         x_data = np.zeros((0, 1), dtype=np.float32)
         y_data = np.zeros((0,), dtype=np.int64)
 
+    human_samples = source_counts.get("human", 0)
+    ai_samples = source_counts.get("ai", 0)
+    total = int(len(y_data))
+
+    runs_detail = []
+    for rid, info in sorted(accepted_runs.items(), key=lambda x: -x[1]["samples"]):
+        runs_detail.append({
+            "run_id": rid,
+            "source": info["source"],
+            "quality": info["quality"],
+            "samples": info["samples"],
+        })
+
     np.save(OUTPUT_DIR / "X_train.npy", x_data)
     np.save(OUTPUT_DIR / "Y_train.npy", y_data)
     with open(OUTPUT_DIR / "metadata.json", "w", encoding="utf-8") as f:
         json.dump({
-            "samples": int(len(y_data)),
+            "samples": total,
+            "human_samples": human_samples,
+            "ai_samples": ai_samples,
+            "human_ratio": round(human_samples / max(total, 1), 4),
+            "ai_ratio": round(ai_samples / max(total, 1), 4),
+            "accepted_run_count": len(accepted_runs),
+            "accepted_runs": runs_detail,
             "features": int(x_data.shape[1]) if x_data.ndim == 2 else 0,
             "classes": class_counts,
             "accepted_sources": source_counts,
@@ -548,9 +576,13 @@ def build_dataset():
                 if "ai" in progress.get("sources", set())
                 and (progress.get("max_act", 0) >= 2 or progress.get("max_floor", 0) > 17)
             ),
+            "build_timestamp": __import__("datetime").datetime.now().isoformat(timespec="seconds"),
+            "build_elapsed_sec": round(time.time() - start_time, 2),
+            "data_file_count": len(files),
         }, f, ensure_ascii=False, indent=2)
 
     print(f"Saved macro dataset: X={x_data.shape}, Y={y_data.shape}")
+    print(f"  Human: {human_samples} ({human_samples*100/max(total,1):.1f}%)  AI: {ai_samples} ({ai_samples*100/max(total,1):.1f}%)  Runs: {len(accepted_runs)}")
     print("Top macro labels:")
     for label, count in class_counts.most_common(20):
         print(f"  {label}: {count}")

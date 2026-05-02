@@ -1,9 +1,11 @@
 import os
 import json
 import glob
+import hashlib
 import numpy as np
 import time
 import re
+from datetime import datetime
 
 from combat_actions import (
     CANDIDATE_FEATURE_DIM,
@@ -28,6 +30,41 @@ QUALITY_ORDER = {
     "partial_act2": 2,
     "perfect_run": 3,
 }
+
+
+def _path_signature(path):
+    rel = os.path.relpath(path, WORKSPACE_DIR)
+    try:
+        stat = os.stat(path)
+        return {
+            "path": rel,
+            "size": int(stat.st_size),
+            "mtime_ns": int(stat.st_mtime_ns),
+        }
+    except OSError:
+        return {
+            "path": rel,
+            "missing": True,
+        }
+
+
+def _vocab_build_signature(filepaths, ctx):
+    payload = {
+        "files": [_path_signature(path) for path in sorted(filepaths)],
+        "discarded": _path_signature(DISCARDED_RUNS_PATH),
+        "labels": _path_signature(RUN_LABELS_PATH),
+        "filter": {
+            "include_ai": bool(ctx.include_ai),
+            "min_quality": ctx.min_quality,
+            "ai_min_quality": ctx.ai_min_quality,
+            "ai_accept_failed_after_act1": bool(ctx.ai_accept_failed_after_act1),
+            "ai_require_no_invalid_actions": bool(ctx.ai_require_no_invalid_actions),
+            "disabled_since": ctx.disabled_since,
+            "disabled_ranges": ctx.disabled_ranges,
+        },
+    }
+    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
 def iter_json_objects(filepath):
@@ -578,14 +615,37 @@ def build_dataset(data_dirs, output_dir):
         
     print(f"Found {len(filepaths)} data files.")
     ctx.prepare(filepaths)
+    vocab_signature = _vocab_build_signature(filepaths, ctx)
     
-    # 1. 扫描词表
-    if not os.path.exists(vocab_path):
+    # 1. 扫描词表（当文件或过滤签名变化时强制重建）
+    rebuild_vocab = True
+    if os.path.exists(vocab_path):
+        try:
+            with open(vocab_path, "r", encoding="utf-8") as f:
+                old_vocab = json.load(f)
+            old_signature = old_vocab.get("_build_signature")
+            if old_signature == vocab_signature:
+                rebuild_vocab = False
+                print("Using existing vocab (dataset signature unchanged)...")
+            else:
+                print("Vocab outdated (dataset signature changed). Rebuilding...")
+        except Exception:
+            pass
+    if rebuild_vocab:
         builder = VocabBuilder()
         builder.scan_files(filepaths, ctx=ctx)
         builder.save(vocab_path)
-    else:
-        print("Using existing vocab...")
+        # 追加构建元信息到 vocab.json
+        try:
+            with open(vocab_path, "r", encoding="utf-8") as f:
+                vocab_data = json.load(f)
+            vocab_data["_build_file_count"] = len(filepaths)
+            vocab_data["_build_include_ai"] = ctx.include_ai
+            vocab_data["_build_signature"] = vocab_signature
+            with open(vocab_path, "w", encoding="utf-8") as f:
+                json.dump(vocab_data, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
 
     # 2. 编码数据
     encoder = StateEncoder(vocab_path)
@@ -599,6 +659,8 @@ def build_dataset(data_dirs, output_dir):
     candidate_match_misses = 0
     accepted_sources = {}
     accepted_run_qualities = {}
+    accepted_runs = {}  # run_id -> {source, quality, samples}
+    skipped_runs = {}   # run_id -> reason
     
     print("Encoding data into features...")
     start_time = time.time()
@@ -630,8 +692,13 @@ def build_dataset(data_dirs, output_dir):
                         Y_data.append(action_id)
                         source = data.get("source") or "unknown"
                         accepted_sources[source] = accepted_sources.get(source, 0) + 1
-                        quality = ctx.run_quality(data.get("run_id"))
+                        run_id = data.get("run_id") or "unknown"
+                        quality = ctx.run_quality(run_id)
                         accepted_run_qualities[quality] = accepted_run_qualities.get(quality, 0) + 1
+                        # per-run tracking
+                        if run_id not in accepted_runs:
+                            accepted_runs[run_id] = {"source": source, "quality": quality, "samples": 0}
+                        accepted_runs[run_id]["samples"] += 1
 
                         candidates = enumerate_combat_actions(state)
                         matched_idx = match_logged_action(candidates, action)
@@ -660,7 +727,12 @@ def build_dataset(data_dirs, output_dir):
     candidate_Y_data = np.array(candidate_Y_data, dtype=np.int64)
     candidate_group_data = np.array(candidate_group_data, dtype=np.int64)
     
-    print(f"Encoded {len(X_data)} samples in {time.time() - start_time:.2f} seconds.")
+    elapsed = time.time() - start_time
+    human_samples = accepted_sources.get("human", 0)
+    ai_samples = accepted_sources.get("ai", 0)
+    total_samples = int(len(Y_data))
+    print(f"Encoded {total_samples} samples in {elapsed:.2f} seconds.")
+    print(f"  Human: {human_samples} ({human_samples*100/max(total_samples,1):.1f}%)  AI: {ai_samples} ({ai_samples*100/max(total_samples,1):.1f}%)  Runs: {len(accepted_runs)}")
     
     # 3. 保存 Numpy 数据集
     np.save(os.path.join(output_dir, 'X_train.npy'), X_data)
@@ -668,8 +740,25 @@ def build_dataset(data_dirs, output_dir):
     np.save(os.path.join(output_dir, 'candidate_X_train.npy'), candidate_X_data)
     np.save(os.path.join(output_dir, 'candidate_Y_train.npy'), candidate_Y_data)
     np.save(os.path.join(output_dir, 'candidate_group_train.npy'), candidate_group_data)
+
+    # per-run 详细列表（按样本数降序）
+    runs_detail = []
+    for rid, info in sorted(accepted_runs.items(), key=lambda x: -x[1]["samples"]):
+        runs_detail.append({
+            "run_id": rid,
+            "source": info["source"],
+            "quality": info["quality"],
+            "samples": info["samples"],
+        })
+
     metadata = {
-        "samples": int(len(Y_data)),
+        "samples": total_samples,
+        "human_samples": human_samples,
+        "ai_samples": ai_samples,
+        "human_ratio": round(human_samples / max(total_samples, 1), 4),
+        "ai_ratio": round(ai_samples / max(total_samples, 1), 4),
+        "accepted_run_count": len(accepted_runs),
+        "accepted_runs": runs_detail,
         "features": int(X_data.shape[1]) if X_data.ndim == 2 else 0,
         "feature_version": 2,
         "candidate_rows": int(len(candidate_Y_data)),
@@ -691,6 +780,10 @@ def build_dataset(data_dirs, output_dir):
             if "ai" in progress.get("sources", set())
             and (progress.get("max_act", 0) >= 2 or progress.get("max_floor", 0) > 17)
         ),
+        "build_timestamp": datetime.now().isoformat(timespec="seconds"),
+        "build_elapsed_sec": round(elapsed, 2),
+        "data_file_count": len(filepaths),
+        "data_signature": vocab_signature,
         "feature_notes": [
             "act_floor_round",
             "incoming_damage",

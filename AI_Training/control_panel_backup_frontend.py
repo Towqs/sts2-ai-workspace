@@ -64,17 +64,6 @@ MODEL_ARTIFACTS = {
 MODEL_IMPORT_MAX_BYTES = 128 * 1024 * 1024
 
 
-def resolve_panel_port(default=8765):
-    for value in (os.environ.get("STS2_AI_PANEL_PORT"), sys.argv[1] if len(sys.argv) > 1 else ""):
-        try:
-            port = int(value)
-        except (TypeError, ValueError):
-            continue
-        if 1 <= port <= 65535:
-            return port
-    return default
-
-
 def python_exe_runs(candidate):
     if not candidate:
         return False
@@ -1424,72 +1413,7 @@ def models_status():
     }
 
 
-def training_composition():
-    """Return structured data composition info for the control panel."""
-    control = read_control()
-    include_ai = bool(control.get("include_ai_in_training", False))
-    min_quality = control.get("min_training_quality", "unknown")
-    ai_min_quality = control.get("ai_min_training_quality", "partial_act1")
-
-    combat_meta = read_json(AI_DIR / "ProcessedParams" / "metadata.json", {})
-    macro_meta = read_json(AI_DIR / "ProcessedMacroParams" / "metadata.json", {})
-
-    combat_runs = combat_meta.get("accepted_runs", [])
-    macro_runs = macro_meta.get("accepted_runs", [])
-
-    combat_human_runs = [r for r in combat_runs if r.get("source") == "human"]
-    combat_ai_runs = [r for r in combat_runs if r.get("source") == "ai"]
-    macro_human_runs = [r for r in macro_runs if r.get("source") == "human"]
-    macro_ai_runs = [r for r in macro_runs if r.get("source") == "ai"]
-    combat_human_samples = combat_meta.get("human_samples", combat_meta.get("accepted_sources", {}).get("human", 0))
-    combat_ai_samples = combat_meta.get("ai_samples", combat_meta.get("accepted_sources", {}).get("ai", 0))
-    macro_human_samples = macro_meta.get("human_samples", macro_meta.get("accepted_sources", {}).get("human", 0))
-    macro_ai_samples = macro_meta.get("ai_samples", macro_meta.get("accepted_sources", {}).get("ai", 0))
-
-    return {
-        "settings": {
-            "include_ai": include_ai,
-            "min_quality": min_quality,
-            "ai_min_quality": ai_min_quality,
-        },
-        "combat": {
-            "total_samples": combat_meta.get("samples", 0),
-            "human_samples": combat_human_samples,
-            "ai_samples": combat_ai_samples,
-            "human_ratio": combat_meta.get("human_ratio", 0),
-            "ai_ratio": combat_meta.get("ai_ratio", 0),
-            "include_ai": bool(combat_meta.get("include_ai", combat_ai_samples > 0)),
-            "run_count": combat_meta.get("accepted_run_count", len(combat_runs)),
-            "human_run_count": len(combat_human_runs),
-            "ai_run_count": len(combat_ai_runs),
-            "runs": combat_runs[:20],
-            "build_timestamp": combat_meta.get("build_timestamp", ""),
-            "build_elapsed_sec": combat_meta.get("build_elapsed_sec"),
-            "data_file_count": combat_meta.get("data_file_count"),
-            "candidate_groups": combat_meta.get("candidate_groups", 0),
-            "candidate_match_misses": combat_meta.get("candidate_match_misses", 0),
-        },
-        "macro": {
-            "total_samples": macro_meta.get("samples", 0),
-            "human_samples": macro_human_samples,
-            "ai_samples": macro_ai_samples,
-            "human_ratio": macro_meta.get("human_ratio", 0),
-            "ai_ratio": macro_meta.get("ai_ratio", 0),
-            "include_ai": bool(macro_meta.get("include_ai", macro_ai_samples > 0)),
-            "run_count": macro_meta.get("accepted_run_count", len(macro_runs)),
-            "human_run_count": len(macro_human_runs),
-            "ai_run_count": len(macro_ai_runs),
-            "runs": macro_runs[:20],
-            "build_timestamp": macro_meta.get("build_timestamp", ""),
-            "build_elapsed_sec": macro_meta.get("build_elapsed_sec"),
-            "data_file_count": len(macro_meta.get("files", [])) if macro_meta.get("files") else macro_meta.get("data_file_count"),
-        },
-        "has_data": bool(combat_meta.get("samples", 0) or macro_meta.get("samples", 0)),
-    }
-
-
 def monster_status():
-
     monster_dir = DATA_DIR / "Monster"
     summary = read_json(monster_dir / "monster_build_summary.json", {})
     profiles = read_json(monster_dir / "monster_profiles.json", {})
@@ -1640,7 +1564,6 @@ def status_payload():
             "logic": llm_logic_snapshot(),
         },
         "training": LAST_TRAIN,
-        "training_composition": training_composition(),
         "export": LAST_EXPORT,
     }
 
@@ -2104,27 +2027,21 @@ INDEX_HTML = r"""<!doctype html>
     }
     .stack { display:grid; gap:16px; min-width:0; }
     .sidebar { min-width:0; max-width:336px; }
-    .content { min-width:0; overflow:visible; }
+    .content { min-width:0; overflow:hidden; }
     section {
       position:relative;
       min-width:0;
-      background:rgba(255, 255, 255, 0.75);
-      backdrop-filter:blur(16px) saturate(120%);
-      -webkit-backdrop-filter:blur(16px) saturate(120%);
-      border:1px solid rgba(47,111,120,.14);
-      border-top-color:rgba(255,255,255,.8);
-      border-left-color:rgba(255,255,255,.6);
-      border-radius:18px;
+      background:rgba(255,254,250,.96);
+      border:1px solid var(--line);
+      border-radius:16px;
       padding:17px;
-      box-shadow:0 8px 32px rgba(47,111,120,.06), 0 2px 8px rgba(47,111,120,.03);
+      box-shadow:var(--shadow-soft);
       overflow:hidden;
-      transition:transform .3s var(--ease-smooth), box-shadow .3s var(--ease-smooth), border-color .3s var(--ease-smooth), background .3s var(--ease-smooth);
+      transition:transform .22s var(--ease-smooth), box-shadow .22s var(--ease-smooth), border-color .22s var(--ease-smooth);
     }
     section:hover {
       border-color:rgba(47,111,120,.22);
-      border-top-color:rgba(255,255,255,.9);
-      background:rgba(255, 255, 255, 0.85);
-      box-shadow:0 16px 40px rgba(47,111,120,.12), 0 4px 14px rgba(47,111,120,.05);
+      box-shadow:0 12px 30px rgba(38,55,58,.08);
     }
     section::after {
       content:"";
@@ -2207,90 +2124,6 @@ INDEX_HTML = r"""<!doctype html>
       border-top:1px solid var(--line);
       padding:14px 16px 16px;
       background:linear-gradient(180deg, #fff, var(--surface-soft));
-    }
-    .composition-card {
-      background: var(--surface);
-      border: 1px solid var(--line);
-      border-radius: 10px;
-      padding: 14px 16px;
-      box-shadow: 0 1px 4px rgba(0,0,0,0.04);
-    }
-    .composition-card .comp-header {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      margin-bottom: 10px;
-      font-weight: 600;
-      font-size: 13px;
-      color: var(--ink);
-    }
-    .composition-card .comp-bar {
-      height: 10px;
-      border-radius: 5px;
-      background: var(--line);
-      overflow: hidden;
-      margin-bottom: 12px;
-      display: flex;
-    }
-    .composition-card .comp-bar .bar-human {
-      background: linear-gradient(90deg, #3b82f6, #60a5fa);
-      height: 100%;
-      transition: width 0.4s ease;
-    }
-    .composition-card .comp-bar .bar-ai {
-      background: linear-gradient(90deg, #f59e0b, #fbbf24);
-      height: 100%;
-      transition: width 0.4s ease;
-    }
-    .composition-card .comp-stats {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
-      gap: 8px;
-      margin-bottom: 10px;
-    }
-    .composition-card .comp-stat {
-      text-align: center;
-      padding: 6px 4px;
-      border-radius: 6px;
-      background: var(--surface-soft);
-      border: 1px solid var(--line);
-    }
-    .composition-card .comp-stat .stat-value {
-      font-size: 18px;
-      font-weight: 700;
-      color: var(--ink);
-    }
-    .composition-card .comp-stat .stat-label {
-      font-size: 11px;
-      color: var(--muted);
-      margin-top: 2px;
-    }
-    .composition-card .comp-runs {
-      max-height: none;
-      overflow: visible;
-      font-size: 12px;
-    }
-    .composition-card .comp-runs table {
-      width: 100%;
-      border-collapse: collapse;
-    }
-    .composition-card .comp-runs th,
-    .composition-card .comp-runs td {
-      padding: 3px 6px;
-      text-align: left;
-      border-bottom: 1px solid var(--line);
-    }
-    .composition-card .comp-runs th {
-      font-weight: 600;
-      color: var(--muted);
-      font-size: 11px;
-      background: var(--surface);
-    }
-    .composition-card .comp-empty {
-      text-align: center;
-      color: var(--muted);
-      padding: 18px 0;
-      font-size: 13px;
     }
     .section-head {
       display:grid;
@@ -2467,8 +2300,8 @@ INDEX_HTML = r"""<!doctype html>
     code { overflow-wrap:anywhere; }
     pre {
       white-space:pre-wrap;
-      max-height:none;
-      overflow:visible;
+      max-height:260px;
+      overflow:auto;
       background:#233036;
       color:#eef6f2;
       padding:12px;
@@ -2477,13 +2310,7 @@ INDEX_HTML = r"""<!doctype html>
       font-size:12px;
       border:1px solid rgba(35,48,54,.34);
     }
-    .table-wrap {
-      overflow-x:auto;
-      overflow-y:visible;
-      border:1px solid var(--line);
-      border-radius:12px;
-      background:#fff;
-    }
+    .table-wrap { overflow:auto; border:1px solid var(--line); border-radius:12px; background:#fff; }
     .table-wrap table th, .table-wrap table td { white-space:nowrap; }
     .run-id { max-width:260px; white-space:normal; }
     .compact-card {
@@ -2843,6 +2670,10 @@ INDEX_HTML = r"""<!doctype html>
       user-select:text;
       -webkit-user-select:text;
     }
+    .module-card:hover {
+      transform:translateY(-1px);
+      box-shadow:0 12px 30px rgba(38,55,58,.08);
+    }
     .module-card[data-size="compact"] {
       flex-basis:calc((100% - 32px) / 3);
       width:calc((100% - 32px) / 3);
@@ -2860,9 +2691,9 @@ INDEX_HTML = r"""<!doctype html>
       width:min(var(--module-width), 100%);
     }
     .module-card.has-custom-height {
-      height:auto;
-      min-height:var(--module-height);
-      overflow:visible;
+      height:var(--module-height);
+      overflow-x:hidden;
+      overflow-y:auto;
       padding-bottom:26px;
     }
     .module-card[data-size="compact"] {
@@ -2882,13 +2713,13 @@ INDEX_HTML = r"""<!doctype html>
     }
     .module-card[data-size="compact"] .table-wrap,
     .module-card[data-size="compact"] pre {
-      max-height:none;
+      max-height:220px;
     }
     .module-card[data-size="wide"] .table-wrap {
-      max-height:none;
+      max-height:520px;
     }
     .module-card[data-size="wide"] pre {
-      max-height:none;
+      max-height:420px;
     }
     .model-panel {
       display:grid;
@@ -3533,7 +3364,6 @@ INDEX_HTML = r"""<!doctype html>
             <option value="perfect_run">只用通关完美</option>
           </select>
         </div>
-        <div id="trainingComposition" class="composition-card" style="margin-top:14px"></div>
         <div class="row" style="margin-top:12px">
           <button class="primary" onclick="train()">重建数据 + 重训战斗/候选/宏观 BC</button>
           <button onclick="proceed()">Proceed</button>
@@ -3541,7 +3371,6 @@ INDEX_HTML = r"""<!doctype html>
           </div>
         </details>
       </section>
-
 
       <section class="fold-panel">
         <details>
@@ -3690,21 +3519,14 @@ INDEX_HTML = r"""<!doctype html>
 
       <section id="module-training" class="module-card" data-module="training">
         <div class="section-head">
-          <h2>训练</h2>
+          <h2>训练输出</h2>
           <div class="module-actions">
             <span id="trainStatus" class="pill">-</span>
             <button class="module-action" onclick="toggleModuleCollapse('training')" data-collapse-for="training" title="收起">-</button>
             <button class="module-action" onclick="closeModule('training')" title="关闭">×</button>
           </div>
         </div>
-        <div id="trainCompositionMain" class="composition-card" style="margin-bottom:12px"></div>
-        <div class="row" style="margin-bottom:12px">
-          <button class="primary" onclick="train()">重建数据 + 重训战斗/候选/宏观 BC</button>
-        </div>
-        <details class="more-panel">
-          <summary>训练日志</summary>
-          <pre id="trainOutput">暂无输出</pre>
-        </details>
+        <pre id="trainOutput">暂无输出</pre>
       </section>
     </div>
   </main>
@@ -4760,7 +4582,7 @@ function renderStatus(s) {
   document.getElementById("collectStatus").textContent = s.control.collection_enabled ? "采集中" : "已暂停";
   document.getElementById("collectStatus").className = `status-main ${s.control.collection_enabled ? "on" : "off"}`;
   document.getElementById("collectDetail").textContent = s.control.collection_enabled
-    ? (s.control.include_ai_in_training ? "采集开启；下次重训会纳入合格 AI 样本" : "采集开启；下次重训只使用 Human 样本")
+    ? (s.control.include_ai_in_training ? "写入 Human + AI 数据" : "写入 Human 数据，AI 不进 BC")
     : "不会写入新的战斗/宏观日志";
   document.getElementById("runQuality").textContent = active ? (active.quality_label || active.quality || "-") : "无 run";
   document.getElementById("runQuality").className = `status-main ${active && active.discarded ? "off" : "info"}`;
@@ -4793,11 +4615,7 @@ function renderStatus(s) {
   }
   setPill("aiProcessBadge", s.ai_pid ? (s.ai_process && s.ai_process.needs_restart ? "需重启" : "运行中") : "未启动", s.ai_pid ? ((s.ai_process && s.ai_process.needs_restart) ? "warn" : "on") : "warn");
   setPill("llmProcessBadge", s.llm && s.llm.pid ? "运行中" : "未启动", s.llm && s.llm.pid ? "on" : "warn");
-  setPill(
-    "collectBadge",
-    s.control.collection_enabled ? (s.control.include_ai_in_training ? "AI入训" : "AI不入训") : "暂停",
-    s.control.collection_enabled ? (s.control.include_ai_in_training ? "warn" : "on") : "off"
-  );
+  setPill("collectBadge", s.control.collection_enabled ? "启用" : "暂停", s.control.collection_enabled ? "on" : "off");
   const runMode = s.control.next_run_mode || "auto";
   const runModeLabel = runMode === "new" ? "强制新局一次" : (runMode === "continue" ? "续接旧 Run" : "自动检测");
   setPill("nextRunBadge", runModeLabel, runMode === "new" ? "warn" : "info");
@@ -4814,133 +4632,9 @@ function renderStatus(s) {
   renderModelHealthV2(s.models || {}, s.ai_process || {}, s.control || {}, s.python_runtime || {}, s.monster_profiles || {});
   renderAiLogic(s.ai_logic);
   renderLLMLogic(s.llm && s.llm.logic, llmCfg);
-  renderTrainingComposition(s.training_composition || {});
 
   setPill("trainStatus", s.training.running ? `训练中 ${s.training.started || ""}` : (s.training.finished ? `完成 ${s.training.finished}` : "未运行"), s.training.running ? "warn" : "info");
   document.getElementById("trainOutput").textContent = s.training.output || "暂无输出";
-}
-function renderTrainingComposition(comp) {
-  const targets = ["trainingComposition", "trainCompositionMain"]
-    .map(id => document.getElementById(id))
-    .filter(Boolean);
-  if (!targets.length) return;
-  const emptyHtml = `<div class="comp-empty">尚未构建训练数据。点击"重建数据 + 重训"生成。</div>`;
-  if (!comp || !comp.has_data) {
-    targets.forEach(el => { el.innerHTML = emptyHtml; });
-    return;
-  }
-  const settings = comp.settings || {};
-  const combat = comp.combat || {};
-  const macro = comp.macro || {};
-  const nextIncludeAi = !!settings.include_ai;
-  const combatIncludeAi = !!combat.include_ai;
-  const macroIncludeAi = !!macro.include_ai;
-  const lastIncludeAi = combatIncludeAi || macroIncludeAi;
-  const mixedLastIncludeAi = combatIncludeAi !== macroIncludeAi;
-  const totalCombat = combat.total_samples || 0;
-  const humanCombat = combat.human_samples || 0;
-  const aiCombat = combat.ai_samples || 0;
-  const humanPct = totalCombat ? Math.round(humanCombat * 100 / totalCombat) : 0;
-  const aiPct = totalCombat ? Math.round(aiCombat * 100 / totalCombat) : 0;
-  const totalMacro = macro.total_samples || 0;
-  const lastAiPill = mixedLastIncludeAi
-    ? '<span class="pill warn">上次部分含 AI</span>'
-    : (lastIncludeAi ? '<span class="pill on">上次含 AI</span>' : '<span class="pill off">上次未含 AI</span>');
-  const nextAiPill = nextIncludeAi
-    ? '<span class="pill warn">下次含 AI</span>'
-    : '<span class="pill info">下次仅 Human</span>';
-  const configPill = nextIncludeAi === lastIncludeAi
-    ? '<span class="pill info">设置已对齐</span>'
-    : '<span class="pill warn">开关已变更</span>';
-  const qualityLabels = {
-    "failed_run": "失败也要", "unknown": "未知及以上", "before_act1_boss": "一关Boss前",
-    "partial_act1": "一关Boss", "partial_act2": "二关Boss", "perfect_run": "通关完美"
-  };
-  const minQLabel = qualityLabels[settings.min_quality] || settings.min_quality || "-";
-  const aiMinQLabel = qualityLabels[settings.ai_min_quality] || settings.ai_min_quality || "-";
-  const buildTimestamp = combat.build_timestamp || macro.build_timestamp || "";
-  const buildTime = buildTimestamp ? buildTimestamp.replace("T", " ") : "";
-  const buildNotes = [
-    combat.data_file_count ? `战斗文件 ${combat.data_file_count}` : "",
-    combat.build_elapsed_sec != null ? `战斗耗时 ${combat.build_elapsed_sec}s` : "",
-    macro.data_file_count ? `宏观文件 ${macro.data_file_count}` : "",
-    macro.build_elapsed_sec != null ? `宏观耗时 ${macro.build_elapsed_sec}s` : "",
-  ].filter(Boolean).join(" · ");
-  const combatRuns = combat.runs || [];
-  const macroRuns = macro.runs || [];
-  const legacyMetaNote = (!combatRuns.length && !macroRuns.length && (totalCombat || totalMacro))
-    ? "当前模型 metadata 是旧格式；重建数据后会显示每个 Run 的来源、质量和样本数。"
-    : "";
-  const runRows = combatRuns.map(r => {
-    const srcIcon = r.source === "ai" ? "🤖" : "🧑";
-    const qLabel = qualityLabels[r.quality] || r.quality || "-";
-    return `<tr><td>${srcIcon} ${escapeHtml((r.run_id||"").substring(0,28))}</td><td>${escapeHtml(qLabel)}</td><td>${r.samples}</td></tr>`;
-  }).join("");
-  const macroRunRows = macroRuns.map(r => {
-    const srcIcon = r.source === "ai" ? "🤖" : "🧑";
-    const qLabel = qualityLabels[r.quality] || r.quality || "-";
-    return `<tr><td>${srcIcon} ${escapeHtml((r.run_id||"").substring(0,28))}</td><td>${escapeHtml(qLabel)}</td><td>${r.samples}</td></tr>`;
-  }).join("");
-  const html = `
-    <div class="comp-header">
-      <span>📊 上次训练数据配比</span>
-      ${lastAiPill}
-      ${nextAiPill}
-      ${configPill}
-      <span class="pill info">Human 最低 ${escapeHtml(minQLabel)}</span>
-      <span class="pill info">AI 最低 ${escapeHtml(aiMinQLabel)}</span>
-      ${buildTime ? `<span class="fine" style="margin-left:auto">${escapeHtml(buildTime)}</span>` : ""}
-    </div>
-    ${buildNotes ? `<div class="fine" style="margin-bottom:8px">${escapeHtml(buildNotes)}</div>` : ""}
-    ${legacyMetaNote ? `<div class="fine" style="margin-bottom:8px">${escapeHtml(legacyMetaNote)}</div>` : ""}
-    <div class="comp-bar">
-      <div class="bar-human" style="width:${humanPct}%" title="人类 ${humanPct}%"></div>
-      <div class="bar-ai" style="width:${aiPct}%" title="AI ${aiPct}%"></div>
-    </div>
-    <div class="comp-stats">
-      <div class="comp-stat">
-        <div class="stat-value">${totalCombat}</div>
-        <div class="stat-label">战斗样本</div>
-      </div>
-      <div class="comp-stat">
-        <div class="stat-value" style="color:#3b82f6">${humanCombat}</div>
-        <div class="stat-label">🧑 人类 (${humanPct}%)</div>
-      </div>
-      <div class="comp-stat">
-        <div class="stat-value" style="color:#f59e0b">${aiCombat}</div>
-        <div class="stat-label">🤖 AI (${aiPct}%)</div>
-      </div>
-      <div class="comp-stat">
-        <div class="stat-value">${totalMacro}</div>
-        <div class="stat-label">宏观样本</div>
-      </div>
-      <div class="comp-stat">
-        <div class="stat-value">${combat.run_count || 0}</div>
-        <div class="stat-label">战斗 Run</div>
-      </div>
-      <div class="comp-stat">
-        <div class="stat-value">${macro.run_count || 0}</div>
-        <div class="stat-label">宏观 Run</div>
-      </div>
-    </div>
-    ${combatRuns.length ? `
-    <details style="margin-top:4px">
-      <summary style="font-size:12px;cursor:pointer;color:var(--muted)">▶ 战斗 Run 明细（${combatRuns.length} 个）</summary>
-      <div class="comp-runs">
-        <table><thead><tr><th>Run</th><th>质量</th><th>样本数</th></tr></thead>
-        <tbody>${runRows}</tbody></table>
-      </div>
-    </details>` : ""}
-    ${macroRuns.length ? `
-    <details style="margin-top:4px">
-      <summary style="font-size:12px;cursor:pointer;color:var(--muted)">▶ 宏观 Run 明细（${macroRuns.length} 个）</summary>
-      <div class="comp-runs">
-        <table><thead><tr><th>Run</th><th>质量</th><th>样本数</th></tr></thead>
-        <tbody>${macroRunRows}</tbody></table>
-      </div>
-    </details>` : ""}
-  `;
-  targets.forEach(el => { el.innerHTML = html; });
 }
 function formatBytes(n) {
   if (!n) return "0 B";
@@ -5902,9 +5596,8 @@ def main():
         write_json(DISCARDED_PATH, {"discarded": []})
     threading.Thread(target=_refresh_python_runtime_cache, kwargs={"blocking": False}, daemon=True).start()
     threading.Thread(target=_refresh_dashboard_data_cache, kwargs={"blocking": False}, daemon=True).start()
-    panel_port = resolve_panel_port()
-    server = ThreadingHTTPServer(("127.0.0.1", panel_port), Handler)
-    print(f"STS2 AI control panel: http://127.0.0.1:{panel_port}")
+    server = ThreadingHTTPServer(("127.0.0.1", 8765), Handler)
+    print("STS2 AI control panel: http://127.0.0.1:8765")
     server.serve_forever()
 
 

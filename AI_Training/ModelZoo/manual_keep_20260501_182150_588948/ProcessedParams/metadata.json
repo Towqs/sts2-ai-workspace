@@ -1,0 +1,43 @@
+{
+  "samples": 576,
+  "features": 76,
+  "feature_version": 2,
+  "candidate_rows": 2846,
+  "candidate_groups": 484,
+  "candidate_positive": 484,
+  "candidate_match_misses": 92,
+  "candidate_feature_dim": 26,
+  "candidate_total_features": 102,
+  "accepted_sources": {
+    "human": 576
+  },
+  "accepted_run_qualities": {
+    "partial_act2": 243,
+    "perfect_run": 333
+  },
+  "include_ai": false,
+  "min_training_quality": "partial_act1",
+  "ai_min_training_quality": "partial_act1",
+  "ai_accept_failed_after_act1": true,
+  "ai_require_no_invalid_actions": true,
+  "ai_qualified_run_ids": [
+    "ai_20260430_191437_8dd6267d",
+    "ai_20260430_193638_d7e4cab3",
+    "hum_20260430_191513_08e3de83"
+  ],
+  "feature_notes": [
+    "act_floor_round",
+    "incoming_damage",
+    "net_incoming_after_block",
+    "hp_after_incoming",
+    "affordable_playable_counts",
+    "affordable_attack_block_estimates",
+    "lethal_and_threat_flags",
+    "candidate_action_feature_rows_for_future_scorer"
+  ],
+  "actions": 40,
+  "epochs": 100,
+  "best_loss": 0.6071671462721295,
+  "device": "cuda",
+  "model_path": "bc_model_best.pth"
+}

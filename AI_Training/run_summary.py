@@ -249,9 +249,11 @@ def empty_run_summary(run_id):
 
 
 def update_progress_from_state(item, state):
-    item["max_act"] = max(item["max_act"], safe_int(state.get("act")))
-    item["max_floor"] = max(item["max_floor"], safe_int(state.get("floor")))
-    item["max_round"] = max(item["max_round"], safe_int(state.get("round")))
+    run = state.get("run") if isinstance(state.get("run"), dict) else state
+    item["max_act"] = max(item["max_act"], safe_int(run.get("act")), safe_int(state.get("act")))
+    item["max_floor"] = max(item["max_floor"], safe_int(run.get("floor")), safe_int(state.get("floor")))
+    battle = state.get("battle") if isinstance(state.get("battle"), dict) else state
+    item["max_round"] = max(item["max_round"], safe_int(battle.get("round")), safe_int(state.get("round")))
 
 
 def update_run_summary(item, record, path):

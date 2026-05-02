@@ -1,0 +1,72 @@
+{
+  "samples": 488,
+  "features": 115,
+  "classes": {
+    "choose_event_option:unknown": 56,
+    "claim_reward:gold": 79,
+    "claim_reward:card": 92,
+    "claim_reward:potion": 46,
+    "choose_rest_option:choose_rest_option": 43,
+    "buy_item:?": 16,
+    "choose_event_option:index_0": 45,
+    "select_map_node:index_1": 20,
+    "select_map_node:index_0": 21,
+    "claim_reward:relic": 6,
+    "choose_card:index_1": 17,
+    "choose_card:index_0": 15,
+    "buy_item:card_removal": 1,
+    "choose_card:index_2": 15,
+    "select_map_node:index_2": 2,
+    "buy_item:FEED": 1,
+    "buy_item:HIDDEN_GEM": 1,
+    "buy_item:THE_BOMB": 1,
+    "buy_item:MANGLE": 1,
+    "buy_item:GREMLIN_HORN": 1,
+    "buy_item:CHANDELIER": 1,
+    "buy_item:PREP_TIME": 1,
+    "buy_item:SWORD_BOOMERANG": 1,
+    "buy_item:JACK_OF_ALL_TRADES": 1,
+    "claim_reward:specialcard": 1,
+    "buy_item:PRAYER_WHEEL": 1,
+    "buy_item:INFERNAL_BLADE": 1,
+    "buy_item:SPITE": 1,
+    "buy_item:CAPTAINS_WHEEL": 1
+  },
+  "accepted_sources": {
+    "human": 488
+  },
+  "accepted_run_qualities": {
+    "partial_act2": 218,
+    "perfect_run": 270
+  },
+  "files": [
+    "RL_Datasets\\AI\\Macro\\macro_run_2026-04-29.jsonl",
+    "RL_Datasets\\AI\\Macro\\macro_run_2026-04-30.jsonl",
+    "RL_Datasets\\AI\\Macro\\macro_run_2026-05-01.jsonl",
+    "RL_Datasets\\Human\\Macro\\macro_run_2026-04-25.jsonl",
+    "RL_Datasets\\Human\\Macro\\macro_run_2026-04-26.jsonl",
+    "RL_Datasets\\Human\\Macro\\macro_run_2026-04-27.jsonl",
+    "RL_Datasets\\Human\\Macro\\macro_run_2026-04-29.jsonl",
+    "RL_Datasets\\Human\\Macro\\macro_run_2026-04-30.jsonl",
+    "RL_Datasets\\Human\\Macro\\macro_run_2026-05-01.jsonl",
+    "RL_Datasets\\Macro\\macro_logs_2026-04-18_01.jsonl",
+    "RL_Datasets\\Macro\\macro_logs_2026-04-18_02.jsonl",
+    "RL_Datasets\\Macro\\macro_logs_2026-04-18_03.jsonl",
+    "RL_Datasets\\Macro\\macro_logs_2026-04-18_04.jsonl",
+    "RL_Datasets\\Macro\\macro_run_2026-04-20.jsonl",
+    "RL_Datasets\\Macro\\macro_run_2026-04-21.jsonl",
+    "RL_Datasets\\Processed\\Macro\\migrated_2026-04-20_macro_logs_2026-04-18_01.jsonl",
+    "RL_Datasets\\Processed\\Macro\\migrated_2026-04-20_macro_logs_2026-04-18_02.jsonl",
+    "RL_Datasets\\Processed\\Macro\\migrated_2026-04-20_macro_logs_2026-04-18_03.jsonl",
+    "RL_Datasets\\Processed\\Macro\\migrated_2026-04-20_macro_logs_2026-04-18_04.jsonl",
+    "RL_Datasets\\Processed\\Macro\\migrated_2026-04-20_macro_run_2026-04-20.jsonl"
+  ],
+  "include_ai": false,
+  "min_training_quality": "partial_act1",
+  "ai_min_training_quality": "partial_act1",
+  "ai_accept_failed_after_act1": true,
+  "ai_require_no_invalid_actions": true,
+  "ai_qualified_run_ids": [
+    "hum_20260430_191513_08e3de83"
+  ]
+}
