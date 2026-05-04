@@ -340,9 +340,14 @@ class SelfPlayManager:
         started_ms = int(time.time() * 1000)
         deadline = time.time() + 90
         last_message = ""
+        start_attempted = False
+        transitional_since = None
         while time.time() < deadline and not self._stop_event.is_set():
             state = self._game_get(timeout=10)
-            if str(state.get("state_type") or "").lower() == "menu":
+            state_type = str(state.get("state_type") or "").lower()
+
+            if state_type == "menu":
+                transitional_since = None
                 self._panel_post("/api/control", {"next_run_mode": "new"}, timeout=10)
                 result = self._game_post({
                     "action": "start_new_run",
@@ -360,7 +365,26 @@ class SelfPlayManager:
                     last_message = error_text or "start_new_run 返回错误。"
                 else:
                     last_message = str(result.get("message") or "正在尝试开新局。")
+                    start_attempted = True
                 self._set_status(last_message=last_message, current_state="launching")
+            elif start_attempted:
+                # 角色已选择，游戏正在加载/过渡（overlay / card_select 等）
+                # AI agent 需要处理这些界面，runner 只需等待
+                if transitional_since is None:
+                    transitional_since = time.time()
+                elapsed = time.time() - transitional_since
+                self._set_status(
+                    last_message=f"等待游戏初始化：{state_type}（已等 {int(elapsed)} 秒）",
+                    current_state="launching",
+                    current_state_type=state_type,
+                )
+                # 如果过渡状态持续超过 60 秒，尝试恢复到菜单重试
+                if elapsed > 60:
+                    self._set_status(last_message=f"游戏在 {state_type} 状态卡住超过 60 秒，尝试恢复到菜单。")
+                    self._recover_to_menu("launch_stuck_" + state_type)
+                    transitional_since = None
+                    start_attempted = False
+
             new_run = self._find_new_run(existing_run_ids, started_ms)
             if new_run:
                 return new_run
