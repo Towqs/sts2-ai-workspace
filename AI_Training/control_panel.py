@@ -5446,6 +5446,58 @@ function renderUpdate(info) {
   }
   output.textContent = info.output || (info.finished ? `更新结束：${info.finished}` : "暂无更新输出");
 }
+function selfPlayReasonBucket(score) {
+  const group = String((score && score.reason_group) || "").toLowerCase();
+  if (group) return group;
+  const reason = String((score && score.reason) || "").toLowerCase();
+  if (reason.startsWith("death")) return "death";
+  if (reason === "invalid_actions") return "illegal_action";
+  if (reason === "stuck_or_no_floor") return "stuck";
+  if (reason === "clear_or_probable_clear") return "clear";
+  if (reason === "reached_act2" || reason === "floor18_plus") return "progress";
+  if (reason === "non_ai_run") return "non_ai";
+  return "early_failure";
+}
+function selfPlayReasonLabel(code) {
+  const map = {
+    non_ai_run: "非 AI 局",
+    invalid_actions: "非法动作",
+    stuck_or_no_floor: "卡死 / 无进度",
+    death: "死亡",
+    death_before_act2: "死亡（A1）",
+    death_after_act2: "死亡（A2+）",
+    clear_or_probable_clear: "通关 / 疑似通关",
+    reached_act2: "到达 A2",
+    floor18_plus: "F18+",
+    early_failed_before_act2: "早期失败",
+  };
+  return map[code] || code || "-";
+}
+function selfPlayReasonGroupLabel(code) {
+  const map = {
+    non_ai: "非 AI",
+    illegal_action: "非法动作",
+    stuck: "卡死",
+    death: "死亡",
+    early_failure: "早期失败",
+    progress: "进度",
+    clear: "通关",
+  };
+  return map[code] || code || "-";
+}
+function selfPlayTrendText(scores) {
+  const recent = (scores || []).slice(0, 6);
+  const counts = {};
+  recent.forEach(score => {
+    const bucket = selfPlayReasonBucket(score);
+    counts[bucket] = (counts[bucket] || 0) + 1;
+  });
+  const order = ["death", "stuck", "illegal_action", "early_failure", "progress", "clear", "non_ai"];
+  const parts = order
+    .map(key => counts[key] ? `${selfPlayReasonGroupLabel(key)} ${counts[key]}` : "")
+    .filter(Boolean);
+  return parts.length ? `近 ${recent.length} 局：${parts.join(" / ")}` : "近 6 局：暂无";
+}
 function renderSelfPlay(info, control) {
   const summary = document.getElementById("selfPlaySummary");
   const state = document.getElementById("selfPlayState");
@@ -5464,9 +5516,13 @@ function renderSelfPlay(info, control) {
   const currentRun = (info && info.current_run_id) || "-";
   const currentFloor = Number((info && info.current_floor) || 0);
   const lastScore = info && info.last_score;
+  const lastReasonLabel = lastScore ? (lastScore.reason_label || selfPlayReasonLabel(lastScore.reason)) : "-";
+  const lastStageLabel = lastScore ? (lastScore.failure_stage_label || "") : "";
+  const lastAdmissionLabel = lastScore ? (lastScore.admission_reason_label || selfPlayReasonLabel(lastScore.admission_reason)) : "-";
   const scoreText = lastScore
-    ? `score ${lastScore.score ?? "-"} / ${lastScore.admitted ? "入训" : "拒绝"} / ${lastScore.reason || "-"}`
+    ? `score ${lastScore.score ?? "-"} / ${lastScore.admitted ? "入训" : "拒绝"} / ${lastReasonLabel}${lastStageLabel ? ` · ${lastStageLabel}` : ""}${lastScore.admission_reason && lastScore.admission_reason !== lastScore.reason ? ` / 判定 ${lastAdmissionLabel}` : ""}`
     : "暂无评分";
+  const trendText = selfPlayTrendText((info && info.recent_scores) || []);
   const explore = [
     control && control.exploration_enabled ? "探索开" : "探索关",
     `战斗 ${Number((control && control.combat_exploration_epsilon) ?? 0.35).toFixed(2)}`,
@@ -5490,7 +5546,9 @@ function renderSelfPlay(info, control) {
     <div class="kv"><span>当前 Run</span><code>${escapeHtml(currentRun)}</code></div>
     <div class="kv"><span>下次重训</span><span>${pending ? `还差 ${pending} 个入训 run` : "达到批次或等待新样本"}</span></div>
     <div class="kv"><span>最近评分</span><span>${escapeHtml(scoreText)}</span></div>
+    <div class="kv"><span>最近趋势</span><span>${escapeHtml(trendText)}</span></div>
     <div class="kv"><span>探索强度</span><span>${escapeHtml(explore)}</span></div>
+    ${lastScore && lastScore.reason_detail ? `<div class="fine" style="margin-top:4px">${escapeHtml(lastScore.reason_detail)}</div>` : ""}
     ${message ? `<div class="fine" style="margin-top:8px">${escapeHtml(message)}</div>` : ""}
   `;
 
@@ -5517,7 +5575,11 @@ function renderSelfPlay(info, control) {
       const rows = scores.slice(0, 6).map(s => {
         const rid = (s.run_id || "").slice(-8);
         const adm = s.admitted ? '<span class="pill on" style="font-size:11px">入训</span>' : '<span class="pill off" style="font-size:11px">拒绝</span>';
-        return `<tr><td><code>${rid}</code></td><td>A${s.max_act||0}/F${s.max_floor||0}</td><td>${s.score??"?"}</td><td>${escapeHtml(s.reason||"-")}</td><td>${adm}</td></tr>`;
+        const reasonLabel = s.reason_label || selfPlayReasonLabel(s.reason);
+        const reasonDetail = s.reason_detail ? `<div class="fine">${escapeHtml(s.reason_detail)}</div>` : "";
+        const admissionLabel = s.admission_reason_label || selfPlayReasonLabel(s.admission_reason || "");
+        const admissionDetail = admissionLabel ? `<div class="fine">${escapeHtml(admissionLabel)}</div>` : "";
+        return `<tr><td><code>${rid}</code></td><td>A${s.max_act||0}/F${s.max_floor||0}</td><td>${s.score??"?"}</td><td>${escapeHtml(reasonLabel)}${reasonDetail}</td><td>${adm}${admissionDetail}</td></tr>`;
       }).join("");
       scoresEl.innerHTML = `
         <details open style="margin-top:4px">
@@ -5567,6 +5629,8 @@ function renderCurrentData(data) {
       <div class="metric"><div class="metric-value">${run.invalid_actions || 0}</div><div class="metric-label">非法动作</div></div>
       <div class="metric"><div class="metric-value">v${schemaVersions}</div><div class="metric-label">Schema</div></div>
     </div>
+    ${(run.self_play_reason_label || run.self_play_reason_group_label || run.self_play_failure_stage_label) ? `<div class="kv"><span>自训结论</span><span>${escapeHtml([run.self_play_reason_group_label, run.self_play_reason_label, run.self_play_failure_stage_label].filter(Boolean).join(" / "))}</span></div>` : ""}
+    ${run.self_play_reason_detail ? `<div class="fine" style="margin:4px 0 8px">${escapeHtml(run.self_play_reason_detail)}</div>` : ""}
     <div class="check-list">${checks}</div>
     <div class="warning-list">${warnings || '<div><span class="pill on">正常</span> 最近 run 有数据写入</div>'}</div>`;
 }

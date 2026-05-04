@@ -27,6 +27,37 @@ QUALITY_ORDER = {
     "perfect_run": 3,
 }
 
+SELF_PLAY_REASON_LABELS = {
+    "non_ai_run": "非 AI 局",
+    "invalid_actions": "非法动作",
+    "stuck_or_no_floor": "卡死 / 无进度",
+    "death": "死亡",
+    "death_before_act2": "死亡（A1）",
+    "death_after_act2": "死亡（A2+）",
+    "clear_or_probable_clear": "通关 / 疑似通关",
+    "reached_act2": "到达 A2",
+    "floor18_plus": "F18+",
+    "early_failed_before_act2": "早期失败",
+}
+
+SELF_PLAY_REASON_GROUP_LABELS = {
+    "non_ai": "非 AI",
+    "illegal_action": "非法动作",
+    "stuck": "卡死",
+    "death": "死亡",
+    "early_failure": "早期失败",
+    "progress": "进度",
+    "clear": "通关",
+}
+
+SELF_PLAY_STAGE_LABELS = {
+    "unknown": "未知",
+    "pre_act1": "A0/开局",
+    "act1": "A1",
+    "act2": "A2",
+    "act3_plus": "A3+",
+}
+
 RUN_ROOTS = [
     "Combat",
     "Human/Combat",
@@ -243,6 +274,105 @@ def is_stuck_run(summary):
     return safe_int(summary.get("records")) > 0 and safe_int(summary.get("max_floor")) <= 0
 
 
+def self_play_stage_bucket(max_act, max_floor):
+    if max_act >= 3:
+        return "act3_plus"
+    if max_act == 2:
+        return "act2"
+    if max_act == 1:
+        return "act1"
+    if max_floor > 0:
+        return "pre_act1"
+    return "unknown"
+
+
+def self_play_label(mapping, key):
+    return mapping.get(key, key)
+
+
+def classify_self_play_outcome(summary):
+    quality = summary.get("quality") or infer_quality(summary)
+    probable_clear = bool(summary.get("probable_clear") or quality == "perfect_run")
+    max_act = safe_int(summary.get("max_act"))
+    max_floor = safe_int(summary.get("max_floor"))
+    wins = safe_int(summary.get("wins"))
+    losses = safe_int(summary.get("losses"))
+    invalid_actions = safe_int(summary.get("invalid_actions"))
+    stuck = is_stuck_run(summary)
+    data_missing = summary.get("data_health") == "missing"
+    stage = self_play_stage_bucket(max_act, max_floor)
+
+    reason = "early_failed_before_act2"
+    reason_group = "early_failure"
+    if not is_ai_run_summary(summary):
+        reason = "non_ai_run"
+        reason_group = "non_ai"
+    elif invalid_actions > 0:
+        reason = "invalid_actions"
+        reason_group = "illegal_action"
+    elif stuck:
+        reason = "stuck_or_no_floor"
+        reason_group = "stuck"
+    elif losses > 0:
+        reason = "death_after_act2" if max_act >= 2 else "death_before_act2" if max_act == 1 else "death"
+        reason_group = "death"
+    elif probable_clear:
+        reason = "clear_or_probable_clear"
+        reason_group = "clear"
+    elif max_act >= 2:
+        reason = "reached_act2"
+        reason_group = "progress"
+    elif max_floor >= 18:
+        reason = "floor18_plus"
+        reason_group = "progress"
+
+    admission_reason = "early_failed_before_act2"
+    admitted = False
+    if not is_ai_run_summary(summary):
+        admission_reason = "non_ai_run"
+    elif invalid_actions > 0:
+        admission_reason = "invalid_actions"
+    elif stuck:
+        admission_reason = "stuck_or_no_floor"
+    elif probable_clear:
+        admitted = True
+        admission_reason = "clear_or_probable_clear"
+    elif max_act >= 2:
+        admitted = True
+        admission_reason = "reached_act2"
+    elif max_floor >= 18:
+        admitted = True
+        admission_reason = "floor18_plus"
+
+    reason_detail = (
+        f"stage={stage}; max_act={max_act}; max_floor={max_floor}; "
+        f"wins={wins}; losses={losses}; invalid_actions={invalid_actions}; "
+        f"records={safe_int(summary.get('records'))}; data_missing={int(bool(data_missing))}"
+    )
+
+    return {
+        "admitted": admitted,
+        "quality": quality,
+        "probable_clear": probable_clear,
+        "reason": reason,
+        "reason_label": self_play_label(SELF_PLAY_REASON_LABELS, reason),
+        "reason_group": reason_group,
+        "reason_group_label": self_play_label(SELF_PLAY_REASON_GROUP_LABELS, reason_group),
+        "admission_reason": admission_reason,
+        "admission_reason_label": self_play_label(SELF_PLAY_REASON_LABELS, admission_reason),
+        "failure_stage": stage,
+        "failure_stage_label": self_play_label(SELF_PLAY_STAGE_LABELS, stage),
+        "reason_detail": reason_detail,
+        "max_act": max_act,
+        "max_floor": max_floor,
+        "wins": wins,
+        "losses": losses,
+        "invalid_actions": invalid_actions,
+        "stuck": stuck,
+        "data_missing": data_missing,
+    }
+
+
 def collect_run_policy_signal(run_id):
     policy_counts = Counter()
     model_counts = Counter()
@@ -271,15 +401,16 @@ def collect_run_policy_signal(run_id):
 
 def evaluate_self_play_run(summary):
     run_id = str(summary.get("run_id") or "")
-    quality = summary.get("quality") or infer_quality(summary)
-    probable_clear = bool(summary.get("probable_clear") or quality == "perfect_run")
-    max_act = safe_int(summary.get("max_act"))
-    max_floor = safe_int(summary.get("max_floor"))
-    wins = safe_int(summary.get("wins"))
-    losses = safe_int(summary.get("losses"))
-    invalid_actions = safe_int(summary.get("invalid_actions"))
-    stuck = is_stuck_run(summary)
-    data_missing = summary.get("data_health") == "missing"
+    outcome = classify_self_play_outcome(summary)
+    quality = outcome["quality"]
+    probable_clear = outcome["probable_clear"]
+    max_act = outcome["max_act"]
+    max_floor = outcome["max_floor"]
+    wins = outcome["wins"]
+    losses = outcome["losses"]
+    invalid_actions = outcome["invalid_actions"]
+    stuck = outcome["stuck"]
+    data_missing = outcome["data_missing"]
     policy_signal = collect_run_policy_signal(run_id)
 
     score = 0
@@ -301,29 +432,19 @@ def evaluate_self_play_run(summary):
     if stuck:
         score -= 300
 
-    admitted = False
-    reason = "early_failed_before_act2"
-    if not is_ai_run_summary(summary):
-        reason = "non_ai_run"
-    elif invalid_actions > 0:
-        reason = "invalid_actions"
-    elif stuck:
-        reason = "stuck_or_no_floor"
-    elif probable_clear:
-        admitted = True
-        reason = "clear_or_probable_clear"
-    elif max_act >= 2:
-        admitted = True
-        reason = "reached_act2"
-    elif max_floor >= 18:
-        admitted = True
-        reason = "floor18_plus"
-
     return {
         "run_id": run_id,
         "score": int(score),
-        "admitted": admitted,
-        "reason": reason,
+        "admitted": outcome["admitted"],
+        "reason": outcome["reason"],
+        "reason_label": outcome["reason_label"],
+        "reason_group": outcome["reason_group"],
+        "reason_group_label": outcome["reason_group_label"],
+        "admission_reason": outcome["admission_reason"],
+        "admission_reason_label": outcome["admission_reason_label"],
+        "failure_stage": outcome["failure_stage"],
+        "failure_stage_label": outcome["failure_stage_label"],
+        "reason_detail": outcome["reason_detail"],
         "quality": quality,
         "probable_clear": probable_clear,
         "policy_name": policy_signal.get("policy_name", ""),
@@ -548,6 +669,14 @@ def finalize_run_summary(item, discarded, labels, self_play_scores):
         item["self_play_score"] = self_play.get("score")
         item["self_play_admitted"] = bool(self_play.get("admitted"))
         item["self_play_reason"] = self_play.get("reason", "")
+        item["self_play_reason_label"] = self_play.get("reason_label", self_play.get("reason", ""))
+        item["self_play_reason_group"] = self_play.get("reason_group", "")
+        item["self_play_reason_group_label"] = self_play.get("reason_group_label", self_play.get("reason_group", ""))
+        item["self_play_admission_reason"] = self_play.get("admission_reason", "")
+        item["self_play_admission_reason_label"] = self_play.get("admission_reason_label", self_play.get("admission_reason", ""))
+        item["self_play_failure_stage"] = self_play.get("failure_stage", "")
+        item["self_play_failure_stage_label"] = self_play.get("failure_stage_label", self_play.get("failure_stage", ""))
+        item["self_play_reason_detail"] = self_play.get("reason_detail", "")
         item["self_play_updated_at"] = self_play.get("updated_at", "")
     item["inferred_quality"] = inferred_quality
     item["inferred_quality_label"] = QUALITY_LABELS.get(inferred_quality, inferred_quality)
