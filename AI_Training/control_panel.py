@@ -38,6 +38,8 @@ CONTROL_PATH = AI_DIR / "control_state.json"
 AI_LOGIC_PATH = AI_DIR / "ai_logic_state.json"
 LLM_CONFIG_PATH = AI_DIR / "model_config.json"
 LLM_LOGIC_PATH = AI_DIR / "llm_logic_state.json"
+SELF_PLAY_RUNNER_PATH = AI_DIR / "self_play_runner.py"
+SELF_PLAY_STATE_PATH = AI_DIR / "self_play_state.json"
 DISCARDED_PATH = DATA_DIR / "discarded_runs.json"
 SERVER_STATE_PATH = AI_DIR / "control_panel_state.json"
 DEFAULT_PYTHON_EXE = WORKSPACE / ".venv" / "Scripts" / "python.exe"
@@ -85,10 +87,37 @@ def python_exe_runs(candidate):
         return False
 
 
+def resolve_venv_base_python():
+    cfg_path = WORKSPACE / ".venv" / "pyvenv.cfg"
+    try:
+        for line in cfg_path.read_text(encoding="utf-8").splitlines():
+            key, sep, value = line.partition("=")
+            if sep and key.strip().lower() == "executable":
+                return value.strip()
+    except Exception:
+        pass
+    return ""
+
+
+def read_venv_version():
+    cfg_path = WORKSPACE / ".venv" / "pyvenv.cfg"
+    try:
+        for line in cfg_path.read_text(encoding="utf-8").splitlines():
+            key, sep, value = line.partition("=")
+            if sep and key.strip().lower() == "version":
+                parts = value.strip().split(".")
+                if len(parts) >= 2:
+                    return ".".join(parts[:2])
+    except Exception:
+        pass
+    return ""
+
+
 def resolve_python_exe():
     candidates = [
         os.environ.get("STS2_AI_PYTHON"),
         str(DEFAULT_PYTHON_EXE),
+        resolve_venv_base_python(),
         str(Path.home() / ".cache" / "codex-runtimes" / "codex-primary-runtime" / "dependencies" / "python" / "python.exe"),
         sys.executable,
         shutil.which("python"),
@@ -109,6 +138,37 @@ def resolve_python_exe():
 
 PYTHON_EXE = resolve_python_exe()
 
+
+def python_subprocess_env():
+    env = os.environ.copy()
+    venv_python = DEFAULT_PYTHON_EXE.resolve()
+    venv_base_raw = resolve_venv_base_python()
+    try:
+        venv_base_python = Path(venv_base_raw).resolve() if venv_base_raw else None
+    except Exception:
+        venv_base_python = None
+    try:
+        selected_python = PYTHON_EXE.resolve()
+    except Exception:
+        selected_python = PYTHON_EXE
+    venv_site = WORKSPACE / ".venv" / "Lib" / "site-packages"
+    selected_version = f"{sys.version_info.major}.{sys.version_info.minor}" if selected_python == Path(sys.executable) else ""
+    venv_version = read_venv_version()
+    use_venv_site = (
+        selected_python == venv_python
+        or (venv_base_python is not None and selected_python == venv_base_python)
+        or (selected_python == Path(sys.executable) and bool(venv_version) and selected_version == venv_version)
+    )
+    if selected_python != venv_python and venv_site.exists() and use_venv_site:
+        existing = env.get("PYTHONPATH", "")
+        parts = [str(venv_site)]
+        if existing:
+            parts.append(existing)
+        env["PYTHONPATH"] = os.pathsep.join(parts)
+    env.setdefault("PYTHONUTF8", "1")
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    return env
+
 DEFAULT_CONTROL = {
     "ai_enabled": False,
     "macro_enabled": False,
@@ -127,6 +187,19 @@ DEFAULT_CONTROL = {
     "collection_disabled_since": None,
     "collection_disabled_ranges": [],
     "min_training_quality": "unknown",
+    "exploration_enabled": False,
+    "exploration_mode": "aggressive",
+    "combat_exploration_epsilon": 0.35,
+    "macro_exploration_epsilon": 0.25,
+    "exploration_top_k": 5,
+    "exploration_temperature": 1.35,
+    "self_play_character": "IRONCLAD",
+    "self_play_ascension": 0,
+    "self_play_target_runs": 20,
+    "self_play_train_every_admitted_runs": 5,
+    "self_play_max_run_minutes": 75,
+    "self_play_stall_seconds": 120,
+    "self_play_game_speed_multiplier": 3.0,
 }
 DEFAULT_LLM_CONFIG = {
     "enabled": False,
@@ -146,10 +219,12 @@ DEFAULT_LLM_CONFIG = {
     "active_profile_id": "",
 }
 TRAIN_LOCK = threading.Lock()
+UPDATE_LOCK = threading.Lock()
 LLM_TEST_LOCK = threading.Lock()
 LLM_TEST_COOLDOWN_SEC = 60
 LAST_TRAIN = {"running": False, "started": None, "finished": None, "output": ""}
 LAST_EXPORT = {"path": None, "filename": None, "created": None, "size": 0, "file_count": 0}
+LAST_UPDATE = {"running": False, "started": None, "finished": None, "status": "idle", "output": ""}
 LLM_TEST_STATE = {"running": False, "last_started": 0.0, "last_finished": 0.0}
 GAME_CACHE = {"state": None, "ts": 0.0}
 PYTHON_RUNTIME_CACHE = {"ts": 0.0, "data": None}
@@ -161,6 +236,14 @@ PYTHON_RUNTIME_CACHE_TTL_SEC = 300
 DASHBOARD_DATA_CACHE_TTL_SEC = 8
 REQUIRED_AGENT_MODULES = ["requests", "torch", "numpy", "colorama"]
 REQUIRED_TRAINING_MODULES = ["numpy", "torch"]
+UPDATE_SCRIPT_PATH = WORKSPACE / "tools" / "update_workspace.ps1"
+
+
+def clamp_int(value, default, minimum, maximum):
+    try:
+        return max(minimum, min(int(value), maximum))
+    except (TypeError, ValueError):
+        return default
 
 
 def read_json(path, default):
@@ -200,6 +283,12 @@ def update_control(patch):
                 data[key] = patch[key] if patch[key] in QUALITY_ORDER else "unknown"
             elif key == "ai_min_training_quality":
                 data[key] = patch[key] if patch[key] in QUALITY_ORDER else "partial_act1"
+            elif key == "exploration_mode":
+                mode = str(patch[key] or "aggressive").strip().lower()
+                data[key] = mode if mode in ("aggressive", "off") else "aggressive"
+            elif key == "self_play_character":
+                character = str(patch[key] or "IRONCLAD").strip().upper()
+                data[key] = character if character == "IRONCLAD" else "IRONCLAD"
             elif key == "active_model_id":
                 data[key] = str(patch[key] or "local")
             elif key == "macro_card_reward_weight":
@@ -209,6 +298,35 @@ def update_control(patch):
                     data[key] = DEFAULT_CONTROL[key]
             elif key == "game_speed_multiplier":
                 data[key] = clamp_game_speed_multiplier(patch[key])
+            elif key == "self_play_game_speed_multiplier":
+                data[key] = clamp_game_speed_multiplier(patch[key])
+            elif key == "combat_exploration_epsilon":
+                try:
+                    data[key] = max(0.0, min(float(patch[key]), 1.0))
+                except (TypeError, ValueError):
+                    data[key] = DEFAULT_CONTROL[key]
+            elif key == "macro_exploration_epsilon":
+                try:
+                    data[key] = max(0.0, min(float(patch[key]), 1.0))
+                except (TypeError, ValueError):
+                    data[key] = DEFAULT_CONTROL[key]
+            elif key == "exploration_top_k":
+                data[key] = clamp_int(patch[key], DEFAULT_CONTROL[key], 1, 12)
+            elif key == "exploration_temperature":
+                try:
+                    data[key] = max(0.1, min(float(patch[key]), 5.0))
+                except (TypeError, ValueError):
+                    data[key] = DEFAULT_CONTROL[key]
+            elif key == "self_play_ascension":
+                data[key] = clamp_int(patch[key], DEFAULT_CONTROL[key], 0, 20)
+            elif key == "self_play_target_runs":
+                data[key] = clamp_int(patch[key], DEFAULT_CONTROL[key], 1, 500)
+            elif key == "self_play_train_every_admitted_runs":
+                data[key] = clamp_int(patch[key], DEFAULT_CONTROL[key], 1, 100)
+            elif key == "self_play_max_run_minutes":
+                data[key] = clamp_int(patch[key], DEFAULT_CONTROL[key], 5, 240)
+            elif key == "self_play_stall_seconds":
+                data[key] = clamp_int(patch[key], DEFAULT_CONTROL[key], 15, 1800)
             elif key == "collection_enabled":
                 enabled = bool(patch[key])
                 was_enabled = bool(data.get("collection_enabled", True))
@@ -544,12 +662,14 @@ def _refresh_python_runtime_cache(blocking=True):
             "message": "",
         }
         try:
+            env = python_subprocess_env()
             proc = subprocess.run(
                 [str(PYTHON_EXE), "-c", code],
                 cwd=str(WORKSPACE),
                 capture_output=True,
                 text=True,
                 timeout=12,
+                env=env,
             )
             if proc.returncode == 0:
                 payload = json.loads((proc.stdout or "{}").strip().splitlines()[-1])
@@ -674,6 +794,70 @@ def get_llm_pid():
     return int(pid) if pid and pid_is_running(pid) else None
 
 
+def default_self_play_state():
+    return {
+        "running": False,
+        "phase": "idle",
+        "message": "",
+        "started_at": "",
+        "finished_at": "",
+        "last_updated_at": "",
+        "current_run_id": "",
+        "current_state_type": "",
+        "completed_runs": 0,
+        "admitted_runs": 0,
+        "pending_training_runs": 0,
+        "target_runs": 0,
+        "train_every_admitted_runs": 0,
+        "recent_scores": [],
+        "last_score": None,
+        "last_reason": "",
+        "last_model_id": "",
+        "last_train_at": "",
+        "loop_count": 0,
+    }
+
+
+def read_self_play_state():
+    data = default_self_play_state()
+    data.update(read_json(SELF_PLAY_STATE_PATH, {}))
+    return data
+
+
+def get_self_play_pid():
+    state = read_json(SERVER_STATE_PATH, {})
+    pid = state.get("self_play_pid")
+    return int(pid) if pid and pid_is_running(pid) else None
+
+
+def self_play_status_payload():
+    state = read_self_play_state()
+    server_state = read_json(SERVER_STATE_PATH, {})
+    pid = get_self_play_pid()
+    control = read_control()
+    if not pid and state.get("running"):
+        state["running"] = False
+        if not state.get("finished_at"):
+            state["finished_at"] = datetime.now().isoformat(timespec="seconds")
+    state["pid"] = pid
+    state["started_at"] = server_state.get("self_play_started_at", state.get("started_at", ""))
+    state["config"] = {
+        "character": control.get("self_play_character", DEFAULT_CONTROL["self_play_character"]),
+        "ascension": control.get("self_play_ascension", DEFAULT_CONTROL["self_play_ascension"]),
+        "target_runs": control.get("self_play_target_runs", DEFAULT_CONTROL["self_play_target_runs"]),
+        "train_every_admitted_runs": control.get("self_play_train_every_admitted_runs", DEFAULT_CONTROL["self_play_train_every_admitted_runs"]),
+        "max_run_minutes": control.get("self_play_max_run_minutes", DEFAULT_CONTROL["self_play_max_run_minutes"]),
+        "stall_seconds": control.get("self_play_stall_seconds", DEFAULT_CONTROL["self_play_stall_seconds"]),
+        "game_speed_multiplier": control.get("self_play_game_speed_multiplier", DEFAULT_CONTROL["self_play_game_speed_multiplier"]),
+        "exploration_enabled": control.get("exploration_enabled", DEFAULT_CONTROL["exploration_enabled"]),
+        "combat_exploration_epsilon": control.get("combat_exploration_epsilon", DEFAULT_CONTROL["combat_exploration_epsilon"]),
+        "macro_exploration_epsilon": control.get("macro_exploration_epsilon", DEFAULT_CONTROL["macro_exploration_epsilon"]),
+        "exploration_top_k": control.get("exploration_top_k", DEFAULT_CONTROL["exploration_top_k"]),
+        "exploration_temperature": control.get("exploration_temperature", DEFAULT_CONTROL["exploration_temperature"]),
+    }
+    return state
+
+
 def start_ai():
     pid = get_ai_pid()
     if pid:
@@ -690,6 +874,7 @@ def start_ai():
         [str(PYTHON_EXE), str(AGENT_PATH)],
         cwd=str(WORKSPACE),
         creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+        env=python_subprocess_env(),
     )
     state = read_json(SERVER_STATE_PATH, {})
     state["ai_pid"] = proc.pid
@@ -728,6 +913,7 @@ def start_llm():
         [str(PYTHON_EXE), str(LLM_AGENT_PATH)],
         cwd=str(WORKSPACE),
         creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+        env=python_subprocess_env(),
     )
     state = read_json(SERVER_STATE_PATH, {})
     state["llm_pid"] = proc.pid
@@ -756,6 +942,100 @@ def stop_llm():
     state.pop("llm_pid", None)
     write_json(SERVER_STATE_PATH, state)
     return {"status": "ok", "message": "LLM agent stopped/disabled."}
+
+
+def start_self_play():
+    pid = get_self_play_pid()
+    if pid:
+        return {"status": "ok", "message": f"Self-play already running, pid={pid}", "pid": pid}
+    if not SELF_PLAY_RUNNER_PATH.exists():
+        return {"status": "error", "message": f"Self-play runner not found: {SELF_PLAY_RUNNER_PATH}"}
+
+    runtime = python_runtime_status()
+    if not runtime.get("agent_ready"):
+        missing = [m for m in REQUIRED_AGENT_MODULES if m in (runtime.get("missing") or [])] or REQUIRED_AGENT_MODULES
+        return {
+            "status": "error",
+            "message": "自训练未启动：Python 环境缺少 " + ", ".join(missing),
+            "python_runtime": runtime,
+        }
+
+    control = update_control({
+        "ai_enabled": True,
+        "macro_enabled": True,
+        "macro_shop_enabled": True,
+        "collection_enabled": True,
+        "record_ai_actions": True,
+        "include_ai_in_training": True,
+        "exploration_enabled": True,
+        "exploration_mode": "aggressive",
+        "game_speed_enabled": True,
+        "game_speed_multiplier": read_control().get("self_play_game_speed_multiplier", DEFAULT_CONTROL["self_play_game_speed_multiplier"]),
+    })
+    apply_game_speed({
+        "enabled": True,
+        "multiplier": control.get("game_speed_multiplier", DEFAULT_CONTROL["game_speed_multiplier"]),
+    })
+
+    state_payload = default_self_play_state()
+    state_payload.update({
+        "running": True,
+        "phase": "starting",
+        "message": "正在启动自训练 runner...",
+        "started_at": datetime.now().isoformat(timespec="seconds"),
+        "last_updated_at": datetime.now().isoformat(timespec="seconds"),
+        "target_runs": int(control.get("self_play_target_runs", DEFAULT_CONTROL["self_play_target_runs"])),
+        "train_every_admitted_runs": int(control.get("self_play_train_every_admitted_runs", DEFAULT_CONTROL["self_play_train_every_admitted_runs"])),
+    })
+    write_json(SELF_PLAY_STATE_PATH, state_payload)
+
+    env = python_subprocess_env()
+    env["STS2_AI_PANEL_PORT"] = str(resolve_panel_port())
+    proc = subprocess.Popen(
+        [str(PYTHON_EXE), str(SELF_PLAY_RUNNER_PATH)],
+        cwd=str(WORKSPACE),
+        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+        env=env,
+    )
+    state = read_json(SERVER_STATE_PATH, {})
+    state["self_play_pid"] = proc.pid
+    state["self_play_started_at"] = datetime.now().isoformat(timespec="seconds")
+    write_json(SERVER_STATE_PATH, state)
+    return {"status": "ok", "message": f"Self-play started, pid={proc.pid}", "pid": proc.pid}
+
+
+def stop_self_play():
+    pid = get_self_play_pid()
+    if not pid:
+        state = read_self_play_state()
+        state["running"] = False
+        state["phase"] = "stopped"
+        state["message"] = "自训练已停止。"
+        state["finished_at"] = datetime.now().isoformat(timespec="seconds")
+        state["last_updated_at"] = state["finished_at"]
+        write_json(SELF_PLAY_STATE_PATH, state)
+        return {"status": "ok", "message": "Self-play stopped. No managed runner is running."}
+    try:
+        os.kill(pid, signal.CTRL_BREAK_EVENT)
+        time.sleep(0.5)
+    except Exception:
+        pass
+    if pid_is_running(pid):
+        try:
+            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, text=True, timeout=5)
+        except Exception:
+            pass
+    state = read_json(SERVER_STATE_PATH, {})
+    state.pop("self_play_pid", None)
+    write_json(SERVER_STATE_PATH, state)
+    payload = read_self_play_state()
+    payload["running"] = False
+    payload["phase"] = "stopped"
+    payload["message"] = "自训练已停止。"
+    payload["finished_at"] = datetime.now().isoformat(timespec="seconds")
+    payload["last_updated_at"] = payload["finished_at"]
+    write_json(SELF_PLAY_STATE_PATH, payload)
+    return {"status": "ok", "message": "Self-play stopped."}
 
 
 def llm_logic_snapshot():
@@ -811,7 +1091,14 @@ def run_training_background():
                     [str(PYTHON_EXE), str(AI_DIR / "macro_data_pipeline.py")],
                     [str(PYTHON_EXE), str(AI_DIR / "train_macro_bc.py")],
                 ]:
-                    proc = subprocess.run(cmd, cwd=str(WORKSPACE), capture_output=True, text=True, timeout=600)
+                    proc = subprocess.run(
+                        cmd,
+                        cwd=str(WORKSPACE),
+                        capture_output=True,
+                        text=True,
+                        timeout=600,
+                        env=python_subprocess_env(),
+                    )
                     output.append("> " + " ".join(cmd))
                     output.append(proc.stdout)
                     if proc.stderr:
@@ -915,6 +1202,76 @@ def export_database_package():
         "export": LAST_EXPORT,
         "download_url": f"/exports/{filename}",
     }
+
+
+def run_workspace_update_background():
+    if LAST_UPDATE.get("running"):
+        return {"status": "busy", "message": "更新已经在运行中。"}
+    if not UPDATE_SCRIPT_PATH.exists():
+        LAST_UPDATE.update({
+            "running": False,
+            "started": None,
+            "finished": datetime.now().isoformat(timespec="seconds"),
+            "status": "error",
+            "output": f"ERROR: 更新脚本不存在：{UPDATE_SCRIPT_PATH}",
+        })
+        return {"status": "error", "message": "更新脚本不存在。"}
+
+    def worker():
+        with UPDATE_LOCK:
+            LAST_UPDATE.update({
+                "running": True,
+                "started": datetime.now().isoformat(timespec="seconds"),
+                "finished": None,
+                "status": "running",
+                "output": "",
+            })
+            try:
+                cmd = [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(UPDATE_SCRIPT_PATH),
+                    "-NoPause",
+                ]
+                proc = subprocess.run(
+                    cmd,
+                    cwd=str(WORKSPACE),
+                    capture_output=True,
+                    text=True,
+                    timeout=1800,
+                )
+                output_parts = ["> " + " ".join(cmd)]
+                if proc.stdout:
+                    output_parts.append(proc.stdout)
+                if proc.stderr:
+                    output_parts.append(proc.stderr)
+                status = "ok" if proc.returncode == 0 else "error"
+                tail = "\n".join(output_parts)[-16000:]
+                if status == "ok":
+                    tail = (
+                        tail
+                        + "\n\n更新脚本已完成。为了确保网页加载到最新控制台代码，请关闭当前控制台并重新运行 start_all.bat。"
+                    )
+                LAST_UPDATE.update({
+                    "running": False,
+                    "finished": datetime.now().isoformat(timespec="seconds"),
+                    "status": status,
+                    "output": tail,
+                })
+                APP_VERSION_CACHE["ts"] = 0.0
+            except Exception as exc:
+                LAST_UPDATE.update({
+                    "running": False,
+                    "finished": datetime.now().isoformat(timespec="seconds"),
+                    "status": "error",
+                    "output": f"ERROR: {exc}",
+                })
+
+    threading.Thread(target=worker, daemon=True).start()
+    return {"status": "ok", "message": "仓库更新已开始。"}
 
 
 def file_status(path):
@@ -1642,6 +1999,8 @@ def status_payload():
         "training": LAST_TRAIN,
         "training_composition": training_composition(),
         "export": LAST_EXPORT,
+        "update": LAST_UPDATE,
+        "self_play": self_play_status_payload(),
     }
 
 
@@ -3559,6 +3918,99 @@ INDEX_HTML = r"""<!doctype html>
       <section class="fold-panel">
         <details>
           <summary>
+            <span class="fold-title">自训练</span>
+            <span id="selfPlayBadge" class="pill info">未启动</span>
+          </summary>
+          <div class="fold-body">
+        <div class="button-row">
+          <button class="good" onclick="startSelfPlay()">启动自训练</button>
+          <button class="bad" onclick="stopSelfPlay()">停止自训练</button>
+        </div>
+        <div id="selfPlaySummary" class="fine" style="margin-top:10px">等待启动</div>
+        <div id="selfPlayProgress" style="margin-top:6px"></div>
+        <div id="selfPlayRecentScores" style="margin-top:8px"></div>
+        <div class="field">
+          <span>角色</span>
+          <select id="self_play_character" onchange="saveSelfPlayConfig()">
+            <option value="IRONCLAD">IRONCLAD / 铁甲战士</option>
+          </select>
+        </div>
+        <div class="field">
+          <span>目标局数 <small style="opacity:0.6">(0=无限)</small></span>
+          <input id="self_play_target_runs" type="number" min="0" max="999" step="1" onchange="saveSelfPlayConfig()">
+        </div>
+        <div class="field">
+          <span>入训批次</span>
+          <input id="self_play_train_every_admitted_runs" type="number" min="1" max="100" step="1" onchange="saveSelfPlayConfig()">
+        </div>
+        <div class="field">
+          <span>单局超时(分钟)</span>
+          <input id="self_play_max_run_minutes" type="number" min="5" max="240" step="1" onchange="saveSelfPlayConfig()">
+        </div>
+        <div class="field">
+          <span>卡死判定(秒)</span>
+          <input id="self_play_stall_seconds" type="number" min="15" max="1800" step="1" onchange="saveSelfPlayConfig()">
+        </div>
+        <div class="field">
+          <span>自训练速度</span>
+          <select id="self_play_game_speed_multiplier" onchange="saveSelfPlayConfig()">
+            <option value="1.5">1.5x</option>
+            <option value="2">2x</option>
+            <option value="3">3x</option>
+            <option value="4">4x</option>
+            <option value="6">6x</option>
+          </select>
+        </div>
+        <div class="switch">
+          <div><div class="switch-title">激进探索</div><div class="switch-note">始终只从合法候选动作里抽样</div></div>
+          <input id="exploration_enabled" type="checkbox" onchange="saveSelfPlayConfig()">
+        </div>
+        <div class="field">
+          <span>战斗探索</span>
+          <input id="combat_exploration_epsilon" type="number" min="0" max="1" step="0.05" onchange="saveSelfPlayConfig()">
+        </div>
+        <div class="field">
+          <span>宏观探索</span>
+          <input id="macro_exploration_epsilon" type="number" min="0" max="1" step="0.05" onchange="saveSelfPlayConfig()">
+        </div>
+        <div class="field">
+          <span>Top K</span>
+          <input id="exploration_top_k" type="number" min="1" max="12" step="1" onchange="saveSelfPlayConfig()">
+        </div>
+        <div class="field">
+          <span>温度</span>
+          <input id="exploration_temperature" type="number" min="0.1" max="5" step="0.05" onchange="saveSelfPlayConfig()">
+        </div>
+        <details class="more-panel">
+          <summary>自训练状态</summary>
+          <pre id="selfPlayState">暂无自训练状态</pre>
+        </details>
+          </div>
+        </details>
+      </section>
+
+      <section class="fold-panel">
+        <details>
+          <summary>
+            <span class="fold-title">仓库更新</span>
+            <span id="updateBadge" class="pill info">未运行</span>
+          </summary>
+          <div class="fold-body">
+        <div class="button-row">
+          <button class="primary" onclick="runWorkspaceUpdate()">一键更新仓库</button>
+        </div>
+        <div class="fine" style="margin-top:10px">会调用本机 Git 执行安全的快进更新；如果有已跟踪的本地改动，会先自动做 stash 备份。更新完请关闭当前控制台，再重新运行 start_all.bat。</div>
+        <details class="more-panel">
+          <summary>更新日志</summary>
+          <pre id="updateOutput">暂无更新记录</pre>
+        </details>
+          </div>
+        </details>
+      </section>
+
+      <section class="fold-panel">
+        <details>
+          <summary>
             <span class="fold-title">主菜单标记</span>
             <span id="nextRunBadge" class="pill info">-</span>
           </summary>
@@ -4739,6 +5191,17 @@ function renderStatus(s) {
   document.getElementById("game_speed_enabled").checked = !!s.control.game_speed_enabled;
   document.getElementById("game_speed_multiplier").value = String(s.control.game_speed_multiplier || 2);
   document.getElementById("min_training_quality").value = s.control.min_training_quality || "unknown";
+  document.getElementById("self_play_character").value = s.control.self_play_character || "IRONCLAD";
+  document.getElementById("self_play_target_runs").value = Number(s.control.self_play_target_runs || 20);
+  document.getElementById("self_play_train_every_admitted_runs").value = Number(s.control.self_play_train_every_admitted_runs || 5);
+  document.getElementById("self_play_max_run_minutes").value = Number(s.control.self_play_max_run_minutes || 75);
+  document.getElementById("self_play_stall_seconds").value = Number(s.control.self_play_stall_seconds || 120);
+  document.getElementById("self_play_game_speed_multiplier").value = String(s.control.self_play_game_speed_multiplier || 3);
+  document.getElementById("exploration_enabled").checked = !!s.control.exploration_enabled;
+  document.getElementById("combat_exploration_epsilon").value = Number(s.control.combat_exploration_epsilon ?? 0.35);
+  document.getElementById("macro_exploration_epsilon").value = Number(s.control.macro_exploration_epsilon ?? 0.25);
+  document.getElementById("exploration_top_k").value = Number(s.control.exploration_top_k || 5);
+  document.getElementById("exploration_temperature").value = Number(s.control.exploration_temperature || 1.35);
   const llmCfg = (s.llm && s.llm.config) || {};
   if (!isLLMFormEditing()) {
     applyLLMConfigToForm(llmCfg);
@@ -4805,6 +5268,7 @@ function renderStatus(s) {
   document.getElementById("modeNew").className = runMode === "new" ? "active" : "";
   document.getElementById("modeContinue").className = runMode === "continue" ? "active" : "";
   renderExport(s.export);
+  renderUpdate(s.update);
 
   renderCurrentData(s.current_data);
   renderRuns(s.runs || []);
@@ -4815,6 +5279,7 @@ function renderStatus(s) {
   renderAiLogic(s.ai_logic);
   renderLLMLogic(s.llm && s.llm.logic, llmCfg);
   renderTrainingComposition(s.training_composition || {});
+  renderSelfPlay(s.self_play || {}, s.control || {});
 
   setPill("trainStatus", s.training.running ? `训练中 ${s.training.started || ""}` : (s.training.finished ? `完成 ${s.training.finished}` : "未运行"), s.training.running ? "warn" : "info");
   document.getElementById("trainOutput").textContent = s.training.output || "暂无输出";
@@ -4961,6 +5426,113 @@ function renderExport(info) {
      <div>${formatBytes(info.size)}，${info.file_count || 0} 个文件，${info.created || ""}</div>
      <div><a href="/exports/${info.filename}">下载这个数据包</a></div>
      <div class="muted">${info.path || ""}</div>`;
+}
+function renderUpdate(info) {
+  const output = document.getElementById("updateOutput");
+  if (!output) return;
+  if (!info || (!info.running && !info.finished && !info.output)) {
+    setPill("updateBadge", "未运行", "info");
+    output.textContent = "暂无更新记录";
+    return;
+  }
+  if (info.running) {
+    setPill("updateBadge", "更新中", "warn");
+  } else if (info.status === "ok") {
+    setPill("updateBadge", "已完成", "on");
+  } else if (info.status === "error") {
+    setPill("updateBadge", "失败", "off");
+  } else {
+    setPill("updateBadge", "已结束", "info");
+  }
+  output.textContent = info.output || (info.finished ? `更新结束：${info.finished}` : "暂无更新输出");
+}
+function renderSelfPlay(info, control) {
+  const summary = document.getElementById("selfPlaySummary");
+  const state = document.getElementById("selfPlayState");
+  const progressEl = document.getElementById("selfPlayProgress");
+  const scoresEl = document.getElementById("selfPlayRecentScores");
+  if (!summary || !state) return;
+
+  const running = !!(info && info.running);
+  const phase = (info && info.phase) || "idle";
+  const message = (info && info.message) || "";
+  const completed = Number((info && info.completed_runs) || 0);
+  const admitted = Number((info && info.admitted_runs) || 0);
+  const rawTarget = Number((info && info.target_runs) || (control && control.self_play_target_runs) || 0);
+  const targetLabel = rawTarget <= 0 ? "∞" : String(rawTarget);
+  const pending = Number((info && info.pending_training_runs) || 0);
+  const currentRun = (info && info.current_run_id) || "-";
+  const currentFloor = Number((info && info.current_floor) || 0);
+  const lastScore = info && info.last_score;
+  const scoreText = lastScore
+    ? `score ${lastScore.score ?? "-"} / ${lastScore.admitted ? "入训" : "拒绝"} / ${lastScore.reason || "-"}`
+    : "暂无评分";
+  const explore = [
+    control && control.exploration_enabled ? "探索开" : "探索关",
+    `战斗 ${Number((control && control.combat_exploration_epsilon) ?? 0.35).toFixed(2)}`,
+    `宏观 ${Number((control && control.macro_exploration_epsilon) ?? 0.25).toFixed(2)}`,
+    `TopK ${Number((control && control.exploration_top_k) || 5)}`,
+    `T ${Number((control && control.exploration_temperature) || 1.35).toFixed(2)}`,
+  ].join(" · ");
+
+  if (running) {
+    setPill("selfPlayBadge", `${phase || "运行中"}`, "warn");
+  } else if (phase === "finished") {
+    setPill("selfPlayBadge", "已完成", "on");
+  } else if (phase === "error") {
+    setPill("selfPlayBadge", "错误", "off");
+  } else {
+    setPill("selfPlayBadge", "未启动", "info");
+  }
+
+  summary.innerHTML = `
+    <div class="kv"><span>进度</span><span>${completed}/${targetLabel} 局，入训 ${admitted} 局</span></div>
+    <div class="kv"><span>当前 Run</span><code>${escapeHtml(currentRun)}</code></div>
+    <div class="kv"><span>下次重训</span><span>${pending ? `还差 ${pending} 个入训 run` : "达到批次或等待新样本"}</span></div>
+    <div class="kv"><span>最近评分</span><span>${escapeHtml(scoreText)}</span></div>
+    <div class="kv"><span>探索强度</span><span>${escapeHtml(explore)}</span></div>
+    ${message ? `<div class="fine" style="margin-top:8px">${escapeHtml(message)}</div>` : ""}
+  `;
+
+  // 实时进度：当前局 floor / 已跑时间
+  if (progressEl) {
+    if (running && currentRun && currentRun !== "-") {
+      const runStarted = Number(info.run_started_at || 0);
+      let elapsed = "";
+      if (runStarted > 0) {
+        const mins = Math.floor((Date.now() / 1000 - runStarted) / 60);
+        elapsed = ` · 已跑 ${mins} 分钟`;
+      }
+      const stType = info.current_state_type || "";
+      progressEl.innerHTML = `<div class="kv"><span>当前局进度</span><span>Floor ${currentFloor}${elapsed}${stType ? " · " + escapeHtml(stType) : ""}</span></div>`;
+    } else {
+      progressEl.innerHTML = "";
+    }
+  }
+
+  // 最近 N 局评分表格
+  if (scoresEl) {
+    const scores = (info && info.recent_scores) || [];
+    if (scores.length > 0) {
+      const rows = scores.slice(0, 6).map(s => {
+        const rid = (s.run_id || "").slice(-8);
+        const adm = s.admitted ? '<span class="pill on" style="font-size:11px">入训</span>' : '<span class="pill off" style="font-size:11px">拒绝</span>';
+        return `<tr><td><code>${rid}</code></td><td>A${s.max_act||0}/F${s.max_floor||0}</td><td>${s.score??"?"}</td><td>${escapeHtml(s.reason||"-")}</td><td>${adm}</td></tr>`;
+      }).join("");
+      scoresEl.innerHTML = `
+        <details open style="margin-top:4px">
+          <summary style="cursor:pointer;font-size:13px;opacity:0.8">最近 ${scores.length} 局评分</summary>
+          <table style="width:100%;font-size:12px;border-collapse:collapse;margin-top:4px">
+            <thead><tr style="opacity:0.7;text-align:left"><th>Run</th><th>进度</th><th>Score</th><th>原因</th><th>结果</th></tr></thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </details>`;
+    } else {
+      scoresEl.innerHTML = "";
+    }
+  }
+
+  state.textContent = JSON.stringify(info || {}, null, 2);
 }
 function renderCurrentData(data) {
   const run = data && data.active_run;
@@ -5596,6 +6168,42 @@ async function restartAI(){ await api("/api/ai/restart", {}); refresh(); }
 async function startLLM(){ await saveLLMConfig(); await api("/api/llm/start", {}); refresh(); }
 async function stopLLM(){ await api("/api/llm/stop", {}); refresh(); }
 async function train(){ await api("/api/train", {}); refresh(); }
+async function startSelfPlay(){
+  setPill("selfPlayBadge", "启动中", "warn");
+  const summary = document.getElementById("selfPlaySummary");
+  if (summary) summary.textContent = "正在启动自训练 runner...";
+  await saveSelfPlayConfig();
+  await api("/api/self-play/start", {});
+  refresh();
+}
+async function stopSelfPlay(){
+  setPill("selfPlayBadge", "停止中", "warn");
+  await api("/api/self-play/stop", {});
+  refresh();
+}
+async function saveSelfPlayConfig(){
+  const body = {
+    self_play_character: document.getElementById("self_play_character").value,
+    self_play_target_runs: Number(document.getElementById("self_play_target_runs").value || 20),
+    self_play_train_every_admitted_runs: Number(document.getElementById("self_play_train_every_admitted_runs").value || 5),
+    self_play_max_run_minutes: Number(document.getElementById("self_play_max_run_minutes").value || 75),
+    self_play_stall_seconds: Number(document.getElementById("self_play_stall_seconds").value || 120),
+    self_play_game_speed_multiplier: Number(document.getElementById("self_play_game_speed_multiplier").value || 3),
+    exploration_enabled: !!document.getElementById("exploration_enabled").checked,
+    exploration_mode: "aggressive",
+    combat_exploration_epsilon: Number(document.getElementById("combat_exploration_epsilon").value || 0.35),
+    macro_exploration_epsilon: Number(document.getElementById("macro_exploration_epsilon").value || 0.25),
+    exploration_top_k: Number(document.getElementById("exploration_top_k").value || 5),
+    exploration_temperature: Number(document.getElementById("exploration_temperature").value || 1.35),
+  };
+  await api("/api/self-play/config", body);
+}
+async function runWorkspaceUpdate(){
+  setPill("updateBadge", "更新中", "warn");
+  document.getElementById("updateOutput").textContent = "正在执行仓库更新...";
+  await api("/api/update", {});
+  refresh();
+}
 async function activateModelPackage(){
   const select = document.getElementById("modelPackageSelect");
   const resultEl = document.getElementById("modelSwitchResult");
@@ -5789,6 +6397,10 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {"status": "ok", "time": datetime.now().isoformat(timespec="seconds")})
         elif self.path == "/api/status":
             self._json(200, status_payload())
+        elif self.path == "/api/self-play/status":
+            self._json(200, self_play_status_payload())
+        elif self.path == "/api/self-play/config":
+            self._json(200, {"control": read_control(), "self_play": self_play_status_payload()})
         elif self.path.startswith("/assets/"):
             name = Path(self.path.split("?", 1)[0].split("/assets/", 1)[1]).name
             path = ASSETS_DIR / name
@@ -5841,8 +6453,16 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, stop_ai())
             elif self.path == "/api/ai/restart":
                 self._json(200, restart_ai())
+            elif self.path == "/api/self-play/start":
+                self._json(200, start_self_play())
+            elif self.path == "/api/self-play/stop":
+                self._json(200, stop_self_play())
+            elif self.path == "/api/self-play/config":
+                self._json(200, {"control": update_control(body), "self_play": self_play_status_payload()})
             elif self.path == "/api/train":
                 self._json(200, run_training_background())
+            elif self.path == "/api/update":
+                self._json(200, run_workspace_update_background())
             elif self.path == "/api/model/activate":
                 self._json(200, activate_model_package(body.get("model_id")))
             elif self.path == "/api/model/snapshot":
@@ -5896,6 +6516,8 @@ def main():
         write_json(CONTROL_PATH, DEFAULT_CONTROL)
     if not LLM_CONFIG_PATH.exists():
         write_json(LLM_CONFIG_PATH, DEFAULT_LLM_CONFIG)
+    if not SELF_PLAY_STATE_PATH.exists():
+        write_json(SELF_PLAY_STATE_PATH, default_self_play_state())
     ensure_llm_profiles_initialized()
     ensure_active_model_available()
     if not DISCARDED_PATH.exists():

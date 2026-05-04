@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using System.Linq;
+using System.Reflection;
 using System.Text.Json;
 using Godot;
 using MegaCrit.Sts2.Core.Nodes.Cards;
@@ -34,6 +35,8 @@ using MegaCrit.Sts2.Core.Entities.Players;
 using MegaCrit.Sts2.Core.Entities.Potions;
 using MegaCrit.Sts2.Core.GameActions;
 using MegaCrit.Sts2.Core.Runs;
+using MegaCrit.Sts2.Core.Nodes.Screens.MainMenu;
+using MegaCrit.Sts2.Core.Nodes.Screens.CharacterSelect;
 
 namespace STS2_MCP;
 
@@ -50,6 +53,19 @@ public static partial class McpMod
     {
         if (action == "set_game_speed")
             return ExecuteSetGameSpeed(data);
+        if (action == "set_data_source")
+            return ExecuteSetDataSource(data);
+
+        if (action == "start_new_run")
+            return ExecuteStartNewRun(data);
+        if (action == "continue_run")
+            return ExecuteContinueRun();
+        if (action == "debug_menu_buttons")
+            return ExecuteDebugMenuButtons();
+        if (action == "debug_crystal_sphere")
+            return ExecuteDebugCrystalSphere();
+        if (action == "return_to_menu" || action == "abandon_run")
+            return ExecuteReturnToMenu(action);
 
         if (!RunManager.Instance.IsInProgress)
             return Error("No run in progress");
@@ -135,6 +151,453 @@ public static partial class McpMod
             ["speed"] = speed,
             ["message"] = enabled ? $"Game speed set to {speed:0.##}x" : "Game speed restored to 1x"
         };
+    }
+
+    private static Dictionary<string, object?> ExecuteSetDataSource(Dictionary<string, JsonElement> data)
+    {
+        var source = (OptionalString(data, "source") ?? "human").Trim().ToLowerInvariant();
+        var dataSource = source == "ai" ? RL_DataCollector.DataSource.AI : RL_DataCollector.DataSource.Human;
+        RL_DataCollector.SetDataSource(dataSource);
+        RL_DataCollector.SetPolicyContext(OptionalString(data, "policy_name"), OptionalString(data, "model_version"));
+        return new Dictionary<string, object?>
+        {
+            ["status"] = "ok",
+            ["source"] = dataSource == RL_DataCollector.DataSource.AI ? "ai" : "human",
+            ["message"] = $"Data source set to {source}"
+        };
+    }
+
+    private static Dictionary<string, object?> ExecuteStartNewRun(Dictionary<string, JsonElement> data)
+    {
+        var character = (OptionalString(data, "character") ?? "IRONCLAD").Trim().ToUpperInvariant();
+        var ascension = (int)OptionalDouble(data, "ascension", 0);
+        var seed = OptionalString(data, "seed");
+
+        if (character != "IRONCLAD")
+            return Error("start_new_run currently supports character=IRONCLAD only");
+        if (ascension != 0)
+            return Error("start_new_run currently supports ascension=0 only");
+        if (!string.IsNullOrWhiteSpace(seed))
+            return Error("start_new_run currently supports seed=null only");
+        if (RunManager.Instance.IsInProgress)
+            return Error("A run is already in progress");
+
+        RL_DataCollector.SetDataSource(RL_DataCollector.DataSource.AI);
+        RL_DataCollector.MarkMenuRunIntent("new", null);
+
+        var root = ((SceneTree)Engine.GetMainLoop()).Root;
+        var characterSelect = TryHandleCharacterSelectStart(root);
+        if (characterSelect != null)
+            return characterSelect;
+
+        var clicked = TryClickMenuStartButton(root);
+        if (clicked != null)
+            return clicked;
+
+        var direct = TryInvokeMenuStartMethod(root);
+        if (direct != null)
+            return direct;
+
+        return Error("Could not find a main menu / character select control to start an Ironclad run");
+    }
+
+    private static Dictionary<string, object?> ExecuteReturnToMenu(string action)
+    {
+        var root = ((SceneTree)Engine.GetMainLoop()).Root;
+
+        var direct = TryInvokeMenuReturnMethod(root);
+        if (direct != null)
+            return direct;
+
+        var clicked = TryClickReturnToMenuButton(root);
+        if (clicked != null)
+            return clicked;
+
+        if (!RunManager.Instance.IsInProgress)
+        {
+            return new Dictionary<string, object?>
+            {
+                ["status"] = "ok",
+                ["message"] = "Already at menu or no run in progress"
+            };
+        }
+
+        return Error($"Could not execute {action}; no return-to-menu or abandon control was found");
+    }
+
+    private static Dictionary<string, object?> ExecuteContinueRun()
+    {
+        if (RunManager.Instance.IsInProgress)
+        {
+            return new Dictionary<string, object?>
+            {
+                ["status"] = "ok",
+                ["message"] = "Run is already in progress"
+            };
+        }
+
+        RL_DataCollector.SetDataSource(RL_DataCollector.DataSource.AI);
+        RL_DataCollector.MarkMenuRunIntent("continue");
+
+        var root = ((SceneTree)Engine.GetMainLoop()).Root;
+        var buttons = FindAll<NButton>(root)
+            .Where(button => button.IsVisibleInTree() && button.IsEnabled)
+            .Select(button => new { Button = button, Text = NodeSearchText(button).ToLowerInvariant() })
+            .ToList();
+
+        foreach (var row in buttons)
+        {
+            if (!ContainsAny(row.Text, "continue", "继续游戏"))
+                continue;
+
+            row.Button.ForceClick();
+            return new Dictionary<string, object?>
+            {
+                ["status"] = "ok",
+                ["message"] = $"Clicked continue button {row.Button.GetType().Name}: {row.Text}"
+            };
+        }
+
+        return Error("Could not find an enabled continue button");
+    }
+
+    private static Dictionary<string, object?> ExecuteDebugMenuButtons()
+    {
+        var root = ((SceneTree)Engine.GetMainLoop()).Root;
+        var buttons = FindAll<NButton>(root)
+            .Select(button => new Dictionary<string, object?>
+            {
+                ["type"] = button.GetType().FullName ?? button.GetType().Name,
+                ["name"] = button.Name.ToString(),
+                ["visible"] = button.IsVisibleInTree(),
+                ["enabled"] = button.IsEnabled,
+                ["text"] = NodeSearchText(button),
+            })
+            .Cast<object?>()
+            .ToList();
+        return new Dictionary<string, object?>
+        {
+            ["status"] = "ok",
+            ["count"] = buttons.Count,
+            ["buttons"] = buttons,
+        };
+    }
+
+    private static Dictionary<string, object?> ExecuteDebugCrystalSphere()
+    {
+        var overlay = NOverlayStack.Instance?.Peek();
+        if (overlay is not NCrystalSphereScreen screen)
+            return Error("Crystal Sphere screen is not open");
+
+        var screenType = screen.GetType();
+        var fields = screenType
+            .GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static)
+            .Select(field =>
+            {
+                object? value = null;
+                string? valueType = null;
+                string? valueText = null;
+                try
+                {
+                    value = field.GetValue(field.IsStatic ? null : screen);
+                    valueType = value?.GetType().FullName;
+                    valueText = value?.ToString();
+                }
+                catch { }
+                return new Dictionary<string, object?>
+                {
+                    ["name"] = field.Name,
+                    ["type"] = field.FieldType.FullName,
+                    ["value_type"] = valueType,
+                    ["value"] = valueText
+                };
+            })
+            .Cast<object?>()
+            .ToList();
+        var properties = screenType
+            .GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static)
+            .Select(prop => new Dictionary<string, object?>
+            {
+                ["name"] = prop.Name,
+                ["type"] = prop.PropertyType.FullName,
+                ["can_read"] = prop.CanRead,
+                ["can_write"] = prop.CanWrite
+            })
+            .Cast<object?>()
+            .ToList();
+        var methods = screenType
+            .GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static)
+            .Where(method => !method.IsSpecialName)
+            .Select(method => new Dictionary<string, object?>
+            {
+                ["name"] = method.Name,
+                ["return_type"] = method.ReturnType.FullName,
+                ["params"] = method.GetParameters()
+                    .Select(param => $"{param.ParameterType.FullName} {param.Name}")
+                    .ToList()
+            })
+            .Cast<object?>()
+            .ToList();
+
+        return new Dictionary<string, object?>
+        {
+            ["status"] = "ok",
+            ["screen_type"] = screenType.FullName,
+            ["base_type"] = screenType.BaseType?.FullName,
+            ["fields"] = fields,
+            ["properties"] = properties,
+            ["methods"] = methods
+        };
+    }
+
+    private static Dictionary<string, object?>? TryHandleCharacterSelectStart(Node root)
+    {
+        var characterButtons = FindAll<NCharacterSelectButton>(root)
+            .Where(button => button.IsVisibleInTree() && button.IsEnabled)
+            .ToList();
+
+        if (characterButtons.Count == 0)
+            return null;
+
+        var ironcladButton = characterButtons.FirstOrDefault(button =>
+        {
+            var text = NodeSearchText(button).ToLowerInvariant();
+            return ContainsAny(text, "ironclad", "铁甲", "铁甲战士");
+        });
+
+        if (ironcladButton != null)
+        {
+            ironcladButton.ForceClick();
+
+            var confirmButton = FindAll<NConfirmButton>(root)
+                .FirstOrDefault(button => button.IsVisibleInTree() && button.IsEnabled);
+            if (confirmButton != null)
+            {
+                confirmButton.ForceClick();
+                return new Dictionary<string, object?>
+                {
+                    ["status"] = "ok",
+                    ["message"] = $"Selected {NodeSearchText(ironcladButton)} and clicked confirm"
+                };
+            }
+
+            return new Dictionary<string, object?>
+            {
+                ["status"] = "ok",
+                ["message"] = $"Selected {NodeSearchText(ironcladButton)}"
+            };
+        }
+
+        var confirmOnly = FindAll<NConfirmButton>(root)
+            .FirstOrDefault(button => button.IsVisibleInTree() && button.IsEnabled);
+        if (confirmOnly != null)
+        {
+            confirmOnly.ForceClick();
+            return new Dictionary<string, object?>
+            {
+                ["status"] = "ok",
+                ["message"] = $"Clicked character select confirm button {confirmOnly.Name}"
+            };
+        }
+
+        return null;
+    }
+
+    private static Dictionary<string, object?>? TryInvokeMenuStartMethod(Node root)
+    {
+        foreach (var node in FindAll<Node>(root))
+        {
+            string typeName = node.GetType().FullName ?? "";
+            if (!typeName.Contains("MainMenu") && !typeName.Contains("Singleplayer") && !typeName.Contains("CharacterSelect"))
+                continue;
+
+            foreach (var methodName in new[]
+                     {
+                         "StartNewSingleplayerRun",
+                         "StartNewRun",
+                         "BeginRun",
+                         "OnEmbarkPressed",
+                         "OnEmbarkButtonPressed",
+                         "OnNewRunButtonPressed",
+                         "OnSingleplayerButtonPressed",
+                     })
+            {
+                var result = TryInvokeMenuMethod(node, methodName);
+                if (result)
+                {
+                    return new Dictionary<string, object?>
+                    {
+                        ["status"] = "ok",
+                        ["message"] = $"Invoked {node.GetType().Name}.{methodName}()"
+                    };
+                }
+            }
+        }
+        return null;
+    }
+
+    private static Dictionary<string, object?>? TryClickMenuStartButton(Node root)
+    {
+        var buttons = FindAll<NButton>(root)
+            .Where(button => button.IsVisibleInTree() && button.IsEnabled)
+            .Select(button => new { Button = button, Text = NodeSearchText(button).ToLowerInvariant() })
+            .ToList();
+
+        foreach (var priority in new[]
+                 {
+                     new[] { "embark", "begin", "启程", "出发", "开始游戏", "开始冒险" },
+                     new[] { "ironclad", "铁甲", "铁甲战士" },
+                     new[] { "singleplayer", "single player", "单人", "单人模式" },
+                     new[] { "new run", "new game", "start", "开始", "新游戏" },
+                 })
+        {
+            foreach (var row in buttons)
+            {
+                if (!ContainsAny(row.Text, priority))
+                    continue;
+
+                row.Button.ForceClick();
+                return new Dictionary<string, object?>
+                {
+                    ["status"] = "ok",
+                    ["message"] = $"Clicked menu button {row.Button.GetType().Name}: {row.Text}"
+                };
+            }
+        }
+        return null;
+    }
+
+    private static Dictionary<string, object?>? TryInvokeMenuReturnMethod(Node root)
+    {
+        foreach (var node in FindAll<Node>(root))
+        {
+            string typeName = node.GetType().FullName ?? "";
+            if (!typeName.Contains("GameOver") && !typeName.Contains("MainMenu") && !typeName.Contains("Run") && !typeName.Contains("Menu"))
+                continue;
+
+            foreach (var methodName in new[]
+                     {
+                         "ReturnToMenu",
+                         "OnReturnToMenuPressed",
+                         "OnMainMenuButtonPressed",
+                         "OnAbandonRunPressed",
+                         "AbandonRun",
+                         "OnQuitToMenuPressed",
+                     })
+            {
+                var result = TryInvokeMenuMethod(node, methodName);
+                if (result)
+                {
+                    return new Dictionary<string, object?>
+                    {
+                        ["status"] = "ok",
+                        ["message"] = $"Invoked {node.GetType().Name}.{methodName}()"
+                    };
+                }
+            }
+        }
+        return null;
+    }
+
+    private static Dictionary<string, object?>? TryClickReturnToMenuButton(Node root)
+    {
+        foreach (var button in FindAll<NButton>(root))
+        {
+            if (!button.IsVisibleInTree() || !button.IsEnabled)
+                continue;
+
+            string text = NodeSearchText(button).ToLowerInvariant();
+            if (!ContainsAny(text, "return", "main menu", "abandon", "quit", "leave", "menu", "返回", "主菜单", "放弃", "退出", "离开"))
+                continue;
+
+            button.ForceClick();
+            return new Dictionary<string, object?>
+            {
+                ["status"] = "ok",
+                ["message"] = $"Clicked menu/abandon button {button.GetType().Name}"
+            };
+        }
+        return null;
+    }
+
+    private static bool TryInvokeMenuMethod(object target, string methodName)
+    {
+        try
+        {
+            var methods = target.GetType()
+                .GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static)
+                .Where(method => method.Name == methodName)
+                .OrderBy(method => method.GetParameters().Length);
+
+            foreach (var method in methods)
+            {
+                var parameters = method.GetParameters();
+                object?[] args;
+                if (parameters.Length == 0)
+                {
+                    args = System.Array.Empty<object?>();
+                }
+                else if (parameters.Length == 1 && parameters[0].ParameterType == typeof(string))
+                {
+                    args = new object?[] { "" };
+                }
+                else if (parameters.Length == 1 && !parameters[0].ParameterType.IsValueType)
+                {
+                    args = new object?[] { null };
+                }
+                else
+                {
+                    continue;
+                }
+
+                method.Invoke(method.IsStatic ? null : target, args);
+                return true;
+            }
+        }
+        catch
+        {
+        }
+        return false;
+    }
+
+    private static bool ContainsAny(string haystack, params string[] needles)
+    {
+        foreach (var needle in needles)
+        {
+            if (haystack.Contains(needle))
+                return true;
+        }
+        return false;
+    }
+
+    private static string NodeSearchText(Node node)
+    {
+        var parts = new List<string>
+        {
+            node.Name.ToString(),
+            node.GetType().Name
+        };
+        foreach (var propName in new[] { "Text", "Title", "Label", "Description" })
+        {
+            try
+            {
+                var prop = node.GetType().GetProperty(propName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                var value = prop?.GetValue(node);
+                if (value != null)
+                    parts.Add(SafeGetText(() => value) ?? value.ToString() ?? "");
+            }
+            catch { }
+        }
+        foreach (var child in node.GetChildren())
+        {
+            if (child is Label label)
+                parts.Add(label.Text);
+            else if (child is RichTextLabel rich)
+                parts.Add(rich.Text);
+            else if (child is Button button)
+                parts.Add(button.Text);
+        }
+        return string.Join(" ", parts.Where(part => !string.IsNullOrWhiteSpace(part)));
     }
 
     private static Dictionary<string, object?> ExecutePlayCard(Player player, Dictionary<string, JsonElement> data)
@@ -1121,7 +1584,7 @@ public static partial class McpMod
         if (!cell.Entity.IsHidden || !cell.Visible)
             return Error($"Crystal Sphere cell ({x}, {y}) is not clickable");
 
-        cell.EmitSignal(NClickableControl.SignalName.Released, cell);
+        cell.ForceClick();
         return new Dictionary<string, object?>
         {
             ["status"] = "ok",
@@ -1136,14 +1599,70 @@ public static partial class McpMod
             return Error("Crystal Sphere screen is not open");
 
         var proceedButton = screen.GetNodeOrNull<NProceedButton>("%ProceedButton");
-        if (proceedButton is not { IsEnabled: true })
+        proceedButton ??= screen.GetType()
+            .GetField("_proceedButton", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+            ?.GetValue(screen) as NProceedButton;
+        var minigameFinishedMethod = screen.GetType().GetMethod(
+            "OnMinigameFinished",
+            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+        if (minigameFinishedMethod != null)
+        {
+            minigameFinishedMethod.Invoke(screen, System.Array.Empty<object?>());
+        }
+
+        var entity = screen.GetType()
+            .GetField("_entity", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+            ?.GetValue(screen);
+        var completeMethod = entity?.GetType().GetMethod(
+            "CompleteMinigame",
+            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+        if (completeMethod != null && completeMethod.GetParameters().Length == 0)
+        {
+            completeMethod.Invoke(entity, System.Array.Empty<object?>());
+        }
+
+        var directMethod = screen.GetType().GetMethod(
+            "OnProceedButtonPressed",
+            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+        if (directMethod != null && proceedButton != null)
+        {
+            directMethod.Invoke(screen, new object?[] { proceedButton });
+            return new Dictionary<string, object?>
+            {
+                ["status"] = "ok",
+                ["message"] = "Proceeding from Crystal Sphere via OnProceedButtonPressed"
+            };
+        }
+
+        if (proceedButton is { IsEnabled: true })
+        {
+            proceedButton.ForceClick();
+            return new Dictionary<string, object?>
+            {
+                ["status"] = "ok",
+                ["message"] = "Proceeding from Crystal Sphere"
+            };
+        }
+
+        var eventProceedButton = NEventRoom.Instance == null
+            ? null
+            : FindAll<NEventOptionButton>(NEventRoom.Instance)
+                .FirstOrDefault(button =>
+                    button.IsEnabled
+                    && button.IsVisibleInTree()
+                    && !button.Option.IsLocked
+                    && (button.Option.IsProceed
+                        || ContainsAny(NodeSearchText(button).ToLowerInvariant(), "continue", "继续")));
+        if (eventProceedButton == null)
             return Error("Crystal Sphere proceed button is not enabled");
 
-        proceedButton.ForceClick();
+        string title = SafeGetText(() => eventProceedButton.Option.Title) ?? "continue";
+        eventProceedButton.ForceClick();
+
         return new Dictionary<string, object?>
         {
             ["status"] = "ok",
-            ["message"] = "Proceeding from Crystal Sphere"
+            ["message"] = $"Proceeding from Crystal Sphere via event option: {title}"
         };
     }
 

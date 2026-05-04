@@ -1,4 +1,5 @@
 import json
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
@@ -7,6 +8,7 @@ WORKSPACE = Path(__file__).resolve().parents[1]
 DATA_DIR = WORKSPACE / "RL_Datasets"
 DISCARDED_PATH = DATA_DIR / "discarded_runs.json"
 RUN_LABELS_PATH = DATA_DIR / "run_labels.json"
+SELF_PLAY_SCORES_PATH = DATA_DIR / "self_play_scores.json"
 
 QUALITY_LABELS = {
     "failed_run": "失败",
@@ -132,6 +134,30 @@ def read_run_labels():
     return data
 
 
+def read_self_play_scores():
+    data = read_json(SELF_PLAY_SCORES_PATH, {"scores": {}})
+    if "scores" not in data:
+        data = {"scores": data if isinstance(data, dict) else {}}
+    return data
+
+
+def write_self_play_scores(data):
+    write_json(SELF_PLAY_SCORES_PATH, data)
+
+
+def self_play_score_for(run_id):
+    return read_self_play_scores().get("scores", {}).get(run_id)
+
+
+def self_play_admitted_run_ids():
+    scores = read_self_play_scores().get("scores", {})
+    return {
+        run_id
+        for run_id, item in scores.items()
+        if isinstance(item, dict) and item.get("admitted") is True
+    }
+
+
 def set_run_label(run_id, quality, note=""):
     if quality not in QUALITY_ORDER:
         quality = "unknown"
@@ -204,6 +230,122 @@ def infer_quality(summary):
     if safe_int(summary.get("max_floor")) > 0:
         return "before_act1_boss"
     return "unknown"
+
+
+def is_ai_run_summary(summary):
+    run_id = str(summary.get("run_id") or "")
+    if run_id.startswith("ai_"):
+        return True
+    return safe_int(summary.get("ai")) > 0 and safe_int(summary.get("human")) == 0
+
+
+def is_stuck_run(summary):
+    return safe_int(summary.get("records")) > 0 and safe_int(summary.get("max_floor")) <= 0
+
+
+def collect_run_policy_signal(run_id):
+    policy_counts = Counter()
+    model_counts = Counter()
+    source_counts = Counter()
+    for path in iter_run_files():
+        for record in iter_jsonl(path):
+            if record.get("run_id") != run_id:
+                continue
+            source = str(record.get("source") or "unknown")
+            source_counts[source] += 1
+            action_data = record.get("action_data") if isinstance(record.get("action_data"), dict) else {}
+            policy_name = record.get("policy_name") or action_data.get("policy_name")
+            model_version = record.get("model_version") or action_data.get("model_version")
+            if policy_name:
+                policy_counts[str(policy_name)] += 1
+            if model_version:
+                model_counts[str(model_version)] += 1
+    return {
+        "policy_name": policy_counts.most_common(1)[0][0] if policy_counts else "",
+        "model_version": model_counts.most_common(1)[0][0] if model_counts else "",
+        "policy_counts": dict(policy_counts),
+        "model_counts": dict(model_counts),
+        "source_counts": dict(source_counts),
+    }
+
+
+def evaluate_self_play_run(summary):
+    run_id = str(summary.get("run_id") or "")
+    quality = summary.get("quality") or infer_quality(summary)
+    probable_clear = bool(summary.get("probable_clear") or quality == "perfect_run")
+    max_act = safe_int(summary.get("max_act"))
+    max_floor = safe_int(summary.get("max_floor"))
+    wins = safe_int(summary.get("wins"))
+    losses = safe_int(summary.get("losses"))
+    invalid_actions = safe_int(summary.get("invalid_actions"))
+    stuck = is_stuck_run(summary)
+    data_missing = summary.get("data_health") == "missing"
+    policy_signal = collect_run_policy_signal(run_id)
+
+    score = 0
+    score += max_floor * 5
+    score += max_act * 120
+    score += wins * 20
+    score -= losses * 160
+    score -= invalid_actions * 400
+    if probable_clear:
+        score += 1000
+    elif max_act >= 3:
+        score += 450
+    elif max_act >= 2:
+        score += 250
+    elif max_floor >= 18:
+        score += 125
+    if data_missing:
+        score -= 250
+    if stuck:
+        score -= 300
+
+    admitted = False
+    reason = "early_failed_before_act2"
+    if not is_ai_run_summary(summary):
+        reason = "non_ai_run"
+    elif invalid_actions > 0:
+        reason = "invalid_actions"
+    elif stuck:
+        reason = "stuck_or_no_floor"
+    elif probable_clear:
+        admitted = True
+        reason = "clear_or_probable_clear"
+    elif max_act >= 2:
+        admitted = True
+        reason = "reached_act2"
+    elif max_floor >= 18:
+        admitted = True
+        reason = "floor18_plus"
+
+    return {
+        "run_id": run_id,
+        "score": int(score),
+        "admitted": admitted,
+        "reason": reason,
+        "quality": quality,
+        "probable_clear": probable_clear,
+        "policy_name": policy_signal.get("policy_name", ""),
+        "model_version": policy_signal.get("model_version", ""),
+        "max_act": max_act,
+        "max_floor": max_floor,
+        "wins": wins,
+        "losses": losses,
+        "invalid_actions": invalid_actions,
+        "data_health": summary.get("data_health"),
+        "stuck": stuck,
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def save_self_play_run_score(summary):
+    result = evaluate_self_play_run(summary)
+    data = read_self_play_scores()
+    scores = data.setdefault("scores", {})
+    scores[result["run_id"]] = result
+    write_self_play_scores(data)
+    return result
 
 
 def empty_run_summary(run_id):
@@ -382,7 +524,7 @@ def run_data_checks(run):
     return checks
 
 
-def finalize_run_summary(item, discarded, labels):
+def finalize_run_summary(item, discarded, labels, self_play_scores):
     item["discarded"] = item["run_id"] in discarded
     item["probable_clear"] = is_probable_act3_clear(item)
     inferred_quality = infer_quality(item)
@@ -401,6 +543,12 @@ def finalize_run_summary(item, discarded, labels):
         item["quality_label"] = QUALITY_LABELS.get(item["quality"], item["quality"])
         item["quality_manual"] = False
         item["quality_note"] = label.get("note", inferred_note)
+    self_play = self_play_scores.get(item["run_id"])
+    if isinstance(self_play, dict):
+        item["self_play_score"] = self_play.get("score")
+        item["self_play_admitted"] = bool(self_play.get("admitted"))
+        item["self_play_reason"] = self_play.get("reason", "")
+        item["self_play_updated_at"] = self_play.get("updated_at", "")
     item["inferred_quality"] = inferred_quality
     item["inferred_quality_label"] = QUALITY_LABELS.get(inferred_quality, inferred_quality)
     item["files"] = sorted(item["files"])
@@ -432,6 +580,7 @@ def finalize_run_summary(item, discarded, labels):
 def summarize_runs(limit=None):
     discarded = set(read_json(DISCARDED_PATH, {"discarded": []}).get("discarded", []))
     labels = read_run_labels().get("labels", {})
+    self_play_scores = read_self_play_scores().get("scores", {})
     runs = {}
     for path in iter_run_files():
         for record in iter_jsonl(path):
@@ -441,7 +590,7 @@ def summarize_runs(limit=None):
             item = runs.setdefault(run_id, empty_run_summary(run_id))
             update_run_summary(item, record, path)
 
-    result = [finalize_run_summary(item, discarded, labels) for item in runs.values()]
+    result = [finalize_run_summary(item, discarded, labels, self_play_scores) for item in runs.values()]
     result.sort(key=lambda x: x["last_ts"], reverse=True)
     return result[:limit] if limit else result
 

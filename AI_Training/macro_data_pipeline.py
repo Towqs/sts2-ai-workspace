@@ -5,6 +5,7 @@ from collections import Counter
 from pathlib import Path
 
 import numpy as np
+from run_summary import self_play_admitted_run_ids
 
 
 WORKSPACE_DIR = Path(__file__).resolve().parents[1]
@@ -180,6 +181,7 @@ class FilterContext:
         self.ai_require_no_invalid_actions = bool(self.control.get("ai_require_no_invalid_actions", True))
         self.discarded = discarded_run_ids()
         self.labels = read_json(RUN_LABELS_PATH, {"labels": {}}).get("labels", {})
+        self.self_play_admitted = set(self_play_admitted_run_ids())
         self.run_progress = build_run_progress(files)
 
     def record_is_collectable(self, record):
@@ -212,6 +214,8 @@ class FilterContext:
             return False
         if self.ai_require_no_invalid_actions and self.run_has_invalid_actions(run_id):
             return False
+        if run_id in self.self_play_admitted:
+            return True
         quality = self.run_quality(run_id)
         if QUALITY_ORDER.get(quality, 0) >= QUALITY_ORDER.get(self.ai_min_quality, 0):
             return True
@@ -244,7 +248,10 @@ def should_use_record(record, ctx=None):
         if record.get("source") == "ai":
             if not include_ai() or record_is_invalid(record):
                 return False
-            if QUALITY_ORDER.get(run_quality(record.get("run_id")), 0) < QUALITY_ORDER.get(ai_min_training_quality(), 0):
+            if (
+                record.get("run_id") not in set(self_play_admitted_run_ids())
+                and QUALITY_ORDER.get(run_quality(record.get("run_id")), 0) < QUALITY_ORDER.get(ai_min_training_quality(), 0)
+            ):
                 return False
     if record.get("action_type") == "select_map_node":
         screen = record.get("screen_state") or record.get("screen") or {}
@@ -570,6 +577,7 @@ def build_dataset():
             "ai_min_training_quality": ctx.ai_min_quality,
             "ai_accept_failed_after_act1": ctx.ai_accept_failed_after_act1,
             "ai_require_no_invalid_actions": ctx.ai_require_no_invalid_actions,
+            "self_play_admitted_run_count": len(ctx.self_play_admitted),
             "ai_qualified_run_ids": sorted(
                 run_id
                 for run_id, progress in ctx.run_progress.items()

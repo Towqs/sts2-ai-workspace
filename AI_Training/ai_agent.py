@@ -1,5 +1,7 @@
 import os
 import json
+import math
+import random
 import time
 import uuid
 import re
@@ -42,6 +44,12 @@ DEFAULT_CONTROL = {
     "ai_min_training_quality": "partial_act1",
     "ai_accept_failed_after_act1": True,
     "ai_require_no_invalid_actions": True,
+    "exploration_enabled": False,
+    "exploration_mode": "aggressive",
+    "combat_exploration_epsilon": 0.35,
+    "macro_exploration_epsilon": 0.25,
+    "exploration_top_k": 5,
+    "exploration_temperature": 1.35,
 }
 
 from train_bc import CombatBCModel
@@ -818,7 +826,7 @@ def tactical_candidate_adjustment(candidate, state):
     return adjustment, ",".join(reasons)
 
 
-def score_combat_candidates(candidate_agent, state_vec, candidates, state=None):
+def score_combat_candidates(candidate_agent, state_vec, candidates, state=None, exploration=None):
     if not candidate_agent or not candidates:
         return None, [], "candidate_model_unavailable"
     model = candidate_agent["model"]
@@ -878,9 +886,23 @@ def score_combat_candidates(candidate_agent, state_vec, candidates, state=None):
             "marker": marker,
         })
     ranked.sort(key=lambda item: item["score"], reverse=True)
-    for item in ranked:
-        return item, ranked, "candidate_scorer_tactical"
-    return (ranked[0] if ranked else None), ranked, "candidate_scorer_all_end_turn"
+    chosen = ranked[0] if ranked else None
+    decision_source = "candidate_scorer_tactical"
+    if chosen and exploration and exploration.get("enabled"):
+        selected, explored, selected_rank = sample_ranked_entry(
+            ranked,
+            exploration.get("combat_epsilon", 0.0),
+            exploration.get("top_k", 1),
+            exploration.get("temperature", 1.0),
+            score_key="score",
+        )
+        if selected:
+            chosen = selected
+            chosen["explored"] = explored
+            chosen["exploration_rank"] = selected_rank
+            if explored:
+                decision_source = "candidate_scorer_tactical_explore"
+    return chosen, ranked, decision_source
 
 
 def candidate_top_actions(ranked, limit=5):
@@ -1155,7 +1177,7 @@ def rest_option_kind(option):
     return "other"
 
 
-def choose_rest_site_rule_action(state):
+def choose_rest_site_rule_action(state, exploration=None):
     rest_site = state.get("rest_site") or {}
     options = rest_site.get("options") or []
     enabled = [o for o in options if o.get("is_enabled", True)]
@@ -1190,15 +1212,36 @@ def choose_rest_site_rule_action(state):
         chosen = enabled[0]
         reason = "rest_rule_first_enabled"
 
-    index = int(chosen.get("index", enabled.index(chosen)))
-    top_actions = []
+    scored_options = []
     for option in enabled:
         kind = rest_option_kind(option)
         option_index = int(option.get("index", enabled.index(option)))
         score = 100.0 if option is chosen else (60.0 if kind == "smith" else 40.0)
+        scored_options.append({
+            "option": option,
+            "score": score,
+            "index": option_index,
+            "kind": kind,
+        })
+    if exploration and exploration.get("enabled"):
+        selected, explored, selected_rank = sample_ranked_entry(
+            sorted(scored_options, key=lambda item: item["score"], reverse=True),
+            exploration.get("macro_epsilon", 0.0),
+            exploration.get("top_k", 1),
+            exploration.get("temperature", 1.0),
+            score_key="score",
+        )
+        if selected:
+            chosen = selected["option"]
+            if explored:
+                reason = f"{reason}; explore_rank={selected_rank}"
+    index = int(chosen.get("index", enabled.index(chosen)))
+    top_actions = []
+    for item in sorted(scored_options, key=lambda row: row["score"], reverse=True):
+        option = item["option"]
         top_actions.append({
-            "action": f"choose_rest_option:index_{option_index}:{kind}",
-            "confidence": score,
+            "action": f"choose_rest_option:index_{item['index']}:{item['kind']}",
+            "confidence": item["score"],
             "marker": f"hp={hp_ratio:.2f}; id={option.get('id') or option.get('option_id') or '-'}",
         })
     return {"action": "choose_rest_option", "index": index}, {
@@ -2432,10 +2475,20 @@ def rank_shop_items(state, state_type, category_filter=None):
     return ranked
 
 
-def choose_shop_rule_action(state, state_type):
-    ranked = rank_shop_items(state, state_type)
+def choose_shop_rule_action(state, state_type, exploration=None):
+    ranked = [row for row in rank_shop_items(state, state_type) if row["category"] != "card_removal"]
     if ranked:
         best = ranked[0]
+        if exploration and exploration.get("enabled"):
+            selected, _, _ = sample_ranked_entry(
+                ranked,
+                exploration.get("macro_epsilon", 0.0),
+                exploration.get("top_k", 1),
+                exploration.get("temperature", 1.0),
+                score_key="score",
+            )
+            if selected:
+                best = selected
         payload = {"action": "shop_purchase", "index": int(best["item"].get("index", best["fallback_index"]))}
         top_actions = [
             {
@@ -2476,7 +2529,7 @@ def choose_shop_rule_action(state, state_type):
     }
 
 
-def choose_card_reward_mixed_action(macro_agent, state, outputs, probs, card_baseline_weight):
+def choose_card_reward_mixed_action(macro_agent, state, outputs, probs, card_baseline_weight, exploration=None):
     baseline_entries, profile = card_reward_baseline_entries(state)
     baseline_by_label = {entry["label"]: entry for entry in baseline_entries}
     baseline_by_payload = {json.dumps(entry["payload"], sort_keys=True): entry for entry in baseline_entries}
@@ -2510,6 +2563,18 @@ def choose_card_reward_mixed_action(macro_agent, state, outputs, probs, card_bas
 
     ranked.sort(key=lambda item: item["adjusted"], reverse=True)
     best = ranked[0]
+    if exploration and exploration.get("enabled"):
+        selected, _, selected_rank = sample_ranked_entry(
+            ranked,
+            exploration.get("macro_epsilon", 0.0),
+            exploration.get("top_k", 1),
+            exploration.get("temperature", 1.0),
+            score_key="adjusted",
+        )
+        if selected:
+            best = selected
+            if selected_rank > 0:
+                best["reasons"] = list(best["reasons"]) + [f"explore_rank={selected_rank}"]
     top_actions = [
         {
             "action": item["label"],
@@ -2649,7 +2714,7 @@ def event_option_has_cost_risk(option):
     return False
 
 
-def choose_event_option_rule_action(state):
+def choose_event_option_rule_action(state, exploration=None):
     event = state.get("event") or {}
     if event.get("in_dialogue"):
         return {"action": "advance_dialogue"}, {
@@ -2688,7 +2753,20 @@ def choose_event_option_rule_action(state):
             "reasons": reasons,
         })
 
-    best = max(scored, key=lambda item: item["score"])
+    scored.sort(key=lambda item: item["score"], reverse=True)
+    best = scored[0]
+    if exploration and exploration.get("enabled"):
+        selected, _, selected_rank = sample_ranked_entry(
+            scored,
+            exploration.get("macro_epsilon", 0.0),
+            exploration.get("top_k", 1),
+            exploration.get("temperature", 1.0),
+            score_key="score",
+        )
+        if selected:
+            best = selected
+            if selected_rank > 0:
+                best["reasons"] = list(best["reasons"]) + [f"explore_rank={selected_rank}"]
     payload = {"action": "choose_event_option", "index": best["index"]}
     top_actions = [
         {
@@ -2703,6 +2781,72 @@ def choose_event_option_rule_action(state):
         "chosen_action": f"choose_event_option:index_{best['index']}:{best.get('title')}",
         "payload": payload,
         "reason": "event_cost_rule: " + (" / ".join(best["reasons"]) or "highest score"),
+    }
+
+
+def choose_crystal_sphere_rule_action(state, exploration=None):
+    crystal = state.get("crystal_sphere") or {}
+    tool = str(crystal.get("tool") or "").lower()
+    can_proceed = bool(crystal.get("can_proceed"))
+    divinations_left_text = str(crystal.get("divinations_left_text") or "")
+    clickable_cells = crystal.get("clickable_cells") or []
+    revealed_items = crystal.get("revealed_items") or []
+    grid_width = max(safe_int(crystal.get("grid_width"), 11), 1)
+    grid_height = max(safe_int(crystal.get("grid_height"), 11), 1)
+    center_x = (grid_width - 1) / 2.0
+    center_y = (grid_height - 1) / 2.0
+    divinations_match = re.search(r"-?\d+", divinations_left_text)
+    divinations_left = safe_int(divinations_match.group(0), 999) if divinations_match else 999
+
+    if can_proceed or divinations_left <= 0:
+        payload = {"action": "crystal_sphere_proceed"}
+        reason = "crystal_sphere_can_proceed" if can_proceed else "crystal_sphere_no_divinations_left"
+        return payload, {
+            "top_actions": [{"action": "crystal_sphere_proceed", "confidence": 100.0, "marker": reason}],
+            "chosen_action": "crystal_sphere_proceed",
+            "payload": payload,
+            "reason": reason,
+        }
+
+    if tool != "big":
+        payload = {"action": "crystal_sphere_set_tool", "tool": "big"}
+        return payload, {
+            "top_actions": [{"action": "crystal_sphere_set_tool:big", "confidence": 100.0, "marker": "prefer_big_tool"}],
+            "chosen_action": "crystal_sphere_set_tool:big",
+            "payload": payload,
+            "reason": "crystal_sphere_set_big_tool",
+        }
+
+    if not clickable_cells:
+        return None, None
+
+    def cell_priority(cell):
+        x = safe_num(cell.get("x"))
+        y = safe_num(cell.get("y"))
+        return ((x - center_x) ** 2 + (y - center_y) ** 2, y, x)
+
+    ranked_cells = sorted(clickable_cells, key=cell_priority)
+    best_cell = ranked_cells[0]
+    payload = {
+        "action": "crystal_sphere_click_cell",
+        "x": int(best_cell.get("x", 0)),
+        "y": int(best_cell.get("y", 0)),
+    }
+    top_actions = [
+        {
+            "action": f"crystal_sphere_click_cell:{int(cell.get('x', 0))},{int(cell.get('y', 0))}",
+            "confidence": round(max(1.0, 100.0 - cell_priority(cell)[0] * 4.0), 2),
+            "marker": "clickable",
+        }
+        for cell in ranked_cells[:6]
+    ]
+    if revealed_items:
+        top_actions[0]["marker"] = f"revealed={len(revealed_items)}"
+    return payload, {
+        "top_actions": top_actions,
+        "chosen_action": f"crystal_sphere_click_cell:{int(best_cell.get('x', 0))},{int(best_cell.get('y', 0))}",
+        "payload": payload,
+        "reason": f"crystal_sphere_click_center revealed={len(revealed_items)} clickable={len(clickable_cells)}",
     }
 
 
@@ -2889,7 +3033,7 @@ def route_lookahead_adjustment(option, map_state, hp_ratio, gold, floor, max_dep
     return score, ",".join(markers[:4])
 
 
-def choose_map_route_action(state):
+def choose_map_route_action(state, exploration=None):
     options = ((state.get("map") or {}).get("next_options") or [])
     if not options:
         return None, {
@@ -2939,7 +3083,8 @@ def choose_map_route_action(state):
             "lookahead": lookahead_marker,
         })
 
-    best_score = max(item["score"] for item in scored)
+    scored.sort(key=lambda item: item["score"], reverse=True)
+    best_score = scored[0]["score"]
     tied = [item for item in scored if best_score - item["score"] <= 0.25]
     if len(tied) > 1:
         center = sum(safe_num(o.get("col")) for o in options) / len(options)
@@ -2948,7 +3093,19 @@ def choose_map_route_action(state):
         else:
             best = max(tied, key=lambda item: (item["leads"], center - safe_num(item["col"])))
     else:
-        best = max(scored, key=lambda item: item["score"])
+        best = scored[0]
+    if exploration and exploration.get("enabled"):
+        selected, _, selected_rank = sample_ranked_entry(
+            scored,
+            exploration.get("macro_epsilon", 0.0),
+            exploration.get("top_k", 1),
+            exploration.get("temperature", 1.0),
+            score_key="score",
+        )
+        if selected:
+            best = selected
+            if selected_rank > 0:
+                best["lookahead"] = ",".join(x for x in [best.get("lookahead"), f"explore_rank={selected_rank}"] if x)
 
     payload = {"action": "choose_map_node", "index": best["index"]}
     top_actions = [
@@ -2957,7 +3114,7 @@ def choose_map_route_action(state):
             "confidence": item["score"],
             "marker": f"col={item['col']} leads={item['leads']} {item['lookahead']}",
         }
-        for item in sorted(scored, key=lambda item: item["score"], reverse=True)[:6]
+        for item in scored[:6]
     ]
     return payload, {
         "top_actions": top_actions,
@@ -2969,7 +3126,13 @@ def choose_map_route_action(state):
 
 def macro_state_signature(state):
     state_type = str(state.get("state_type") or "").lower()
-    payload = {"state_type": state_type}
+    run = state.get("run") or {}
+    player = state.get("player") or {}
+    payload = {
+        "state_type": state_type,
+        "act": run.get("act"),
+        "floor": run.get("floor"),
+    }
     if state_type == "map":
         payload["options"] = [
             (o.get("index"), o.get("col"), o.get("row"), o.get("type"))
@@ -3025,11 +3188,22 @@ def macro_state_signature(state):
             for o in ((state.get("event") or {}).get("options") or [])
         ]
         payload["in_dialogue"] = (state.get("event") or {}).get("in_dialogue")
+    elif state_type == "crystal_sphere":
+        crystal = state.get("crystal_sphere") or {}
+        payload["tool"] = crystal.get("tool")
+        payload["can_proceed"] = crystal.get("can_proceed")
+        payload["clickable_count"] = len(crystal.get("clickable_cells") or [])
+        payload["revealed_count"] = len(crystal.get("revealed_items") or [])
+        payload["divinations_left_text"] = crystal.get("divinations_left_text")
     elif state_type == "rest_site":
+        rest_site = state.get("rest_site") or {}
         payload["options"] = [
             (o.get("index"), o.get("id"), o.get("is_enabled"))
-            for o in ((state.get("rest_site") or {}).get("options") or [])
+            for o in (rest_site.get("options") or [])
         ]
+        payload["can_proceed"] = rest_site.get("can_proceed")
+        payload["hp"] = player.get("hp")
+        payload["max_hp"] = player.get("max_hp")
     elif state_type in ("shop", "fake_merchant"):
         payload["items"] = [
             (i.get("index"), i.get("category"), i.get("price") or i.get("cost"), i.get("can_afford"), i.get("is_stocked"))
@@ -3039,24 +3213,28 @@ def macro_state_signature(state):
     return json.dumps(payload, sort_keys=True, ensure_ascii=False)
 
 
-def choose_macro_action(macro_agent, state, allow_shop=False, card_baseline_weight=0.35):
+def choose_macro_action(macro_agent, state, allow_shop=False, card_baseline_weight=0.35, exploration=None):
     state_type = str(state.get("state_type") or "").lower()
     if state_type == "map":
-        return choose_map_route_action(state)
+        return choose_map_route_action(state, exploration=exploration)
     if state_type == "card_select":
         return choose_card_select_action(state)
     if state_type == "hand_select":
         return choose_hand_select_action(state)
     if state_type == "event":
-        event_payload, event_info = choose_event_option_rule_action(state)
+        event_payload, event_info = choose_event_option_rule_action(state, exploration=exploration)
         if event_payload:
             return event_payload, event_info
+    if state_type == "crystal_sphere":
+        crystal_payload, crystal_info = choose_crystal_sphere_rule_action(state, exploration=exploration)
+        if crystal_payload:
+            return crystal_payload, crystal_info
     if state_type == "rest_site":
-        rest_payload, rest_info = choose_rest_site_rule_action(state)
+        rest_payload, rest_info = choose_rest_site_rule_action(state, exploration=exploration)
         if rest_payload:
             return rest_payload, rest_info
     if state_type in ("shop", "fake_merchant") and allow_shop:
-        shop_payload, shop_info = choose_shop_rule_action(state, state_type)
+        shop_payload, shop_info = choose_shop_rule_action(state, state_type, exploration=exploration)
         if shop_payload:
             return shop_payload, shop_info
 
@@ -3088,12 +3266,10 @@ def choose_macro_action(macro_agent, state, allow_shop=False, card_baseline_weig
         sorted_indices = torch.argsort(outputs[0], descending=True)
 
     if state_type == "card_reward":
-        return choose_card_reward_mixed_action(macro_agent, state, outputs[0], probs, card_baseline_weight)
+        return choose_card_reward_mixed_action(macro_agent, state, outputs[0], probs, card_baseline_weight, exploration=exploration)
 
     top_actions = []
-    chosen_payload = None
-    chosen_label = None
-    chosen_reason = "no_legal_macro_action"
+    ranked_actions = []
     for idx in sorted_indices:
         label = macro_agent["id_to_action"].get(idx.item(), "UNKNOWN")
         if label in ("UNKNOWN", "PAD"):
@@ -3101,12 +3277,36 @@ def choose_macro_action(macro_agent, state, allow_shop=False, card_baseline_weig
         payload, status = macro_label_to_payload(label, state, allow_shop=allow_shop)
         conf = probs[idx].item() * 100
         top_actions.append({"action": label, "confidence": round(conf, 2), "marker": status})
-        if chosen_payload is None and payload:
-            chosen_payload = payload
-            chosen_label = label
-            chosen_reason = status
-        if len(top_actions) >= 6 and chosen_payload is not None:
+        if payload:
+            ranked_actions.append({
+                "label": label,
+                "payload": payload,
+                "status": status,
+                "score": float(outputs[0][idx].item()),
+            })
+        if len(top_actions) >= 6:
             break
+
+    chosen_payload = None
+    chosen_label = None
+    chosen_reason = "no_legal_macro_action"
+    if ranked_actions:
+        chosen = ranked_actions[0]
+        if exploration and exploration.get("enabled"):
+            selected, _, selected_rank = sample_ranked_entry(
+                ranked_actions,
+                exploration.get("macro_epsilon", 0.0),
+                exploration.get("top_k", 1),
+                exploration.get("temperature", 1.0),
+                score_key="score",
+            )
+            if selected:
+                chosen = selected
+                if selected_rank > 0:
+                    chosen["status"] = f"{chosen['status']}; explore_rank={selected_rank}"
+        chosen_payload = chosen["payload"]
+        chosen_label = chosen["label"]
+        chosen_reason = chosen["status"]
 
     if chosen_payload is None:
         chosen_payload, fallback_reason = macro_fallback_payload(state)
@@ -3200,7 +3400,7 @@ def build_play_card_payload(card_id, hand_cards, enemies):
     return build_play_card_payload_for_card(selected_card, enemies)
 
 
-def choose_card_to_play(sorted_indices, id_to_action, hand_cards, energy):
+def choose_card_to_play(sorted_indices, id_to_action, hand_cards, energy, exploration=None):
     """用模型排序选牌，但禁止还有可打牌时过早 end_turn。"""
     affordable = [c for c in hand_cards if is_playable_with_energy(c, energy)]
     if not affordable:
@@ -3221,10 +3421,88 @@ def choose_card_to_play(sorted_indices, id_to_action, hand_cards, energy):
             continue
         card_id = action_name.replace("play_card_", "")
         if card_id in playable_by_id:
+            if exploration and exploration.get("enabled"):
+                ranked_cards = []
+                seen_ids = set()
+                for inner_idx in sorted_indices:
+                    inner_action = id_to_action.get(inner_idx.item(), "UNKNOWN")
+                    if not inner_action.startswith("play_card_"):
+                        continue
+                    inner_card_id = inner_action.replace("play_card_", "")
+                    if inner_card_id in playable_by_id and inner_card_id not in seen_ids:
+                        seen_ids.add(inner_card_id)
+                        ranked_cards.append({
+                            "card": playable_by_id[inner_card_id],
+                            "score": float(len(sorted_indices) - len(ranked_cards)),
+                        })
+                selected, _, _ = sample_ranked_entry(
+                    ranked_cards,
+                    exploration.get("combat_epsilon", 0.0),
+                    exploration.get("top_k", 1),
+                    exploration.get("temperature", 1.0),
+                    score_key="score",
+                )
+                if selected:
+                    return selected["card"]
             return playable_by_id[card_id]
 
     # 模型词表里没有的新牌，兜底打第一张可支付的牌。
     return affordable[0]
+
+
+def load_exploration_config(control):
+    enabled = bool(control.get("exploration_enabled", False))
+    mode = str(control.get("exploration_mode") or "aggressive").lower()
+    if mode not in ("aggressive", "off"):
+        mode = "aggressive"
+    try:
+        combat_epsilon = max(0.0, min(float(control.get("combat_exploration_epsilon", 0.35)), 1.0))
+    except (TypeError, ValueError):
+        combat_epsilon = 0.35
+    try:
+        macro_epsilon = max(0.0, min(float(control.get("macro_exploration_epsilon", 0.25)), 1.0))
+    except (TypeError, ValueError):
+        macro_epsilon = 0.25
+    try:
+        top_k = max(1, min(int(control.get("exploration_top_k", 5)), 12))
+    except (TypeError, ValueError):
+        top_k = 5
+    try:
+        temperature = max(0.1, min(float(control.get("exploration_temperature", 1.35)), 5.0))
+    except (TypeError, ValueError):
+        temperature = 1.35
+    return {
+        "enabled": enabled and mode != "off",
+        "mode": mode,
+        "combat_epsilon": combat_epsilon,
+        "macro_epsilon": macro_epsilon,
+        "top_k": top_k,
+        "temperature": temperature,
+    }
+
+
+def sample_ranked_entry(ranked, epsilon, top_k, temperature, score_key="score"):
+    if not ranked:
+        return None, False, -1
+    pool = ranked[:max(1, min(len(ranked), int(top_k or 1)))]
+    if len(pool) == 1 or epsilon <= 0.0 or random.random() >= epsilon:
+        return pool[0], False, 0
+
+    scores = [float(item.get(score_key, 0.0)) for item in pool]
+    peak = max(scores)
+    safe_temp = max(float(temperature or 1.0), 0.1)
+    weights = [math.exp((score - peak) / safe_temp) for score in scores]
+    total = sum(weights)
+    if total <= 0:
+        return pool[0], False, 0
+
+    pick = random.random() * total
+    running = 0.0
+    for index, (item, weight) in enumerate(zip(pool, weights)):
+        running += weight
+        if pick <= running:
+            return item, index > 0, index
+    return pool[-1], True, len(pool) - 1
 
 
 def fetch_game_state():
@@ -3381,6 +3659,7 @@ def run_agent():
             continue
 
         control = load_control()
+        exploration = load_exploration_config(control)
         if not control.get("ai_enabled", True):
             if last_data_source != "human":
                 set_data_source("human")
@@ -3426,7 +3705,7 @@ def run_agent():
                 agent_sleep(4.0, control)
                 continue
 
-            if control.get("macro_enabled", False) and state_type in ("map", "rewards", "card_reward", "card_select", "hand_select", "event", "rest_site", "shop", "fake_merchant", "treasure"):
+            if control.get("macro_enabled", False) and state_type in ("map", "rewards", "card_reward", "card_select", "hand_select", "event", "crystal_sphere", "rest_site", "shop", "fake_merchant", "treasure"):
                 allow_shop = bool(control.get("macro_shop_enabled", False))
                 card_baseline_weight = safe_num(control.get("macro_card_reward_weight"), 0.35)
                 card_select_key = None
@@ -3440,6 +3719,7 @@ def run_agent():
                     state,
                     allow_shop=allow_shop,
                     card_baseline_weight=card_baseline_weight,
+                    exploration=exploration,
                 )
                 decision_key = json.dumps({
                     "signature": macro_state_signature(state),
@@ -3458,6 +3738,7 @@ def run_agent():
                     "reason": macro_info.get("reason"),
                     "deck_profile": macro_info.get("deck_profile"),
                     "reward_baseline": macro_info.get("reward_baseline"),
+                    "exploration": exploration,
                 })
                 if payload and decision_key != last_macro_decision_key:
                     print(Fore.GREEN + Style.BRIGHT + f"  >>> MACRO EXECUTE: {macro_info.get('chosen_action')}")
@@ -3546,7 +3827,13 @@ def run_agent():
                     top_printed += 1
 
             legacy_top_actions = list(top_actions)
-            candidate_decision, ranked_candidates, decision_source = score_combat_candidates(candidate_agent, state_vec, legal_candidates, state)
+            candidate_decision, ranked_candidates, decision_source = score_combat_candidates(
+                candidate_agent,
+                state_vec,
+                legal_candidates,
+                state,
+                exploration=exploration,
+            )
             
             # === 选择最佳合法动作 ===
             if candidate_decision:
@@ -3583,6 +3870,7 @@ def run_agent():
                     "chosen_candidate": chosen_candidate_label,
                     "payload": payload,
                     "reason": "candidate scorer plus tactical guards chose the highest scoring legal action",
+                    "exploration": exploration,
                 })
                 if payload:
                     print(Fore.WHITE + f"  Sending: {json.dumps(payload)}")
@@ -3602,7 +3890,7 @@ def run_agent():
                     print(Fore.RED + "  [Bug] Candidate scorer returned empty payload")
                 continue
 
-            chosen_card = choose_card_to_play(sorted_indices, id_to_action, hand_cards, energy)
+            chosen_card = choose_card_to_play(sorted_indices, id_to_action, hand_cards, energy, exploration=exploration)
 
             if chosen_card:
                 chosen_candidate = choose_candidate_for_card(legal_candidates, chosen_card)
@@ -3629,6 +3917,7 @@ def run_agent():
                     "chosen_candidate": chosen_candidate_label,
                     "payload": payload,
                     "reason": "zero-cost first, otherwise model-ranked affordable card",
+                    "exploration": exploration,
                 })
                 
                 if payload:
@@ -3668,6 +3957,7 @@ def run_agent():
                     "chosen_candidate": end_turn_candidate.label if end_turn_candidate else "end_turn",
                     "payload": payload,
                     "reason": "no affordable playable card",
+                    "exploration": exploration,
                 })
                 if last_data_source != "ai":
                     set_data_source("ai")

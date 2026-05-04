@@ -13,6 +13,7 @@ from combat_actions import (
     enumerate_combat_actions,
     match_logged_action,
 )
+from run_summary import self_play_admitted_run_ids
 
 # 超参数/常量定义
 MAX_HAND = 10
@@ -164,6 +165,7 @@ class FilterContext:
             _read_json_file(DISCARDED_RUNS_PATH, {"discarded": []}).get("discarded", [])
         )
         self.labels = _read_json_file(RUN_LABELS_PATH, {"labels": {}}).get("labels", {})
+        self.self_play_admitted = set(self_play_admitted_run_ids())
         self.run_progress = {}
 
     def prepare(self, filepaths):
@@ -198,6 +200,8 @@ class FilterContext:
             return False
         if self.ai_require_no_invalid_actions and self.run_has_invalid_actions(run_id):
             return False
+        if run_id in self.self_play_admitted:
+            return True
         rq = self.run_quality(run_id)
         if QUALITY_ORDER.get(rq, 0) >= QUALITY_ORDER.get(self.ai_min_quality, 0):
             return True
@@ -244,6 +248,10 @@ def _ai_min_training_quality():
     control = _read_json_file(CONTROL_PATH, {})
     quality = control.get("ai_min_training_quality", "partial_act1")
     return quality if quality in QUALITY_ORDER else "partial_act1"
+
+
+def _self_play_admitted_run_ids():
+    return set(self_play_admitted_run_ids())
 
 
 def _parse_card_cost(card, energy):
@@ -378,7 +386,7 @@ def should_use_record(data, state, action, ctx=None):
             if not _include_ai_in_training() or _record_is_invalid(data):
                 return False
             min_quality = _ai_min_training_quality()
-            if QUALITY_ORDER.get(run_quality, 0) < QUALITY_ORDER.get(min_quality, 0):
+            if data.get("run_id") not in _self_play_admitted_run_ids() and QUALITY_ORDER.get(run_quality, 0) < QUALITY_ORDER.get(min_quality, 0):
                 return False
         else:
             min_quality = _min_training_quality()
@@ -774,6 +782,7 @@ def build_dataset(data_dirs, output_dir):
         "ai_min_training_quality": ctx.ai_min_quality,
         "ai_accept_failed_after_act1": ctx.ai_accept_failed_after_act1,
         "ai_require_no_invalid_actions": ctx.ai_require_no_invalid_actions,
+        "self_play_admitted_run_count": len(ctx.self_play_admitted),
         "ai_qualified_run_ids": sorted(
             run_id
             for run_id, progress in ctx.run_progress.items()

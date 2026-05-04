@@ -70,8 +70,22 @@ Write-Host "Game directory : $GameDir"
 Write-Host "Output         : $outDir"
 Write-Host ""
 
-dotnet build $project -c $Configuration -o $outDir -p:STS2GameDir="$GameDir"
+dotnet build $project -c $Configuration --no-restore -p:STS2GameDir="$GameDir"
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+$targetFramework = "net9.0"
+$builtDir = Join-Path (Join-Path $scriptDir "bin\$Configuration") $targetFramework
+if (-not (Test-Path (Join-Path $builtDir "STS2_MCP.dll"))) {
+    Write-Host "ERROR: Build output not found: $builtDir\STS2_MCP.dll" -ForegroundColor Red
+    exit 1
+}
+
+if (Test-Path $outDir) {
+    Remove-Item -LiteralPath $outDir -Recurse -Force
+}
+New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+Copy-Item -LiteralPath (Join-Path $builtDir "STS2_MCP.dll") -Destination (Join-Path $outDir "STS2_MCP.dll") -Force
+Copy-Item -LiteralPath (Join-Path $builtDir "STS2_MCP.pdb") -Destination (Join-Path $outDir "STS2_MCP.pdb") -Force -ErrorAction SilentlyContinue
 
 Write-Host ""
 Write-Host "=== Build succeeded ===" -ForegroundColor Green

@@ -1397,7 +1397,20 @@ public static partial class McpMod
         }
 
         var proceedButton = screen.GetNodeOrNull<NProceedButton>("%ProceedButton");
-        state["can_proceed"] = proceedButton?.IsEnabled == true;
+        bool canProceed = proceedButton?.IsEnabled == true;
+        if (!canProceed && NEventRoom.Instance is { } eventRoom)
+        {
+            canProceed = FindAll<NEventOptionButton>(eventRoom).Any(button =>
+                button.IsEnabled
+                && button.IsVisibleInTree()
+                && !button.Option.IsLocked
+                && (button.Option.IsProceed
+                    || (SafeGetText(() => button.Option.Title) ?? "")
+                        .Contains("继续", StringComparison.OrdinalIgnoreCase)
+                    || (SafeGetText(() => button.Option.Title) ?? "")
+                        .Contains("continue", StringComparison.OrdinalIgnoreCase)));
+        }
+        state["can_proceed"] = canProceed;
 
         return state;
     }
