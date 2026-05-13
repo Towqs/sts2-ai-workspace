@@ -6,7 +6,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "AI_Training"))
 
-from ai_agent import choose_macro_action
+from ai_agent import CARD_TEMPLATE_LOCKS, choose_macro_action, locked_template_for_card_reward
 
 
 class CrystalSphereRuleTests(unittest.TestCase):
@@ -51,6 +51,33 @@ class CrystalSphereRuleTests(unittest.TestCase):
         )
         self.assertEqual(payload, {"action": "crystal_sphere_click_cell", "x": 5, "y": 5})
         self.assertEqual(info["chosen_action"], "crystal_sphere_click_cell:5,5")
+
+
+class TemplateLockTests(unittest.TestCase):
+    def test_template_locks_after_warmup(self):
+        CARD_TEMPLATE_LOCKS.clear()
+        state = {
+            "run": {"act": 1, "floor": 5},
+            "player": {
+                "deck": [
+                    {"id": "INFLAME", "type": "Power", "description": "Gain Strength.", "cost": 1},
+                    {"id": "TWIN_STRIKE", "type": "Attack", "description": "Deal damage twice.", "cost": 1},
+                ],
+                "deck_size": 2,
+            },
+            "card_reward": {
+                "can_skip": True,
+                "cards": [
+                    {"index": 0, "id": "TWIN_STRIKE", "type": "Attack", "description": "Deal damage twice.", "cost": 1},
+                ],
+            },
+        }
+        for floor in (5, 6, 7):
+            state["run"]["floor"] = floor
+            template_id, _summary, lock = locked_template_for_card_reward(state, session_id="test_lock")
+        self.assertEqual(template_id, lock["locked_template"])
+        self.assertTrue(lock["locked"])
+        self.assertEqual(lock["card_reward_count"], 3)
 
 
 if __name__ == "__main__":

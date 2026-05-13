@@ -20,6 +20,7 @@ from combat_actions import (
     public_candidate_catalog,
 )
 from data_pipeline import StateEncoder
+from deck_summary import build_deck_summary
 from train_candidate_bc import CandidateBCScorer
 from macro_data_pipeline import Vocab as MacroVocab, encode_record as encode_macro_record
 from train_macro_bc import MacroBCModel
@@ -29,10 +30,13 @@ from options.base import OPTION_FEATURES_VERSION, OPTION_SCHEMA_VERSION
 from options.cards import (
     CARD_OPTION_FEATURES_VERSION,
     CARD_SCORER_VERSION,
+    archetype_consistency,
     build_card_reward_options,
     card_result_log_payload,
     card_result_top_actions,
+    load_template_config,
     normalize_card_scorer_mode,
+    select_template,
 )
 
 init(autoreset=True)
@@ -45,6 +49,7 @@ AI_LOGIC_PATH = os.path.join(os.path.dirname(__file__), "ai_logic_state.json")
 AI_LOG_DIR = os.path.join(WORKSPACE_DIR, "RL_Datasets", "AI_Combat")
 PPO_LOG_DIR = os.path.join(WORKSPACE_DIR, "RL_Datasets", "PPO")
 OPTION_SHADOW_LOG_DIR = os.path.join(WORKSPACE_DIR, "RL_Datasets", "OptionShadow")
+CARD_TEMPLATE_LOCKS = {}
 
 DEFAULT_CONTROL = {
     "ai_enabled": True,
@@ -1984,12 +1989,113 @@ def option_card_scorer_mode(control=None):
     return normalize_card_scorer_mode(setting)
 
 
+def card_reward_signature_for_template_lock(state):
+    state = state if isinstance(state, dict) else {}
+    run = state.get("run") if isinstance(state.get("run"), dict) else {}
+    cards = ((state.get("card_reward") or {}).get("cards") or [])
+    card_keys = []
+    for fallback_index, card in enumerate(cards):
+        if not isinstance(card, dict):
+            continue
+        card_keys.append((
+            safe_int(card.get("index"), fallback_index),
+            str(card.get("id") or card.get("card_id") or ""),
+            str(card.get("name") or card.get("card_name") or ""),
+        ))
+    return json.dumps({
+        "act": safe_int(run.get("act"), 0),
+        "floor": safe_int(run.get("floor"), 0),
+        "cards": card_keys,
+    }, sort_keys=True, ensure_ascii=False)
+
+
+def locked_template_for_card_reward(state, session_id=""):
+    config = load_template_config()
+    deck_summary = build_deck_summary(state)
+    candidate = select_template(deck_summary, config)
+    consistency = archetype_consistency(deck_summary, config)
+    scores = consistency.get("scores") or {}
+    lock_cfg = config.get("template_selection") or {}
+    if str(lock_cfg.get("mode") or "locked_after_warmup") != "locked_after_warmup":
+        return candidate, deck_summary, {
+            "mode": str(lock_cfg.get("mode") or "free"),
+            "candidate_template": candidate,
+            "template_scores": scores,
+            "locked": False,
+        }
+
+    key = session_id or "global"
+    state_key = card_reward_signature_for_template_lock(state)
+    lock = CARD_TEMPLATE_LOCKS.setdefault(key, {
+        "seen": set(),
+        "card_reward_count": 0,
+        "locked_template": "",
+        "challenger_template": "",
+        "challenger_count": 0,
+    })
+    warmup = max(safe_int(lock_cfg.get("warmup_card_rewards"), 3), 0)
+    margin = safe_num(lock_cfg.get("switch_margin"), 1.0)
+    patience = max(safe_int(lock_cfg.get("switch_patience"), 2), 1)
+    switched = False
+
+    if state_key not in lock["seen"]:
+        lock["seen"].add(state_key)
+        lock["card_reward_count"] += 1
+        if not lock["locked_template"] and lock["card_reward_count"] >= warmup:
+            lock["locked_template"] = candidate
+        elif lock["locked_template"]:
+            locked = lock["locked_template"]
+            candidate_score = safe_num(scores.get(candidate), 0.0)
+            locked_score = safe_num(scores.get(locked), 0.0)
+            if candidate != locked and candidate_score - locked_score >= margin:
+                if lock["challenger_template"] == candidate:
+                    lock["challenger_count"] += 1
+                else:
+                    lock["challenger_template"] = candidate
+                    lock["challenger_count"] = 1
+                if lock["challenger_count"] >= patience:
+                    lock["locked_template"] = candidate
+                    lock["challenger_template"] = ""
+                    lock["challenger_count"] = 0
+                    switched = True
+            else:
+                lock["challenger_template"] = ""
+                lock["challenger_count"] = 0
+
+    selected = lock["locked_template"] or candidate
+    lock_info = {
+        "mode": "locked_after_warmup",
+        "warmup_card_rewards": warmup,
+        "switch_margin": margin,
+        "switch_patience": patience,
+        "card_reward_count": lock["card_reward_count"],
+        "candidate_template": candidate,
+        "locked_template": lock["locked_template"],
+        "selected_template": selected,
+        "challenger_template": lock["challenger_template"],
+        "challenger_count": lock["challenger_count"],
+        "template_scores": scores,
+        "locked": bool(lock["locked_template"]),
+        "switched": switched,
+    }
+    return selected, deck_summary, lock_info
+
+
 def build_shadow_card_result(state, mode=None):
     mode = normalize_card_scorer_mode(mode or option_card_scorer_mode())
     if mode == "off":
         return mode, None, ""
     try:
-        return mode, build_card_reward_options(state, mode=mode), ""
+        session_id = str((state or {}).get("_ai_session_id") or "")
+        template_id, deck_summary, lock_info = locked_template_for_card_reward(state, session_id=session_id)
+        state_with_lock = dict(state or {})
+        state_with_lock["_card_template_lock"] = lock_info
+        return mode, build_card_reward_options(
+            state_with_lock,
+            mode=mode,
+            template_id=template_id,
+            deck_summary=deck_summary,
+        ), ""
     except Exception as exc:
         return mode, None, str(exc)
 
@@ -4312,12 +4418,46 @@ def append_card_scorer_shadow_log(session_id, state, actual_payload, macro_info,
         return
     options = scorer.get("options") or []
     selected = scorer.get("selected") or {}
+    old_label = (macro_info or {}).get("chosen_action")
+    if not old_label:
+        if (actual_payload or {}).get("action") == "skip_card_reward":
+            old_label = "skip_reward"
+        elif (actual_payload or {}).get("action") == "select_card_reward":
+            old_label = f"choose_card:index_{safe_int((actual_payload or {}).get('card_index', (actual_payload or {}).get('index')), -1)}"
+    scorer_label = selected.get("label")
+    options_by_label = {
+        option.get("label"): option
+        for option in options
+        if isinstance(option, dict)
+    }
+    old_option = options_by_label.get(old_label) or {}
+    skip_option = options_by_label.get("skip_reward") or {}
+    old_card = {
+        "index": old_option.get("index", safe_int((actual_payload or {}).get("card_index", (actual_payload or {}).get("index")), -1)),
+        "card_id": old_option.get("card_id") or "",
+        "name": old_option.get("name") or "",
+        "type": old_option.get("card_type") or "",
+        "cost": old_option.get("cost", 0),
+    }
+    scorer_card = {
+        "index": selected.get("index", -1),
+        "card_id": selected.get("card_id") or "",
+        "name": selected.get("name") or "",
+        "type": selected.get("card_type") or "",
+        "cost": selected.get("cost", 0),
+    }
     run = (state or {}).get("run") or {}
     scores = [
         safe_num(option.get("score"), 0.0)
         for option in options
         if isinstance(option, dict)
     ]
+    template_scores = (
+        ((scorer.get("template_lock") or {}).get("template_scores"))
+        or ((scorer.get("archetype_consistency") or {}).get("scores"))
+        or {}
+    )
+    deck_summary = scorer.get("deck_summary") if isinstance(scorer.get("deck_summary"), dict) else {}
     record = {
         "type": "card_scorer_shadow",
         "timestamp": int(time.time() * 1000),
@@ -4338,9 +4478,16 @@ def append_card_scorer_shadow_log(session_id, state, actual_payload, macro_info,
         "done": False,
         "truncated": False,
         "actual_skip": (actual_payload or {}).get("action") == "skip_card_reward",
-        "legacy_chosen_action": (macro_info or {}).get("chosen_action"),
-        "recommended_action": selected.get("label"),
+        "legacy_chosen_action": old_label,
+        "old_policy_action": old_label,
+        "old_policy_card": old_card,
+        "recommended_action": scorer_label,
+        "scorer_action": scorer_label,
+        "scorer_card": scorer_card,
         "recommended_payload": selected.get("payload"),
+        "scorer_disagreed_with_old_policy": bool(old_label and scorer_label and old_label != scorer_label),
+        "confidence_gap": scorer.get("confidence_gap", 0.0),
+        "skip_score": skip_option.get("score"),
         "skip_recommended": selected.get("label") == "skip_reward",
         "skip_available": any(
             (option or {}).get("label") == "skip_reward"
@@ -4352,8 +4499,11 @@ def append_card_scorer_shadow_log(session_id, state, actual_payload, macro_info,
         "state_features_version": scorer.get("state_features_version", STATE_FEATURES_VERSION),
         "option_features_version": scorer.get("option_features_version", CARD_OPTION_FEATURES_VERSION),
         "template_id": scorer.get("template_id"),
+        "template_scores": template_scores,
+        "template_lock": scorer.get("template_lock"),
         "archetype_consistency": scorer.get("archetype_consistency"),
-        "deck_summary": scorer.get("deck_summary"),
+        "deck_size": deck_summary.get("deck_size"),
+        "deck_summary": deck_summary,
         "score_distribution": score_distribution(scores),
         "reward_terms": {},
         "reward_term_distribution": {},
@@ -4833,6 +4983,7 @@ def run_agent():
             if control.get("macro_enabled", False) and state_type in ("map", "rewards", "card_reward", "card_select", "hand_select", "event", "crystal_sphere", "rest_site", "shop", "fake_merchant", "treasure"):
                 allow_shop = bool(control.get("macro_shop_enabled", False) or constraint_mode in ("explore", "free"))
                 card_baseline_weight = safe_num(control.get("macro_card_reward_weight"), 0.35)
+                state["_ai_session_id"] = session_id
                 card_select_key = None
                 if is_selection_state_type(state_type):
                     card_select_key = selection_memory_signature(state)

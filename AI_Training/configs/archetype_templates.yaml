@@ -3,6 +3,12 @@ default_template: strength_multihit
 option_card_scorer:
   mode: shadow
 
+template_selection:
+  mode: locked_after_warmup
+  warmup_card_rewards: 3
+  switch_margin: 1.0
+  switch_patience: 2
+
 templates:
   strength_multihit:
     enabled: true
@@ -20,4 +26,4 @@ templates:
 skip:
   soft_deck_size: 22
   hard_deck_size: 30
-  low_best_score: 0.5
+  low_best_score: 1.0

@@ -78,7 +78,7 @@ def round4(value):
 
 
 def old_policy_label(record):
-    label = str(record.get("legacy_chosen_action") or "").strip()
+    label = str(record.get("old_policy_action") or record.get("legacy_chosen_action") or "").strip()
     if label:
         return label
     payload = record.get("actual_payload") if isinstance(record.get("actual_payload"), dict) else {}
@@ -175,6 +175,8 @@ def summarize_records(records):
             old_skip_count += 1
 
         gap, record_nan, record_inf = confidence_gap(options)
+        gap = safe_float(record.get("confidence_gap")) if record.get("confidence_gap") is not None else gap
+        gap = float(gap or 0.0)
         gaps.append(gap)
         nan_count += record_nan
         inf_count += record_inf
@@ -217,8 +219,11 @@ def summarize_records(records):
             "deck_size": deck_summary.get("deck_size"),
             "line": record.get("_line"),
             "file": os.path.basename(str(record.get("_path") or "")),
+            "old_card": record.get("old_policy_card") or {},
+            "scorer_card": record.get("scorer_card") or {},
             "selected_score": selected.get("score"),
             "selected_reasons": selected.get("reasons"),
+            "score_breakdown": selected.get("score_breakdown"),
         }
         if old_label != scorer_label:
             disagreement_examples.append(example)
@@ -289,19 +294,47 @@ def reward_terms_table(distributions):
     return "\n".join(lines) + "\n"
 
 
+def _card_label(card):
+    if not isinstance(card, dict):
+        return "-"
+    name = card.get("name") or ""
+    card_id = card.get("card_id") or ""
+    index = card.get("index")
+    if name or card_id:
+        return f"{index}:{name or card_id}"
+    return "-"
+
+
 def examples_table(examples):
     if not examples:
-        return "| run | floor | old | scorer | gap | template | deck | location |\n| --- | ---: | --- | --- | ---: | --- | ---: | --- |\n| - | 0 | - | - | 0 | - | 0 | - |\n"
+        return "| run | floor | old | old card | scorer | scorer card | gap | template | deck | location |\n| --- | ---: | --- | --- | --- | --- | ---: | --- | ---: | --- |\n| - | 0 | - | - | - | - | 0 | - | 0 | - |\n"
     lines = [
-        "| run | floor | old | scorer | gap | template | deck | location |",
-        "| --- | ---: | --- | --- | ---: | --- | ---: | --- |",
+        "| run | floor | old | old card | scorer | scorer card | gap | template | deck | location |",
+        "| --- | ---: | --- | --- | --- | --- | ---: | --- | ---: | --- |",
     ]
     for item in examples:
         location = f"{item.get('file')}:{item.get('line')}"
         lines.append(
             f"| `{item.get('run_id') or ''}` | {item.get('floor') or 0} | "
-            f"`{item.get('old')}` | `{item.get('scorer')}` | {item.get('gap')} | "
+            f"`{item.get('old')}` | `{_card_label(item.get('old_card'))}` | "
+            f"`{item.get('scorer')}` | `{_card_label(item.get('scorer_card'))}` | {item.get('gap')} | "
             f"`{item.get('template_id')}` | {item.get('deck_size') or 0} | `{location}` |"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def details_list(examples):
+    if not examples:
+        return "- No examples.\n"
+    lines = []
+    for item in examples[:5]:
+        reasons = item.get("selected_reasons") or []
+        breakdown = item.get("score_breakdown") or {}
+        lines.append(
+            f"- `{item.get('run_id')}` floor {item.get('floor')}: "
+            f"{_card_label(item.get('scorer_card'))}, score={item.get('selected_score')}, "
+            f"gap={item.get('gap')}, reasons={'; '.join(map(str, reasons)) or '-'}, "
+            f"breakdown={json.dumps(breakdown, ensure_ascii=False, sort_keys=True)}"
         )
     return "\n".join(lines) + "\n"
 
@@ -351,6 +384,9 @@ def render_report(summary, input_files, report_date):
         "## Disagreement Examples",
         "",
         examples_table(summary["disagreement_examples"]),
+        "## Disagreement Details",
+        "",
+        details_list(summary["disagreement_examples"]),
         "## High Confidence Examples",
         "",
         examples_table(summary["high_confidence_examples"]),

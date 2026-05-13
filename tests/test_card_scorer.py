@@ -53,6 +53,10 @@ class CardScorerTests(unittest.TestCase):
         self.assertIn("choose_card:index_2", labels)
         self.assertIn("skip_reward", labels)
         self.assertEqual(result.to_dict()["legal_option_count"], 4)
+        first_card = next(option for option in result.to_dict()["options"] if option["label"] == "choose_card:index_0")
+        self.assertEqual(first_card["card_id"], "TWIN_STRIKE")
+        self.assertIn("score_breakdown", first_card)
+        self.assertIn("total_score", first_card)
 
     def test_skip_rises_for_bloated_deck_with_weak_candidates(self):
         state = {
@@ -81,6 +85,24 @@ class CardScorerTests(unittest.TestCase):
         strength = score_card(state, summary, card, template_id="strength_multihit")["score"]
         barricade = score_card(state, summary, card, template_id="barricade_block")["score"]
         self.assertGreater(strength, barricade)
+
+    def test_result_includes_confidence_gap_and_template_lock(self):
+        state = {
+            "run": {"act": 1, "floor": 5},
+            "player": {"deck": [{"id": "INFLAME", "type": "Power", "description": "Gain Strength.", "cost": 1}], "deck_size": 1},
+            "_card_template_lock": {"selected_template": "strength_multihit", "locked": True},
+            "card_reward": {
+                "can_skip": True,
+                "cards": [
+                    {"index": 0, "id": "TWIN_STRIKE", "name": "Twin Strike", "type": "Attack", "description": "Deal damage twice.", "cost": 1},
+                    {"index": 1, "id": "UNKNOWN_CARD", "type": "Other", "cost": 2},
+                ],
+            },
+        }
+        result = build_card_reward_options(state, mode="shadow", template_id="strength_multihit")
+        payload = result.to_dict()
+        self.assertGreaterEqual(payload["confidence_gap"], 0.0)
+        self.assertTrue(payload["template_lock"]["locked"])
 
 
 if __name__ == "__main__":

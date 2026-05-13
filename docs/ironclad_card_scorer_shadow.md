@@ -145,6 +145,31 @@ reward_term_inf_count
 
 其中 `confidence_gap = best_score - second_best_score`。后续判断能否打开 active 时，重点看分歧案例里 scorer 是否有足够高的 confidence gap，以及是否存在异常 skip、NaN、inf 或候选数量异常。
 
+每条 shadow JSONL 还会记录可解释字段，便于人工审查分歧案例：
+
+```text
+old_policy_action / old_policy_card
+scorer_action / scorer_card
+template_scores
+template_lock
+confidence_gap
+scorer_disagreed_with_old_policy
+skip_score
+options[].card_id / name / total_score / score_breakdown / reasons
+```
+
+模板选择默认启用 `locked_after_warmup`：
+
+```yaml
+template_selection:
+  mode: locked_after_warmup
+  warmup_card_rewards: 3
+  switch_margin: 1.0
+  switch_patience: 2
+```
+
+也就是说，前 3 次 card reward 允许自由判断构筑；之后锁定主模板。只有另一个模板连续 2 次超过当前模板且分差至少 1.0，才会切换。
+
 ## PPO / Rollout 预留字段
 
 PPO v0 仍然保持原训练语义，但 rollout 记录已补齐后续 PPO v2 需要的字段：

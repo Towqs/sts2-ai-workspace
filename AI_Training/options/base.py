@@ -17,13 +17,22 @@ class Option:
     index: int = -1
 
     def to_dict(self, include_features=False):
+        metadata = dict(self.metadata)
+        card = metadata.get("card") if isinstance(metadata.get("card"), dict) else {}
         item = {
             "label": self.label,
+            "action": self.label,
             "payload": self.payload,
             "kind": self.kind,
             "score": round(float(self.score), 4),
+            "total_score": round(float(self.score), 4),
             "reasons": list(self.reasons),
-            "metadata": dict(self.metadata),
+            "score_breakdown": dict(metadata.get("score_breakdown") or {}),
+            "card_id": card.get("id") or "",
+            "name": card.get("name") or "",
+            "card_type": card.get("type") or "",
+            "cost": card.get("cost", 0),
+            "metadata": metadata,
             "index": int(self.index),
         }
         if include_features:
@@ -42,6 +51,8 @@ class OptionResult:
     state_features_version: str = ""
     deck_summary: dict = field(default_factory=dict)
     archetype_consistency: dict = field(default_factory=dict)
+    confidence_gap: float = 0.0
+    template_lock: dict = field(default_factory=dict)
 
     def to_dict(self, include_features=False):
         return {
@@ -51,6 +62,8 @@ class OptionResult:
             "option_features_version": self.option_features_version,
             "state_features_version": self.state_features_version,
             "legal_option_count": len(self.options),
+            "confidence_gap": round(float(self.confidence_gap), 4),
+            "template_lock": dict(self.template_lock),
             "selected": self.selected.to_dict(include_features=include_features) if self.selected else None,
             "options": [option.to_dict(include_features=include_features) for option in self.options],
             "deck_summary": dict(self.deck_summary),

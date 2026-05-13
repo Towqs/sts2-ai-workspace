@@ -16,6 +16,12 @@ CARD_SCORER_VERSION = "ironclad_card_scorer_v1"
 DEFAULT_TEMPLATE_CONFIG = {
     "default_template": "strength_multihit",
     "option_card_scorer": {"mode": "shadow"},
+    "template_selection": {
+        "mode": "locked_after_warmup",
+        "warmup_card_rewards": 3,
+        "switch_margin": 1.0,
+        "switch_patience": 2,
+    },
     "templates": {
         "strength_multihit": {
             "enabled": True,
@@ -107,6 +113,9 @@ def _simple_yaml(path):
             data.setdefault(section, {})[key] = _parse_scalar(value)
             continue
         if section == "skip" and indent == 2:
+            data.setdefault(section, {})[key] = _parse_scalar(value)
+            continue
+        if section == "template_selection" and indent == 2:
             data.setdefault(section, {})[key] = _parse_scalar(value)
             continue
         if section == "templates":
@@ -233,6 +242,19 @@ def _add(score, reasons, amount, reason):
     return score
 
 
+def _add_component(breakdown, key, amount):
+    if abs(amount) > 1e-9:
+        breakdown[key] = round(float(breakdown.get(key, 0.0) + amount), 4)
+
+
+def _add_score(score, reasons, breakdown, key, amount, reason):
+    if abs(amount) > 1e-9:
+        score += amount
+        reasons.append(reason)
+        _add_component(breakdown, key, amount)
+    return score
+
+
 def score_card(state, deck_summary, card, template_id=None, config=None):
     """Score one candidate card for the current Ironclad deck context."""
     config = config or load_template_config()
@@ -243,70 +265,81 @@ def score_card(state, deck_summary, card, template_id=None, config=None):
     deck_size = max(_safe_int(deck_summary.get("deck_size"), 0), 0)
     score = 0.0
     reasons = []
+    breakdown = {
+        "base_power": 0.0,
+        "archetype_fit": 0.0,
+        "role_need": 0.0,
+        "synergy": 0.0,
+        "rarity_bonus": 0.0,
+        "cost_penalty": 0.0,
+        "duplicate_penalty": 0.0,
+        "deck_bloat_penalty": 0.0,
+    }
 
     if tags["type"] in ("curse", "status"):
-        score = _add(score, reasons, -4.0, "curse/status card")
+        score = _add_score(score, reasons, breakdown, "base_power", -4.0, "curse/status card")
 
     if ctx["act"] <= 1 and ctx["floor"] <= 8 and tags["damage"]:
-        score = _add(score, reasons, 1.4, "early damage")
+        score = _add_score(score, reasons, breakdown, "role_need", 1.4, "early damage")
     if deck_summary.get("damage_density", 0.0) < 0.32 and tags["damage"]:
-        score = _add(score, reasons, 1.0, "fills damage gap")
+        score = _add_score(score, reasons, breakdown, "role_need", 1.0, "fills damage gap")
     if deck_summary.get("block_density", 0.0) < 0.22 and tags["block"]:
-        score = _add(score, reasons, 1.1, "fills block gap")
+        score = _add_score(score, reasons, breakdown, "role_need", 1.1, "fills block gap")
     if deck_size >= 18 and deck_summary.get("draw_count", 0) < 2 and tags["draw"]:
-        score = _add(score, reasons, 1.1, "adds draw")
+        score = _add_score(score, reasons, breakdown, "role_need", 1.1, "adds draw")
     if (ctx["act"] >= 2 or ctx["floor"] >= 9) and tags["scaling"]:
-        score = _add(score, reasons, 0.9, "adds scaling")
+        score = _add_score(score, reasons, breakdown, "role_need", 0.9, "adds scaling")
     if deck_summary.get("vulnerable_sources", 0) < 1 and tags["vulnerable"]:
-        score = _add(score, reasons, 0.7, "adds vulnerable")
+        score = _add_score(score, reasons, breakdown, "role_need", 0.7, "adds vulnerable")
     if tags["aoe"] and deck_summary.get("aoe_count", 0) < 1:
-        score = _add(score, reasons, 0.7, "adds aoe")
+        score = _add_score(score, reasons, breakdown, "role_need", 0.7, "adds aoe")
 
     if template_id == "strength_multihit":
         if tags["strength"]:
-            score = _add(score, reasons, 1.9, "strength template payoff")
+            score = _add_score(score, reasons, breakdown, "archetype_fit", 1.9, "strength template payoff")
         if tags["multihit"]:
-            score = _add(score, reasons, 1.7, "multi-hit strength payoff")
+            score = _add_score(score, reasons, breakdown, "archetype_fit", 1.7, "multi-hit strength payoff")
         if tags["vulnerable"]:
-            score = _add(score, reasons, 0.7, "vulnerable burst setup")
+            score = _add_score(score, reasons, breakdown, "synergy", 0.7, "vulnerable burst setup")
     elif template_id == "barricade_block":
         if tags["block_payoff"]:
-            score = _add(score, reasons, 2.1, "block payoff")
+            score = _add_score(score, reasons, breakdown, "archetype_fit", 2.1, "block payoff")
         if tags["block"]:
-            score = _add(score, reasons, 1.2, "block package")
+            score = _add_score(score, reasons, breakdown, "archetype_fit", 1.2, "block package")
         if tags["damage"] and not tags["block_payoff"] and deck_size >= 16:
-            score = _add(score, reasons, -0.5, "off-template attack")
+            score = _add_score(score, reasons, breakdown, "archetype_fit", -0.5, "off-template attack")
     elif template_id == "exhaust_engine":
         if tags["exhaust_payoff"]:
-            score = _add(score, reasons, 2.1, "exhaust payoff")
+            score = _add_score(score, reasons, breakdown, "archetype_fit", 2.1, "exhaust payoff")
         if tags["exhaust"]:
-            score = _add(score, reasons, 1.3, "exhaust enabler")
+            score = _add_score(score, reasons, breakdown, "archetype_fit", 1.3, "exhaust enabler")
         if tags["draw"]:
-            score = _add(score, reasons, 0.8, "engine draw")
+            score = _add_score(score, reasons, breakdown, "synergy", 0.8, "engine draw")
         if tags["damage"] and not (tags["exhaust"] or tags["premium"]) and deck_size >= 16:
-            score = _add(score, reasons, -0.4, "low engine fit")
+            score = _add_score(score, reasons, breakdown, "archetype_fit", -0.4, "low engine fit")
     elif template_id == "self_damage_rupture":
         if tags["self_damage"]:
-            score = _add(score, reasons, 1.0, "self-damage package disabled by default")
+            score = _add_score(score, reasons, breakdown, "archetype_fit", 1.0, "self-damage package disabled by default")
 
     rarity = str((card or {}).get("rarity") or "").lower()
     if "rare" in rarity:
-        score = _add(score, reasons, 0.25, "rare card")
+        score = _add_score(score, reasons, breakdown, "rarity_bonus", 0.25, "rare card")
     elif "uncommon" in rarity:
-        score = _add(score, reasons, 0.1, "uncommon card")
+        score = _add_score(score, reasons, breakdown, "rarity_bonus", 0.1, "uncommon card")
 
     if tags["cost"] >= 3 and ctx["act"] <= 1 and ctx["floor"] <= 8:
-        score = _add(score, reasons, -0.7, "early high cost")
+        score = _add_score(score, reasons, breakdown, "cost_penalty", -0.7, "early high cost")
     elif tags["cost"] >= 3:
-        score = _add(score, reasons, -0.25, "high cost")
+        score = _add_score(score, reasons, breakdown, "cost_penalty", -0.25, "high cost")
     if deck_size >= 24 and not tags["premium"] and score < 1.2:
-        score = _add(score, reasons, -0.7, "deck bloat pressure")
+        score = _add_score(score, reasons, breakdown, "deck_bloat_penalty", -0.7, "deck bloat pressure")
     if deck_size >= 30 and not tags["premium"]:
-        score = _add(score, reasons, -0.5, "large deck")
+        score = _add_score(score, reasons, breakdown, "deck_bloat_penalty", -0.5, "large deck")
 
     return {
         "score": round(float(score), 4),
         "reasons": reasons[:5] or ["neutral fit"],
+        "score_breakdown": breakdown,
         "template_id": template_id,
         "tags": {key: value for key, value in tags.items() if isinstance(value, (bool, int, float, str))},
     }
@@ -320,41 +353,72 @@ def score_skip(state, deck_summary, card_scores, template_id=None, config=None):
     best = max(card_scores) if card_scores else 0.0
     score = -1.0
     reasons = ["default take bias"]
+    breakdown = {
+        "base_take_bias": -1.0,
+        "deck_bloat_bonus": 0.0,
+        "low_value_bonus": 0.0,
+        "template_coherence_bonus": 0.0,
+        "early_deck_penalty": 0.0,
+    }
     soft_size = _safe_int(skip_cfg.get("soft_deck_size"), 22)
     hard_size = _safe_int(skip_cfg.get("hard_deck_size"), 30)
     low_best = _safe_float(skip_cfg.get("low_best_score"), 0.5)
 
     if deck_size >= hard_size and best < 1.4:
         score += 2.5
+        _add_component(breakdown, "deck_bloat_bonus", 2.5)
         reasons.append("hard deck bloat")
     elif deck_size >= soft_size and best < low_best:
         score += 1.8
+        _add_component(breakdown, "deck_bloat_bonus", 1.8)
         reasons.append("weak candidates in large deck")
     elif deck_size >= soft_size:
         score += 0.5
+        _add_component(breakdown, "deck_bloat_bonus", 0.5)
         reasons.append("deck size caution")
+
+    if deck_size >= 24 and best < 1.0:
+        score += 1.0
+        _add_component(breakdown, "deck_bloat_bonus", 1.0)
+        reasons.append("large deck low card value")
+    if deck_size >= 26:
+        score += 0.8
+        _add_component(breakdown, "deck_bloat_bonus", 0.8)
+        reasons.append("deck size 26+")
 
     if best < 0.0:
         score += 1.1
+        _add_component(breakdown, "low_value_bonus", 1.1)
         reasons.append("all candidates harmful")
     elif best < low_best:
         score += 0.5
+        _add_component(breakdown, "low_value_bonus", 0.5)
         reasons.append("low best card score")
 
     consistency = archetype_consistency(deck_summary, config)
     if deck_size >= soft_size and consistency.get("consistency", 0.0) >= 0.65 and best < 1.0:
         score += 0.4
+        _add_component(breakdown, "template_coherence_bonus", 0.4)
         reasons.append("template already coherent")
 
     if ctx["act"] <= 1 and ctx["floor"] <= 8 and deck_size < 18:
         score -= 1.3
+        _add_component(breakdown, "early_deck_penalty", -1.3)
         reasons.append("early deck still needs cards")
 
     return {
         "score": round(float(score), 4),
         "reasons": reasons[:5],
+        "score_breakdown": breakdown,
         "template_id": template_id or select_template(deck_summary, config),
     }
+
+
+def confidence_gap_from_options(options):
+    scores = sorted([float(option.score) for option in options], reverse=True)
+    if len(scores) < 2:
+        return 0.0
+    return round(scores[0] - scores[1], 4)
 
 
 def build_card_reward_options(state, mode=None, template_id=None, config=None, deck_summary=None):
@@ -385,8 +449,11 @@ def build_card_reward_options(state, mode=None, template_id=None, config=None, d
                     "name": card.get("name") or card.get("card_name") or "",
                     "type": card.get("type") or "",
                     "rarity": card.get("rarity") or "",
+                    "cost": card.get("cost", 0),
+                    "index": index,
                 },
                 "tags": scored["tags"],
+                "score_breakdown": scored["score_breakdown"],
                 "template_id": template_id,
                 "scorer_version": CARD_SCORER_VERSION,
             },
@@ -406,6 +473,7 @@ def build_card_reward_options(state, mode=None, template_id=None, config=None, d
                 "template_id": template_id,
                 "scorer_version": CARD_SCORER_VERSION,
                 "skip": True,
+                "score_breakdown": skipped["score_breakdown"],
             },
             index=len(options),
         ))
@@ -422,6 +490,8 @@ def build_card_reward_options(state, mode=None, template_id=None, config=None, d
         state_features_version=STATE_FEATURES_VERSION,
         deck_summary=public_deck_summary(deck_summary),
         archetype_consistency=archetype_consistency(deck_summary, config),
+        confidence_gap=confidence_gap_from_options(ranked),
+        template_lock=dict((state or {}).get("_card_template_lock") or {}),
     )
 
 
