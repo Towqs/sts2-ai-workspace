@@ -170,6 +170,40 @@ template_selection:
 
 也就是说，前 3 次 card reward 允许自由判断构筑；之后锁定主模板。只有另一个模板连续 2 次超过当前模板且分差至少 1.0，才会切换。
 
+## Shadow 采集循环
+
+可以直接启动一个按 card reward shadow 条数停止的采集循环：
+
+```powershell
+.\.venv\Scripts\python.exe .\AI_Training\run_card_shadow_loop.py --target-events 50
+```
+
+默认不传 seed 时使用随机开局。需要固定 seed 时显式传入：
+
+```powershell
+.\.venv\Scripts\python.exe .\AI_Training\run_card_shadow_loop.py --target-events 50 --seed 101
+```
+
+这个循环会：
+
+```text
+1. 设置 policy_mode=current_rl。
+2. 设置 option_card_scorer.mode=shadow。
+3. 启动 AI 和 self-play。
+4. 统计本次启动后新增的 card_scorer shadow 事件。
+5. 达到 --target-events 后停止 self-play 和 AI。
+6. 生成本轮 shadow report。
+```
+
+常用参数：
+
+```text
+--target-events 50      达到多少条 card_reward shadow 事件后停止
+--seed 101              固定 seed；不传则随机
+--max-minutes 180       整个采集循环最长运行时间
+--keep-ai-running       达标后只停 self-play，不停 AI
+```
+
 ## PPO / Rollout 预留字段
 
 PPO v0 仍然保持原训练语义，但 rollout 记录已补齐后续 PPO v2 需要的字段：

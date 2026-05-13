@@ -214,6 +214,7 @@ DEFAULT_CONTROL = {
     "self_play_max_run_minutes": 75,
     "self_play_stall_seconds": 120,
     "self_play_game_speed_multiplier": 3.0,
+    "option_card_scorer": {"mode": "shadow"},
 }
 DEFAULT_LLM_CONFIG = {
     "enabled": False,
@@ -317,6 +318,10 @@ def update_control(patch):
                 data[key] = mode if mode in ("fixed", "random") else "fixed"
             elif key == "ppo_fixed_seed":
                 data[key] = str(patch[key] or "101").strip().upper() or "101"
+            elif key == "option_card_scorer":
+                setting = patch[key] if isinstance(patch[key], dict) else {"mode": patch[key]}
+                mode = str(setting.get("mode") or "shadow").strip().lower()
+                data[key] = {"mode": mode if mode in ("off", "shadow", "active") else "shadow"}
             elif key == "active_model_id":
                 data[key] = str(patch[key] or "local")
             elif key == "macro_card_reward_weight":

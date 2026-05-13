@@ -405,9 +405,15 @@ def render_report(summary, input_files, report_date):
 
 def analyze(args):
     input_files = resolve_input_files(args)
+    since_ms = safe_float(getattr(args, "since_ms", 0) or 0) or 0
     records = []
     for path in input_files:
-        records.extend(iter_jsonl(path))
+        for record in iter_jsonl(path):
+            if since_ms and not record.get("_error"):
+                timestamp = safe_float(record.get("timestamp"))
+                if timestamp is None or timestamp < since_ms:
+                    continue
+            records.append(record)
     summary = summarize_records(records)
     report_date = args.date or datetime.now().strftime("%Y-%m-%d")
     if args.report:
@@ -427,6 +433,7 @@ def main():
     parser.add_argument("--log-dir", default=str(DEFAULT_LOG_DIR))
     parser.add_argument("--report", nargs="?", const="auto", default="", help="Write Markdown report. Pass a path or omit value for auto path.")
     parser.add_argument("--report-dir", default=str(DEFAULT_REPORT_DIR))
+    parser.add_argument("--since-ms", type=float, default=0.0, help="Only include shadow records with timestamp >= this epoch millisecond value.")
     args = parser.parse_args()
     summary = analyze(args)
     print(json.dumps(summary["metrics"], ensure_ascii=False, indent=2, sort_keys=True))
