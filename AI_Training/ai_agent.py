@@ -24,6 +24,16 @@ from train_candidate_bc import CandidateBCScorer
 from macro_data_pipeline import Vocab as MacroVocab, encode_record as encode_macro_record
 from train_macro_bc import MacroBCModel
 from ppo_policy import PPO_INPUT_DIM, load_ppo_policy
+from state_encoder import STATE_FEATURES_VERSION
+from options.base import OPTION_FEATURES_VERSION, OPTION_SCHEMA_VERSION
+from options.cards import (
+    CARD_OPTION_FEATURES_VERSION,
+    CARD_SCORER_VERSION,
+    build_card_reward_options,
+    card_result_log_payload,
+    card_result_top_actions,
+    normalize_card_scorer_mode,
+)
 
 init(autoreset=True)
 
@@ -34,6 +44,7 @@ CONTROL_PATH = os.path.join(os.path.dirname(__file__), "control_state.json")
 AI_LOGIC_PATH = os.path.join(os.path.dirname(__file__), "ai_logic_state.json")
 AI_LOG_DIR = os.path.join(WORKSPACE_DIR, "RL_Datasets", "AI_Combat")
 PPO_LOG_DIR = os.path.join(WORKSPACE_DIR, "RL_Datasets", "PPO")
+OPTION_SHADOW_LOG_DIR = os.path.join(WORKSPACE_DIR, "RL_Datasets", "OptionShadow")
 
 DEFAULT_CONTROL = {
     "ai_enabled": True,
@@ -57,6 +68,7 @@ DEFAULT_CONTROL = {
     "policy_mode": "current_rl",
     "ppo_seed_mode": "fixed",
     "ppo_fixed_seed": "101",
+    "option_card_scorer": {"mode": "shadow"},
 }
 
 from train_bc import CombatBCModel
@@ -1962,6 +1974,81 @@ def public_deck_profile(profile):
     }
 
 
+def option_card_scorer_mode(control=None):
+    if control is None:
+        try:
+            control = load_control()
+        except Exception:
+            control = DEFAULT_CONTROL
+    setting = (control or {}).get("option_card_scorer", DEFAULT_CONTROL.get("option_card_scorer"))
+    return normalize_card_scorer_mode(setting)
+
+
+def build_shadow_card_result(state, mode=None):
+    mode = normalize_card_scorer_mode(mode or option_card_scorer_mode())
+    if mode == "off":
+        return mode, None, ""
+    try:
+        return mode, build_card_reward_options(state, mode=mode), ""
+    except Exception as exc:
+        return mode, None, str(exc)
+
+
+def card_scorer_info_payload(mode, result, error=""):
+    if mode == "off":
+        return {"mode": "off"}
+    payload = {
+        "mode": mode,
+        "scorer_version": CARD_SCORER_VERSION,
+        "option_schema": OPTION_SCHEMA_VERSION,
+        "state_features_version": STATE_FEATURES_VERSION,
+        "option_features_version": CARD_OPTION_FEATURES_VERSION,
+    }
+    if error:
+        payload["error"] = error
+    if result:
+        payload.update(card_result_log_payload(result, include_options=True))
+        payload["top_actions"] = card_result_top_actions(result)
+    return payload
+
+
+def active_card_scorer_choice(state, card_baseline_weight=1.0):
+    mode, result, error = build_shadow_card_result(state, mode="active")
+    if not result or not result.selected:
+        return None, {
+            "top_actions": [],
+            "chosen_action": None,
+            "payload": None,
+            "reason": f"card_scorer_active_unavailable: {error or 'no_options'}",
+            "deck_profile": {},
+            "reward_baseline": {
+                "mode": "card_scorer_active",
+                "weight": card_baseline_weight,
+                "error": error,
+            },
+            "card_scorer": card_scorer_info_payload(mode, result, error),
+        }
+    selected = result.selected
+    top_actions = card_result_top_actions(result)
+    return selected.payload, {
+        "top_actions": top_actions,
+        "chosen_action": selected.label,
+        "payload": selected.payload,
+        "reason": "card_scorer_active: " + (" / ".join(selected.reasons) or "highest score"),
+        "deck_profile": result.deck_summary,
+        "reward_baseline": {
+            "mode": "card_scorer_active",
+            "weight": card_baseline_weight,
+            "chosen_score": round(float(selected.score), 3),
+            "chosen_reason": selected.reasons,
+            "template_id": result.template_id,
+            "archetype_consistency": result.archetype_consistency,
+        },
+        "card_scorer": card_scorer_info_payload(mode, result, error),
+        "archetype_consistency": result.archetype_consistency,
+    }
+
+
 def score_reward_card(card, profile, state):
     traits = card_traits(card)
     run = state.get("run") or {}
@@ -2098,6 +2185,11 @@ def card_reward_baseline_entries(state):
 
 
 def choose_card_reward_baseline_action(state, card_baseline_weight=1.0):
+    scorer_mode = option_card_scorer_mode()
+    if scorer_mode == "active":
+        return active_card_scorer_choice(state, card_baseline_weight=card_baseline_weight)
+    shadow_mode, shadow_result, shadow_error = build_shadow_card_result(state, mode=scorer_mode)
+    shadow_info = card_scorer_info_payload(shadow_mode, shadow_result, shadow_error)
     entries, profile = card_reward_baseline_entries(state)
     if not entries:
         return None, {
@@ -2106,7 +2198,13 @@ def choose_card_reward_baseline_action(state, card_baseline_weight=1.0):
             "payload": None,
             "reason": "no_card_reward_options",
             "deck_profile": public_deck_profile(profile),
-            "reward_baseline": {"mode": "baseline_only", "weight": card_baseline_weight},
+            "reward_baseline": {
+                "mode": "baseline_only",
+                "weight": card_baseline_weight,
+                "card_scorer_mode": scorer_mode,
+            },
+            "card_scorer": shadow_info,
+            "archetype_consistency": (shadow_info or {}).get("archetype_consistency"),
         }
     entries.sort(key=lambda item: item["score"], reverse=True)
     best = entries[0]
@@ -2129,7 +2227,10 @@ def choose_card_reward_baseline_action(state, card_baseline_weight=1.0):
             "weight": card_baseline_weight,
             "chosen_score": best["score"],
             "chosen_reason": best["reasons"],
+            "card_scorer_mode": scorer_mode,
         },
+        "card_scorer": shadow_info,
+        "archetype_consistency": (shadow_info or {}).get("archetype_consistency"),
     }
 
 
@@ -2935,6 +3036,11 @@ def choose_shop_rule_action(state, state_type, exploration=None):
 
 
 def choose_card_reward_mixed_action(macro_agent, state, outputs, probs, card_baseline_weight, exploration=None):
+    scorer_mode = option_card_scorer_mode()
+    if scorer_mode == "active":
+        return choose_card_reward_baseline_action(state, card_baseline_weight)
+    shadow_mode, shadow_result, shadow_error = build_shadow_card_result(state, mode=scorer_mode)
+    shadow_info = card_scorer_info_payload(shadow_mode, shadow_result, shadow_error)
     baseline_entries, profile = card_reward_baseline_entries(state)
     baseline_by_label = {entry["label"]: entry for entry in baseline_entries}
     baseline_by_payload = {json.dumps(entry["payload"], sort_keys=True): entry for entry in baseline_entries}
@@ -3003,7 +3109,10 @@ def choose_card_reward_mixed_action(macro_agent, state, outputs, probs, card_bas
             "chosen_score": round(best["baseline_score"], 3),
             "chosen_mixed_score": round(best["adjusted"], 3),
             "chosen_reason": best["reasons"],
+            "card_scorer_mode": scorer_mode,
         },
+        "card_scorer": shadow_info,
+        "archetype_consistency": (shadow_info or {}).get("archetype_consistency"),
     }
 
 
@@ -4114,27 +4223,41 @@ def append_ppo_rollout(session_id, mode, state_before, state_after, payload, ok,
     os.makedirs(PPO_LOG_DIR, exist_ok=True)
     path = os.path.join(PPO_LOG_DIR, f"ppo_rollouts_{datetime.now():%Y-%m-%d}.jsonl")
     run = (state_before or {}).get("run") or {}
+    state_type = (state_before or {}).get("state_type")
     reward_terms = ppo_combat_reward_terms(state_before, state_after, ok, payload)
     reward = ppo_step_reward(state_before, state_after, ok, payload)
+    old_logprob = float(ppo_decision.get("logprob", 0.0))
+    old_value = float(ppo_decision.get("value", 0.0))
     record = {
         "type": "ppo_step",
         "timestamp": int(time.time() * 1000),
         "run_id": session_id,
+        "episode_id": session_id,
         "seed": str((state_before or {}).get("seed") or run.get("seed") or ""),
         "act": safe_int(run.get("act"), 0),
         "floor": safe_int(run.get("floor"), 0),
-        "state_type": (state_before or {}).get("state_type"),
+        "state_type": state_type,
+        "screen_type": state_type,
         "policy_mode": mode,
+        "policy_version": str(ppo_decision.get("policy_version") or behavior_policy or mode),
         "behavior_policy": behavior_policy,
         "reward_schema": "ironclad_v1",
+        "option_schema": OPTION_SCHEMA_VERSION,
+        "state_features_version": STATE_FEATURES_VERSION,
+        "option_features_version": OPTION_FEATURES_VERSION,
         "ok": bool(ok),
         "action": payload,
         "chosen_index": int(chosen_index),
-        "logprob": float(ppo_decision.get("logprob", 0.0)),
-        "value": float(ppo_decision.get("value", 0.0)),
+        "action_index": int(chosen_index),
+        "logprob": old_logprob,
+        "value": old_value,
+        "old_logprob": old_logprob,
+        "old_value": old_value,
         "reward": reward,
         "reward_terms": reward_terms,
         "done": False,
+        "truncated": False,
+        "legal_option_count": int(len(candidates)),
         "features": features,
         "candidates": [
             {
@@ -4152,6 +4275,84 @@ def append_ppo_rollout(session_id, mode, state_before, state_after, payload, ok,
             f.write(json.dumps(record, ensure_ascii=True) + "\n")
     except Exception as exc:
         print(Fore.YELLOW + f"[PPO] rollout write failed: {exc}")
+
+
+def score_distribution(values):
+    finite = []
+    for value in values:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(number):
+            finite.append(number)
+    if not finite:
+        return {"count": 0, "mean": 0.0, "variance": 0.0, "min": 0.0, "max": 0.0}
+    mean = sum(finite) / len(finite)
+    variance = sum((value - mean) ** 2 for value in finite) / len(finite)
+    return {
+        "count": len(finite),
+        "mean": round(mean, 4),
+        "variance": round(variance, 4),
+        "min": round(min(finite), 4),
+        "max": round(max(finite), 4),
+    }
+
+
+def append_card_scorer_shadow_log(session_id, state, actual_payload, macro_info, behavior_policy):
+    scorer = (macro_info or {}).get("card_scorer")
+    if not isinstance(scorer, dict) or scorer.get("mode") == "off":
+        return
+    options = scorer.get("options") or []
+    selected = scorer.get("selected") or {}
+    run = (state or {}).get("run") or {}
+    scores = [
+        safe_num(option.get("score"), 0.0)
+        for option in options
+        if isinstance(option, dict)
+    ]
+    record = {
+        "type": "card_scorer_shadow",
+        "timestamp": int(time.time() * 1000),
+        "run_id": session_id,
+        "episode_id": session_id,
+        "seed": str((state or {}).get("seed") or run.get("seed") or ""),
+        "act": safe_int(run.get("act"), 0),
+        "floor": safe_int(run.get("floor"), 0),
+        "screen_type": "card_reward",
+        "behavior_policy": behavior_policy,
+        "actual_payload": actual_payload,
+        "actual_action": (actual_payload or {}).get("action"),
+        "actual_skip": (actual_payload or {}).get("action") == "skip_card_reward",
+        "legacy_chosen_action": (macro_info or {}).get("chosen_action"),
+        "recommended_action": selected.get("label"),
+        "recommended_payload": selected.get("payload"),
+        "skip_recommended": selected.get("label") == "skip_reward",
+        "skip_available": any(
+            (option or {}).get("label") == "skip_reward"
+            for option in options
+            if isinstance(option, dict)
+        ),
+        "legal_option_count": scorer.get("legal_option_count", len(options)),
+        "option_schema": scorer.get("option_schema", OPTION_SCHEMA_VERSION),
+        "state_features_version": scorer.get("state_features_version", STATE_FEATURES_VERSION),
+        "option_features_version": scorer.get("option_features_version", CARD_OPTION_FEATURES_VERSION),
+        "template_id": scorer.get("template_id"),
+        "archetype_consistency": scorer.get("archetype_consistency"),
+        "deck_summary": scorer.get("deck_summary"),
+        "score_distribution": score_distribution(scores),
+        "reward_terms": {},
+        "reward_term_distribution": {},
+        "selected": selected,
+        "options": options,
+    }
+    try:
+        os.makedirs(OPTION_SHADOW_LOG_DIR, exist_ok=True)
+        path = os.path.join(OPTION_SHADOW_LOG_DIR, f"card_scorer_{datetime.now():%Y-%m-%d}.jsonl")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=True) + "\n")
+    except Exception as exc:
+        print(Fore.YELLOW + f"[CardScorer] shadow log write failed: {exc}")
 
 
 def get_enemy_hp(enemy):
@@ -4689,13 +4890,23 @@ def run_agent():
                     "signature": macro_state_signature(state),
                     "payload": payload,
                 }, sort_keys=True, ensure_ascii=False)
+                snapshot_policy_name = current_policy_mode if current_policy_mode in ("ppo_experiment", "ppo_best") and ppo_agent and ppo_agent.get("trained") else macro_policy_name
+                snapshot_model_version = ppo_model_version if current_policy_mode in ("ppo_experiment", "ppo_best") and ppo_agent and ppo_agent.get("trained") else macro_model_version
+                if state_type == "card_reward":
+                    append_card_scorer_shadow_log(
+                        session_id,
+                        state,
+                        payload,
+                        macro_info,
+                        snapshot_policy_name,
+                    )
                 write_ai_logic_snapshot({
                     "timestamp": int(time.time() * 1000),
                     "session_id": session_id,
                     "state_type": state_type,
                     "mode": "macro",
-                    "policy_name": current_policy_mode if current_policy_mode in ("ppo_experiment", "ppo_best") and ppo_agent and ppo_agent.get("trained") else macro_policy_name,
-                    "model_version": ppo_model_version if current_policy_mode in ("ppo_experiment", "ppo_best") and ppo_agent and ppo_agent.get("trained") else macro_model_version,
+                    "policy_name": snapshot_policy_name,
+                    "model_version": snapshot_model_version,
                     "top_actions": macro_info.get("top_actions", []),
                     "chosen_action": macro_info.get("chosen_action"),
                     "payload": payload,
@@ -4703,6 +4914,8 @@ def run_agent():
                     "constraint_mode": constraint_mode,
                     "deck_profile": macro_info.get("deck_profile"),
                     "reward_baseline": macro_info.get("reward_baseline"),
+                    "card_scorer": macro_info.get("card_scorer"),
+                    "archetype_consistency": macro_info.get("archetype_consistency"),
                     "exploration": exploration,
                 })
                 now_ts = time.time()

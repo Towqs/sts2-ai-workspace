@@ -1,0 +1,447 @@
+from __future__ import annotations
+
+import copy
+import math
+from pathlib import Path
+
+from deck_summary import build_deck_summary, classify_card, public_deck_summary
+from options.base import OPTION_FEATURES_VERSION, OPTION_SCHEMA_VERSION, Option, OptionResult, ranked_options
+from state_encoder import STATE_FEATURES_VERSION
+
+
+CARD_OPTION_FEATURES_VERSION = "card_option_features_v1"
+CARD_SCORER_VERSION = "ironclad_card_scorer_v1"
+
+
+DEFAULT_TEMPLATE_CONFIG = {
+    "default_template": "strength_multihit",
+    "option_card_scorer": {"mode": "shadow"},
+    "templates": {
+        "strength_multihit": {
+            "enabled": True,
+            "description": "Strength plus multi-hit attacks.",
+        },
+        "barricade_block": {
+            "enabled": True,
+            "description": "Block scaling plus Body Slam style payoffs.",
+        },
+        "exhaust_engine": {
+            "enabled": True,
+            "description": "Exhaust, draw, and defensive engine payoffs.",
+        },
+        "self_damage_rupture": {
+            "enabled": False,
+            "description": "Self-damage growth package; disabled in phase 1.",
+        },
+    },
+    "skip": {
+        "soft_deck_size": 22,
+        "hard_deck_size": 30,
+        "low_best_score": 0.5,
+    },
+}
+
+
+def default_config_path():
+    return Path(__file__).resolve().parents[1] / "configs" / "archetype_templates.yaml"
+
+
+def _parse_scalar(value):
+    text = str(value).strip()
+    lowered = text.lower()
+    if lowered in ("true", "yes", "on"):
+        return True
+    if lowered in ("false", "no", "off"):
+        return False
+    if lowered in ("null", "none", "~"):
+        return None
+    try:
+        if "." in text:
+            return float(text)
+        return int(text)
+    except ValueError:
+        return text.strip("\"'")
+
+
+def _deep_merge(base, override):
+    for key, value in (override or {}).items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _deep_merge(base[key], value)
+        else:
+            base[key] = value
+    return base
+
+
+def _simple_yaml(path):
+    data = {}
+    section = None
+    current_template = None
+    current_nested = None
+    try:
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return data
+
+    for raw in lines:
+        line = raw.split("#", 1)[0].rstrip()
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        text = line.strip()
+        if ":" not in text:
+            continue
+        key, value = text.split(":", 1)
+        key = key.strip()
+        value = value.strip()
+        if indent == 0:
+            current_template = None
+            current_nested = None
+            if value:
+                data[key] = _parse_scalar(value)
+                section = None
+            else:
+                section = key
+                data.setdefault(section, {})
+            continue
+        if section == "option_card_scorer" and indent == 2:
+            data.setdefault(section, {})[key] = _parse_scalar(value)
+            continue
+        if section == "skip" and indent == 2:
+            data.setdefault(section, {})[key] = _parse_scalar(value)
+            continue
+        if section == "templates":
+            templates = data.setdefault("templates", {})
+            if indent == 2 and not value:
+                current_template = key
+                current_nested = None
+                templates.setdefault(current_template, {})
+                continue
+            if indent == 4 and current_template:
+                if value:
+                    templates.setdefault(current_template, {})[key] = _parse_scalar(value)
+                    current_nested = None
+                else:
+                    current_nested = key
+                    templates.setdefault(current_template, {}).setdefault(current_nested, {})
+                continue
+            if indent == 6 and current_template and current_nested:
+                templates[current_template][current_nested][key] = _parse_scalar(value)
+    return data
+
+
+def load_template_config(path=None):
+    config = copy.deepcopy(DEFAULT_TEMPLATE_CONFIG)
+    path = Path(path) if path else default_config_path()
+    if not path.exists():
+        return config
+    try:
+        import yaml  # type: ignore
+
+        loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        loaded = _simple_yaml(path)
+    if isinstance(loaded, dict):
+        _deep_merge(config, loaded)
+    return config
+
+
+def normalize_card_scorer_mode(value):
+    if isinstance(value, dict):
+        value = value.get("mode")
+    text = str(value or "shadow").strip().lower()
+    return text if text in ("off", "shadow", "active") else "shadow"
+
+
+def enabled_templates(config=None):
+    config = config or load_template_config()
+    templates = config.get("templates") or {}
+    return [
+        template_id
+        for template_id, item in templates.items()
+        if isinstance(item, dict) and bool(item.get("enabled", False))
+    ]
+
+
+def archetype_consistency(deck_summary, config=None):
+    config = config or load_template_config()
+    allowed = set(enabled_templates(config))
+    raw_scores = (deck_summary or {}).get("archetype_scores") or {}
+    scores = {
+        key: round(float(max(raw_scores.get(key, 0.0), 0.0)), 4)
+        for key in allowed
+    }
+    if not scores:
+        return {"selected": "", "score": 0.0, "consistency": 0.0, "scores": {}}
+    selected, score = max(scores.items(), key=lambda item: item[1])
+    total = sum(scores.values())
+    consistency = float(score / total) if total > 1e-9 else 0.0
+    return {
+        "selected": selected,
+        "score": round(score, 4),
+        "consistency": round(consistency, 4),
+        "scores": scores,
+    }
+
+
+def select_template(deck_summary, config=None, preferred=None):
+    config = config or load_template_config()
+    allowed = enabled_templates(config)
+    if preferred in allowed:
+        return preferred
+    consistency = archetype_consistency(deck_summary, config)
+    selected = consistency.get("selected")
+    if selected and consistency.get("score", 0.0) >= 1.0:
+        return selected
+    default_template = str(config.get("default_template") or "strength_multihit")
+    if default_template in allowed:
+        return default_template
+    return allowed[0] if allowed else default_template
+
+
+def _safe_float(value, default=0.0):
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return default
+    return result if math.isfinite(result) else default
+
+
+def _safe_int(value, default=0):
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _run_context(state):
+    state = state if isinstance(state, dict) else {}
+    run = state.get("run") if isinstance(state.get("run"), dict) else {}
+    player = state.get("player") if isinstance(state.get("player"), dict) else {}
+    hp = _safe_float(player.get("hp"), 0.0)
+    max_hp = max(_safe_float(player.get("max_hp"), 1.0), 1.0)
+    return {
+        "act": _safe_int(run.get("act", state.get("act")), 1),
+        "floor": _safe_int(run.get("floor", state.get("floor")), 0),
+        "hp_ratio": hp / max_hp,
+    }
+
+
+def _add(score, reasons, amount, reason):
+    if abs(amount) > 1e-9:
+        score += amount
+        reasons.append(reason)
+    return score
+
+
+def score_card(state, deck_summary, card, template_id=None, config=None):
+    """Score one candidate card for the current Ironclad deck context."""
+    config = config or load_template_config()
+    deck_summary = deck_summary or build_deck_summary(state)
+    template_id = template_id or select_template(deck_summary, config)
+    tags = classify_card(card)
+    ctx = _run_context(state)
+    deck_size = max(_safe_int(deck_summary.get("deck_size"), 0), 0)
+    score = 0.0
+    reasons = []
+
+    if tags["type"] in ("curse", "status"):
+        score = _add(score, reasons, -4.0, "curse/status card")
+
+    if ctx["act"] <= 1 and ctx["floor"] <= 8 and tags["damage"]:
+        score = _add(score, reasons, 1.4, "early damage")
+    if deck_summary.get("damage_density", 0.0) < 0.32 and tags["damage"]:
+        score = _add(score, reasons, 1.0, "fills damage gap")
+    if deck_summary.get("block_density", 0.0) < 0.22 and tags["block"]:
+        score = _add(score, reasons, 1.1, "fills block gap")
+    if deck_size >= 18 and deck_summary.get("draw_count", 0) < 2 and tags["draw"]:
+        score = _add(score, reasons, 1.1, "adds draw")
+    if (ctx["act"] >= 2 or ctx["floor"] >= 9) and tags["scaling"]:
+        score = _add(score, reasons, 0.9, "adds scaling")
+    if deck_summary.get("vulnerable_sources", 0) < 1 and tags["vulnerable"]:
+        score = _add(score, reasons, 0.7, "adds vulnerable")
+    if tags["aoe"] and deck_summary.get("aoe_count", 0) < 1:
+        score = _add(score, reasons, 0.7, "adds aoe")
+
+    if template_id == "strength_multihit":
+        if tags["strength"]:
+            score = _add(score, reasons, 1.9, "strength template payoff")
+        if tags["multihit"]:
+            score = _add(score, reasons, 1.7, "multi-hit strength payoff")
+        if tags["vulnerable"]:
+            score = _add(score, reasons, 0.7, "vulnerable burst setup")
+    elif template_id == "barricade_block":
+        if tags["block_payoff"]:
+            score = _add(score, reasons, 2.1, "block payoff")
+        if tags["block"]:
+            score = _add(score, reasons, 1.2, "block package")
+        if tags["damage"] and not tags["block_payoff"] and deck_size >= 16:
+            score = _add(score, reasons, -0.5, "off-template attack")
+    elif template_id == "exhaust_engine":
+        if tags["exhaust_payoff"]:
+            score = _add(score, reasons, 2.1, "exhaust payoff")
+        if tags["exhaust"]:
+            score = _add(score, reasons, 1.3, "exhaust enabler")
+        if tags["draw"]:
+            score = _add(score, reasons, 0.8, "engine draw")
+        if tags["damage"] and not (tags["exhaust"] or tags["premium"]) and deck_size >= 16:
+            score = _add(score, reasons, -0.4, "low engine fit")
+    elif template_id == "self_damage_rupture":
+        if tags["self_damage"]:
+            score = _add(score, reasons, 1.0, "self-damage package disabled by default")
+
+    rarity = str((card or {}).get("rarity") or "").lower()
+    if "rare" in rarity:
+        score = _add(score, reasons, 0.25, "rare card")
+    elif "uncommon" in rarity:
+        score = _add(score, reasons, 0.1, "uncommon card")
+
+    if tags["cost"] >= 3 and ctx["act"] <= 1 and ctx["floor"] <= 8:
+        score = _add(score, reasons, -0.7, "early high cost")
+    elif tags["cost"] >= 3:
+        score = _add(score, reasons, -0.25, "high cost")
+    if deck_size >= 24 and not tags["premium"] and score < 1.2:
+        score = _add(score, reasons, -0.7, "deck bloat pressure")
+    if deck_size >= 30 and not tags["premium"]:
+        score = _add(score, reasons, -0.5, "large deck")
+
+    return {
+        "score": round(float(score), 4),
+        "reasons": reasons[:5] or ["neutral fit"],
+        "template_id": template_id,
+        "tags": {key: value for key, value in tags.items() if isinstance(value, (bool, int, float, str))},
+    }
+
+
+def score_skip(state, deck_summary, card_scores, template_id=None, config=None):
+    config = config or load_template_config()
+    skip_cfg = config.get("skip") or {}
+    ctx = _run_context(state)
+    deck_size = _safe_int((deck_summary or {}).get("deck_size"), 0)
+    best = max(card_scores) if card_scores else 0.0
+    score = -1.0
+    reasons = ["default take bias"]
+    soft_size = _safe_int(skip_cfg.get("soft_deck_size"), 22)
+    hard_size = _safe_int(skip_cfg.get("hard_deck_size"), 30)
+    low_best = _safe_float(skip_cfg.get("low_best_score"), 0.5)
+
+    if deck_size >= hard_size and best < 1.4:
+        score += 2.5
+        reasons.append("hard deck bloat")
+    elif deck_size >= soft_size and best < low_best:
+        score += 1.8
+        reasons.append("weak candidates in large deck")
+    elif deck_size >= soft_size:
+        score += 0.5
+        reasons.append("deck size caution")
+
+    if best < 0.0:
+        score += 1.1
+        reasons.append("all candidates harmful")
+    elif best < low_best:
+        score += 0.5
+        reasons.append("low best card score")
+
+    consistency = archetype_consistency(deck_summary, config)
+    if deck_size >= soft_size and consistency.get("consistency", 0.0) >= 0.65 and best < 1.0:
+        score += 0.4
+        reasons.append("template already coherent")
+
+    if ctx["act"] <= 1 and ctx["floor"] <= 8 and deck_size < 18:
+        score -= 1.3
+        reasons.append("early deck still needs cards")
+
+    return {
+        "score": round(float(score), 4),
+        "reasons": reasons[:5],
+        "template_id": template_id or select_template(deck_summary, config),
+    }
+
+
+def build_card_reward_options(state, mode=None, template_id=None, config=None, deck_summary=None):
+    config = config or load_template_config()
+    mode = normalize_card_scorer_mode(mode if mode is not None else (config.get("option_card_scorer") or {}).get("mode"))
+    deck_summary = deck_summary or build_deck_summary(state)
+    template_id = select_template(deck_summary, config, preferred=template_id)
+    card_reward = (state or {}).get("card_reward") if isinstance(state, dict) else {}
+    cards = (card_reward or {}).get("cards") or []
+    options = []
+    card_scores = []
+    for fallback_index, card in enumerate(cards):
+        if not isinstance(card, dict):
+            continue
+        index = _safe_int(card.get("index"), fallback_index)
+        scored = score_card(state, deck_summary, card, template_id=template_id, config=config)
+        card_scores.append(scored["score"])
+        options.append(Option(
+            label=f"choose_card:index_{index}",
+            payload={"action": "select_card_reward", "card_index": index},
+            kind="card_reward",
+            score=scored["score"],
+            reasons=scored["reasons"],
+            features=[],
+            metadata={
+                "card": {
+                    "id": card.get("id") or card.get("card_id") or "",
+                    "name": card.get("name") or card.get("card_name") or "",
+                    "type": card.get("type") or "",
+                    "rarity": card.get("rarity") or "",
+                },
+                "tags": scored["tags"],
+                "template_id": template_id,
+                "scorer_version": CARD_SCORER_VERSION,
+            },
+            index=index,
+        ))
+
+    if (card_reward or {}).get("can_skip"):
+        skipped = score_skip(state, deck_summary, card_scores, template_id=template_id, config=config)
+        options.append(Option(
+            label="skip_reward",
+            payload={"action": "skip_card_reward"},
+            kind="card_reward",
+            score=skipped["score"],
+            reasons=skipped["reasons"],
+            features=[],
+            metadata={
+                "template_id": template_id,
+                "scorer_version": CARD_SCORER_VERSION,
+                "skip": True,
+            },
+            index=len(options),
+        ))
+
+    ranked = ranked_options(options)
+    selected = ranked[0] if ranked else None
+    return OptionResult(
+        options=ranked,
+        selected=selected,
+        mode=mode,
+        template_id=template_id,
+        option_schema=OPTION_SCHEMA_VERSION,
+        option_features_version=CARD_OPTION_FEATURES_VERSION,
+        state_features_version=STATE_FEATURES_VERSION,
+        deck_summary=public_deck_summary(deck_summary),
+        archetype_consistency=archetype_consistency(deck_summary, config),
+    )
+
+
+def card_result_top_actions(result, limit=6):
+    if not result:
+        return []
+    actions = []
+    for option in result.options[:limit]:
+        actions.append({
+            "action": option.label,
+            "confidence": round(max(float(option.score), 0.0) * 20.0, 2),
+            "marker": f"shadow_score={option.score:+.2f}; {' / '.join(option.reasons) or '-'}",
+        })
+    return actions
+
+
+def card_result_log_payload(result, include_options=True):
+    if not result:
+        return {}
+    data = result.to_dict(include_features=False)
+    if not include_options:
+        data.pop("options", None)
+    return data

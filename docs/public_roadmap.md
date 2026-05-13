@@ -11,6 +11,7 @@
 | 数据采集 | 已跑通 | 支持人类/AI/LLM 日志采集 |
 | 战斗 BC / 候选动作 | 初版可用 | 候选动作评分已经接入线上策略，仍是 baseline |
 | 宏观 BC | 初版可用 | 样本更少，需要更多路线和奖励数据 |
+| Ironclad 选牌 Shadow Mode | 已接入 | 对 card reward 的每张牌和 skip 打分，默认 shadow 记录，不接管旧策略 |
 | 自训练 | 初版可用 | 支持固定 seed、探索参数、run 评分和入训门槛 |
 | Phase 2A 微调 | 已接入 | 用 admitted self-play run 做 reward-weighted 候选动作微调；无合格 run 时安全跳过 |
 | LLM 接入 | 初版可用 | 适合建议和受约束执行，不应自由构造动作 |
@@ -25,6 +26,7 @@
 | P1 | 数据质量 | run 体检、数据标签、坏数据过滤、self-play 入训/拒绝原因 |
 | P2 | 战斗策略 | 候选动作评分、药水使用、危险回合兜底、Phase 2A 微调 |
 | P3 | 宏观策略 | 路线、奖励、事件、营火和商店策略 |
+| P3a | 战士选牌 | deck summary、三套构筑模板、skip 评分和 shadow/active 切换 |
 | P4 | 评测闭环 | Act1 Boss 通过率、死亡楼层、失败原因、固定 seed 回归 |
 | P5 | 模型能力 | 更好的 BC、偏好数据、seed 池、后续 PPO/Actor-Critic 实验 |
 

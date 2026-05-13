@@ -20,6 +20,7 @@ STS2 AI Workspace 是一个面向 **Slay the Spire 2** 的本地 AI 工作区。
 | 网页控制台 | 已可用，地址为 `http://127.0.0.1:8765/`。 |
 | 战斗 AI | 初版可用，支持战斗出牌和候选动作评分。 |
 | 宏观 AI | 初版可用，支持地图、奖励、选卡、事件和营火；商店购买默认保护。 |
+| Ironclad 选牌 Shadow Mode | 已接入战士选牌 option-scoring 对照模式，默认只记录评分和推荐动作，不接管旧策略。 |
 | 训练数据采集 | 支持 Human / AI / LLM 来源，按 run_id 汇总和体检。 |
 | 数据重构与训练 | 支持战斗 BC、候选动作 BC、宏观 BC。 |
 | 自训练 | 已支持固定 seed、自训练 run 评分、入训门槛和按批次触发训练。 |
@@ -228,6 +229,7 @@ AI_Training/ModelZoo/demo_local_20260430/
 - [`docs/startup.md`](docs/startup.md)：一键启动脚本说明。
 - [`docs/data_contribution.md`](docs/data_contribution.md)：如何打包数据并提交给维护者。
 - [`docs/public_roadmap.md`](docs/public_roadmap.md)：公开路线图。
+- [`docs/ironclad_card_scorer_shadow.md`](docs/ironclad_card_scorer_shadow.md)：战士选牌 shadow mode、模板配置和日志字段。
 - [`docs/monster_data.md`](docs/monster_data.md)：怪物数据采集和后续用途。
 - [`AI_Training/ModelZoo/README.md`](AI_Training/ModelZoo/README.md)：模型包结构和切换说明。
 

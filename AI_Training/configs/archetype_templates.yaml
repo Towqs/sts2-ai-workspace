@@ -1,0 +1,23 @@
+default_template: strength_multihit
+
+option_card_scorer:
+  mode: shadow
+
+templates:
+  strength_multihit:
+    enabled: true
+    description: Strength plus multi-hit attacks.
+  barricade_block:
+    enabled: true
+    description: Block scaling plus Body Slam style payoffs.
+  exhaust_engine:
+    enabled: true
+    description: Exhaust, draw, and defensive engine payoffs.
+  self_damage_rupture:
+    enabled: false
+    description: Self-damage growth package; disabled in phase 1.
+
+skip:
+  soft_deck_size: 22
+  hard_deck_size: 30
+  low_best_score: 0.5
