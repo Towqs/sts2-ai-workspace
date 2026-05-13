@@ -5,6 +5,7 @@ import random
 import time
 import uuid
 import re
+import traceback
 from datetime import datetime
 import requests
 import torch
@@ -22,6 +23,7 @@ from data_pipeline import StateEncoder
 from train_candidate_bc import CandidateBCScorer
 from macro_data_pipeline import Vocab as MacroVocab, encode_record as encode_macro_record
 from train_macro_bc import MacroBCModel
+from ppo_policy import PPO_INPUT_DIM, load_ppo_policy
 
 init(autoreset=True)
 
@@ -31,6 +33,7 @@ WORKSPACE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONTROL_PATH = os.path.join(os.path.dirname(__file__), "control_state.json")
 AI_LOGIC_PATH = os.path.join(os.path.dirname(__file__), "ai_logic_state.json")
 AI_LOG_DIR = os.path.join(WORKSPACE_DIR, "RL_Datasets", "AI_Combat")
+PPO_LOG_DIR = os.path.join(WORKSPACE_DIR, "RL_Datasets", "PPO")
 
 DEFAULT_CONTROL = {
     "ai_enabled": True,
@@ -46,10 +49,14 @@ DEFAULT_CONTROL = {
     "ai_require_no_invalid_actions": True,
     "exploration_enabled": False,
     "exploration_mode": "aggressive",
+    "self_play_constraint_mode": "explore",
     "combat_exploration_epsilon": 0.35,
     "macro_exploration_epsilon": 0.25,
     "exploration_top_k": 5,
     "exploration_temperature": 1.35,
+    "policy_mode": "current_rl",
+    "ppo_seed_mode": "fixed",
+    "ppo_fixed_seed": "101",
 }
 
 from train_bc import CombatBCModel
@@ -88,7 +95,21 @@ def load_agent(processed_dir):
     input_dim = int(metadata.get("features") or weight_input_dim)
     if input_dim != weight_input_dim:
         input_dim = weight_input_dim
-    output_dim = len(vocab['actions'])
+    vocab_output_dim = len(vocab['actions'])
+    weight_output_dim = int(state_dict.get("net.5.weight").shape[0])
+    output_dim = vocab_output_dim
+    if vocab_output_dim != weight_output_dim:
+        output_dim = weight_output_dim
+        id_to_action = {idx: action for idx, action in id_to_action.items() if idx < output_dim}
+        metadata["action_space_mismatch"] = {
+            "vocab_actions": int(vocab_output_dim),
+            "checkpoint_actions": int(weight_output_dim),
+        }
+        print(
+            Fore.YELLOW
+            + f"[CombatBC] Vocab has {vocab_output_dim} actions but checkpoint has {weight_output_dim}. "
+            + "Using checkpoint action space; retrain combat BC to include newer actions."
+        )
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = CombatBCModel(input_dim, output_dim).to(device)
@@ -100,8 +121,16 @@ def load_agent(processed_dir):
 
 
 def load_candidate_agent(processed_dir):
-    model_path = os.path.join(processed_dir, "candidate_bc_model_best.pth")
-    metadata_path = os.path.join(processed_dir, "candidate_metadata.json")
+    rl_model_path = os.path.join(processed_dir, "candidate_rl_model_best.pth")
+    rl_metadata_path = os.path.join(processed_dir, "candidate_rl_metadata.json")
+    if os.path.exists(rl_model_path):
+        model_path = rl_model_path
+        metadata_path = rl_metadata_path
+        model_prefix = "candidate_rl"
+    else:
+        model_path = os.path.join(processed_dir, "candidate_bc_model_best.pth")
+        metadata_path = os.path.join(processed_dir, "candidate_metadata.json")
+        model_prefix = "candidate_bc"
     if not os.path.exists(model_path):
         print(Fore.YELLOW + "[Candidate] Candidate scorer not found. Falling back to legacy combat BC.")
         return None
@@ -126,8 +155,8 @@ def load_candidate_agent(processed_dir):
         model = CandidateBCScorer(input_dim).to(device)
         model.load_state_dict(state_dict)
         model.eval()
-        metadata["model_version"] = metadata.get("model_version") or build_model_version("candidate_bc", metadata_path, metadata)
-        print(Fore.CYAN + f"[*] Candidate Scorer Loaded! Features: {input_dim} | Device: {device}")
+        metadata["model_version"] = metadata.get("model_version") or build_model_version(model_prefix, metadata_path, metadata)
+        print(Fore.CYAN + f"[*] Candidate Scorer Loaded! Source: {model_prefix} | Features: {input_dim} | Device: {device}")
         return {
             "model": model,
             "device": device,
@@ -135,6 +164,7 @@ def load_candidate_agent(processed_dir):
             "state_dim": input_dim - CANDIDATE_FEATURE_DIM,
             "metadata": metadata,
             "model_version": metadata["model_version"],
+            "model_path": os.path.basename(model_path),
         }
     except Exception as exc:
         print(Fore.YELLOW + f"[Candidate] Candidate scorer failed to load: {exc}. Falling back to legacy combat BC.")
@@ -468,6 +498,269 @@ def card_effect_profile(card):
     }
 
 
+def status_amount(entries, names):
+    wanted = {str(name).lower() for name in names}
+    total = 0.0
+    for item in entries or []:
+        if not isinstance(item, dict):
+            continue
+        fields = (
+            item.get("id"),
+            item.get("name"),
+            item.get("type"),
+            item.get("label"),
+            item.get("title"),
+        )
+        text = " ".join(str(value or "").lower() for value in fields)
+        if any(name in text for name in wanted):
+            total += safe_num(item.get("amount", item.get("stack", item.get("stacks", 1))), 1.0)
+    return total
+
+
+def card_gain_strength(card):
+    text = combat_text(card)
+    card_id = card_id_key(card)
+    known = {
+        "INFLAME": 2.0,
+        "DEMON_FORM": 2.0,
+        "FLEX_POTION": 5.0,
+    }
+    if card_id in known:
+        return known[card_id]
+    if not has_any(text, ("strength", "\u529b\u91cf")):
+        return 0.0
+    nums = combat_numbers(text)
+    return max(nums) if nums else 1.0
+
+
+def card_gain_energy(card):
+    text = combat_text(card)
+    card_id = card_id_key(card)
+    known = {
+        "BLOODLETTING": 2.0,
+        "FORGOTTEN_RITUAL": 1.0,
+    }
+    if card_id in known:
+        return known[card_id]
+    if not has_any(text, ("energy", "\u80fd\u91cf")):
+        return 0.0
+    nums = combat_numbers(text)
+    if has_any(text, ("gain", "\u83b7\u5f97", "\u56de\u590d")):
+        return max(nums) if nums else 1.0
+    return 0.0
+
+
+def card_applies_vulnerable(card):
+    text = combat_text(card)
+    return has_any(text, ("vulnerable", "\u6613\u4f24"))
+
+
+def card_discount_sensitive(card):
+    text = combat_text(card)
+    card_id = card_id_key(card)
+    if card_id in {"DROPKICK", "BODY_SLAM"}:
+        return True
+    has_cost = has_any(text, ("cost", "free", "\u8d39\u7528", "\u82b1\u8d39", "\u514d\u8d39"))
+    has_play_clause = has_any(text, (
+        "card played", "cards played", "play a card", "played this turn",
+        "\u6253\u51fa", "\u6253\u51fa\u724c", "\u672c\u56de\u5408", "\u964d\u4f4e", "\u51cf\u5c11",
+    ))
+    return bool(has_cost and has_play_clause)
+
+
+def card_trigger_on_block(card):
+    text = combat_text(card)
+    return has_any(text, (
+        "when you gain block", "whenever you gain block", "gain block",
+        "\u83b7\u5f97\u683c\u6321\u65f6", "\u5f53\u4f60\u83b7\u5f97\u683c\u6321", "\u83b7\u5f97\u683c\u6321",
+    )) and card_effect_profile(card)["damage"] > 0
+
+
+def card_sequence_cost(card, energy, played_count):
+    cost = card_play_cost(card, energy)
+    if card_discount_sensitive(card):
+        cost = max(0.0, cost - played_count)
+    return cost
+
+
+def enemy_vulnerable_multiplier(enemies):
+    for enemy in enemies or []:
+        statuses = []
+        for key in ("status", "statuses", "powers", "buffs", "debuffs"):
+            value = enemy.get(key) if isinstance(enemy, dict) else None
+            if isinstance(value, list):
+                statuses.extend(value)
+            elif isinstance(value, dict):
+                statuses.append(value)
+        if status_amount(statuses, ("vulnerable", "\u6613\u4f24")) > 0:
+            return 1.5
+    return 1.0
+
+
+def estimate_card_damage(card, strength=0.0, vulnerable_mult=1.0):
+    profile = card_effect_profile(card)
+    if not profile["is_attack"] or profile["damage"] <= 0:
+        return 0.0
+    base = max(0.0, profile["damage"] + strength)
+    return math.floor(base * max(vulnerable_mult, 1.0))
+
+
+def hand_burst_plan(state, max_depth=6):
+    player = (state or {}).get("player") or {}
+    battle = (state or {}).get("battle") or {}
+    hand = [
+        dict(card)
+        for card in (player.get("hand") or [])
+        if isinstance(card, dict) and card.get("can_play", False)
+    ]
+    if not hand:
+        return {
+            "max_damage": 0.0,
+            "sequence": [],
+            "first_card_index": None,
+            "first_card_id": "",
+            "lethal": False,
+            "target_effective_hp": 0.0,
+            "reason": "no_playable_cards",
+        }
+    enemies = [enemy for enemy in (battle.get("enemies") or []) if isinstance(enemy, dict) and safe_num(enemy.get("hp"), 0.0) > 0]
+    target_effective_hp = min((safe_num(e.get("hp"), 0.0) + safe_num(e.get("block"), 0.0) for e in enemies), default=0.0)
+    player_status = []
+    for key in ("status", "statuses", "powers", "buffs"):
+        value = player.get(key)
+        if isinstance(value, list):
+            player_status.extend(value)
+        elif isinstance(value, dict):
+            player_status.append(value)
+    base_strength = status_amount(player_status, ("strength", "\u529b\u91cf"))
+    base_vulnerable = enemy_vulnerable_multiplier(enemies)
+    start_energy = safe_num(player.get("energy"), 0.0)
+    best = {
+        "damage": 0.0,
+        "sequence": [],
+        "first_card_index": None,
+        "first_card_id": "",
+        "lethal": False,
+        "target_effective_hp": target_effective_hp,
+        "reason": "search",
+    }
+
+    def search(cards, energy, strength, vulnerable_mult, played_count, damage, sequence):
+        nonlocal best
+        if damage > best["damage"]:
+            first = sequence[0] if sequence else {}
+            best = {
+                "damage": damage,
+                "sequence": list(sequence),
+                "first_card_index": first.get("index"),
+                "first_card_id": first.get("id") or first.get("name") or "",
+                "lethal": bool(target_effective_hp > 0 and damage >= target_effective_hp),
+                "target_effective_hp": target_effective_hp,
+                "reason": "burst_search",
+            }
+        if len(sequence) >= max_depth or not cards:
+            return
+
+        playable = []
+        for pos, card in enumerate(cards):
+            if card_sequence_cost(card, energy, played_count) <= energy:
+                playable.append((pos, card))
+        playable.sort(
+            key=lambda row: (
+                estimate_card_damage(row[1], strength, vulnerable_mult),
+                card_effect_profile(row[1])["setup_attack"],
+                -card_sequence_cost(row[1], energy, played_count),
+            ),
+            reverse=True,
+        )
+        for pos, card in playable[:8]:
+            cost = card_sequence_cost(card, energy, played_count)
+            profile = card_effect_profile(card)
+            next_cards = cards[:pos] + cards[pos + 1:]
+            next_energy = max(0.0, energy - cost) + card_gain_energy(card)
+            next_strength = strength + card_gain_strength(card)
+            next_vulnerable = 1.5 if card_applies_vulnerable(card) else vulnerable_mult
+            dealt = estimate_card_damage(card, strength, vulnerable_mult)
+            if profile["block_gain"] > 0:
+                for other in next_cards:
+                    if card_trigger_on_block(other):
+                        dealt += estimate_card_damage(other, strength, vulnerable_mult)
+            entry = {
+                "index": safe_int(card.get("index"), pos),
+                "id": card.get("id") or card.get("name") or "",
+                "cost": cost,
+                "damage": round(dealt, 2),
+            }
+            search(
+                next_cards,
+                next_energy,
+                next_strength,
+                next_vulnerable,
+                played_count + 1,
+                damage + dealt,
+                sequence + [entry],
+            )
+
+    search(hand, start_energy, base_strength, base_vulnerable, 0, 0.0, [])
+    return {
+        "max_damage": round(best["damage"], 2),
+        "sequence": best["sequence"],
+        "first_card_index": best["first_card_index"],
+        "first_card_id": best["first_card_id"],
+        "lethal": best["lethal"],
+        "target_effective_hp": round(best["target_effective_hp"], 2),
+        "reason": best["reason"],
+    }
+
+
+def burst_sequence_label(plan, limit=3):
+    sequence = (plan or {}).get("sequence") or []
+    names = [str(item.get("id") or item.get("index") or "?") for item in sequence[:limit] if isinstance(item, dict)]
+    if not names:
+        return ""
+    suffix = "..." if len(sequence) > limit else ""
+    return ">".join(names) + suffix
+
+
+def burst_candidate_adjustment(candidate, burst_plan):
+    if not burst_plan or burst_plan.get("max_damage", 0.0) <= 0:
+        return 0.0, ""
+    max_damage = safe_num(burst_plan.get("max_damage"), 0.0)
+    first_index = burst_plan.get("first_card_index")
+    target_hp = safe_num(burst_plan.get("target_effective_hp"), 0.0)
+    lethal = bool(burst_plan.get("lethal"))
+    sequence = burst_sequence_label(burst_plan)
+    marker_parts = []
+    adjustment = 0.0
+
+    if candidate.kind == "play_card" and first_index is not None:
+        if safe_int(candidate.card_index, -1) == safe_int(first_index, -2):
+            bonus = min(26.0, 6.0 + max_damage * 0.35)
+            if lethal:
+                bonus += 24.0
+                marker_parts.append("burst_lethal")
+            else:
+                marker_parts.append("burst_first")
+            adjustment += bonus
+            marker_parts.append(f"dmg={max_damage:g}")
+            if target_hp > 0:
+                marker_parts.append(f"hp={target_hp:g}")
+            if sequence:
+                marker_parts.append(f"seq={sequence}")
+        elif lethal:
+            adjustment -= 10.0
+            marker_parts.append("not_burst_lethal_first")
+    elif candidate.kind == "end_turn":
+        if lethal:
+            adjustment -= 80.0
+            marker_parts.append("end_turn_skips_lethal_burst")
+        elif max_damage >= 10.0:
+            adjustment -= min(28.0, 6.0 + max_damage * 0.6)
+            marker_parts.append(f"end_turn_skips_burst={max_damage:g}")
+
+    return adjustment, ",".join(marker_parts)
+
+
 def playable_setup_attack_exists(player, energy, exclude_index=None):
     for hand_index, hand_card in enumerate(player.get("hand", []) or []):
         if not isinstance(hand_card, dict) or not hand_card.get("can_play", False):
@@ -563,12 +856,14 @@ def potion_tactical_profile(candidate, state):
     )
     severe_threat = net_incoming >= max(10.0, hp * 0.45)
     boss_or_elite = state_type in ("boss", "elite")
+    boss_fight = state_type == "boss"
     defensive_useful = bool(defensive and incoming > 0 and (prevents_lethal or severe_threat))
-    healing_useful = bool(healing and (prevents_lethal or (hp_ratio <= 0.30 and (boss_or_elite or incoming > 0))))
-    resource_useful = bool(resource and (prevents_lethal or (boss_or_elite and hp_ratio <= 0.30 and round_no >= 3 and severe_threat)))
-    scaling_useful = bool(scaling and incoming <= 0 and boss_or_elite and round_no <= 2 and hp_ratio >= 0.45)
+    healing_useful = bool(healing and (prevents_lethal or (hp_ratio <= (0.55 if boss_fight else 0.30) and (boss_or_elite or incoming > 0))))
+    resource_useful = bool(resource and (boss_fight or prevents_lethal or (boss_or_elite and hp_ratio <= 0.30 and round_no >= 3 and severe_threat)))
+    scaling_useful = bool(scaling and boss_or_elite and round_no <= (4 if boss_fight else 2) and hp_ratio >= 0.35)
+    damage_useful = bool(damage > 0 and boss_fight)
     urgent = prevents_lethal or severe_threat
-    useful = lethal or defensive_useful or healing_useful or resource_useful or scaling_useful
+    useful = lethal or damage_useful or defensive_useful or healing_useful or resource_useful or scaling_useful
     return {
         "potion_id": potion_id,
         "text": text,
@@ -580,6 +875,8 @@ def potion_tactical_profile(candidate, state):
         "resource": resource,
         "healing": healing,
         "lethal": lethal,
+        "damage_useful": damage_useful,
+        "boss_fight": boss_fight,
         "prevents_lethal": prevents_lethal,
         "severe_threat": severe_threat,
         "defensive_useful": defensive_useful,
@@ -782,11 +1079,15 @@ def tactical_candidate_adjustment(candidate, state):
     elif candidate.kind == "use_potion":
         profile = potion_tactical_profile(candidate, state)
         already_used_potion = bool(state.get("_potion_used_this_turn"))
-        if already_used_potion and not (profile["lethal"] or profile["prevents_lethal"]):
+        boss_fight = bool(profile.get("boss_fight"))
+        if already_used_potion and not boss_fight and not (profile["lethal"] or profile["prevents_lethal"]):
             return -1000.0, "one_potion_per_turn_hard"
         if profile["lethal"]:
             adjustment += 14.0
             reasons.append("lethal_potion")
+        elif boss_fight and profile["damage"] > 0:
+            adjustment += 8.0
+            reasons.append("boss_damage_potion")
         elif profile["prevents_lethal"]:
             adjustment += 12.0
             reasons.append("prevents_lethal_potion")
@@ -800,12 +1101,15 @@ def tactical_candidate_adjustment(candidate, state):
             adjustment += 3.0
             reasons.append("desperate_resource_potion")
         elif profile["scaling_useful"]:
-            adjustment += 2.0
-            reasons.append("safe_setup_potion")
-        if not profile["useful"]:
+            adjustment += 5.0 if boss_fight else 2.0
+            reasons.append("boss_setup_potion" if boss_fight else "safe_setup_potion")
+        elif boss_fight and (profile["resource"] or profile["defensive"] or profile["healing"]):
+            adjustment += 3.0
+            reasons.append("boss_unrestricted_potion")
+        if not profile["useful"] and not boss_fight:
             adjustment -= 20.0
             reasons.append("save_potion")
-        if incoming <= 0 and (profile["defensive"] or profile["scaling"]):
+        if incoming <= 0 and (profile["defensive"] or profile["scaling"]) and not boss_fight:
             adjustment -= 6.0
             reasons.append("no_incoming_save_potion")
 
@@ -831,7 +1135,13 @@ def score_combat_candidates(candidate_agent, state_vec, candidates, state=None, 
         return None, [], "candidate_model_unavailable"
     model = candidate_agent["model"]
     device = candidate_agent["device"]
-    force_delay_end_turn, delay_reason = should_force_delay_end_turn(candidates, state)
+    constraint_mode = str((exploration or {}).get("constraint_mode") or "guarded").lower()
+    if constraint_mode not in ("guarded", "explore", "free"):
+        constraint_mode = "guarded"
+    use_tactical_guards = constraint_mode != "free"
+    tactical_scale = 1.0 if constraint_mode == "guarded" else 0.35 if constraint_mode == "explore" else 0.0
+    force_delay_end_turn, delay_reason = should_force_delay_end_turn(candidates, state) if use_tactical_guards else (False, "")
+    burst_plan = hand_burst_plan(state) if use_tactical_guards and state else None
     lethal_end_turn = False
     if state:
         player = state.get("player") or {}
@@ -860,21 +1170,25 @@ def score_combat_candidates(candidate_agent, state_vec, candidates, state=None, 
         probs = torch.sigmoid(logits).detach().cpu().numpy()
     ranked = []
     for candidate, logit, prob in zip(candidates, logits.detach().cpu().numpy(), probs):
-        adjustment, marker = tactical_candidate_adjustment(candidate, state)
-        if lethal_end_turn:
+        adjustment, marker = tactical_candidate_adjustment(candidate, state) if use_tactical_guards else (0.0, "")
+        burst_adjustment, burst_marker = burst_candidate_adjustment(candidate, burst_plan) if use_tactical_guards else (0.0, "")
+        adjustment += burst_adjustment
+        marker = ",".join(x for x in (marker, burst_marker) if x)
+        adjustment *= tactical_scale
+        if lethal_end_turn and use_tactical_guards:
             if candidate.kind == "end_turn":
-                adjustment -= 100.0
+                adjustment -= 100.0 * tactical_scale
                 marker = ",".join(x for x in (marker, "never_end_turn_into_lethal") if x)
             elif candidate.kind == "use_potion":
                 profile = potion_tactical_profile(candidate, state)
                 if profile["lethal"] or profile["prevents_lethal"] or profile["resource_useful"]:
-                    adjustment += 8.0
+                    adjustment += 8.0 * tactical_scale
                     marker = ",".join(x for x in (marker, "desperate_potion") if x)
                 else:
-                    adjustment -= 8.0
+                    adjustment -= 8.0 * tactical_scale
                     marker = ",".join(x for x in (marker, "not_a_rescue_potion") if x)
         if candidate.kind == "end_turn" and force_delay_end_turn:
-            adjustment -= 100.0
+            adjustment -= 100.0 * tactical_scale
             marker = ",".join(x for x in (marker, delay_reason) if x)
         base_score = float(logit)
         ranked.append({
@@ -887,7 +1201,7 @@ def score_combat_candidates(candidate_agent, state_vec, candidates, state=None, 
         })
     ranked.sort(key=lambda item: item["score"], reverse=True)
     chosen = ranked[0] if ranked else None
-    decision_source = "candidate_scorer_tactical"
+    decision_source = f"candidate_scorer_{constraint_mode}"
     if chosen and exploration and exploration.get("enabled"):
         selected, explored, selected_rank = sample_ranked_entry(
             ranked,
@@ -909,9 +1223,14 @@ def candidate_top_actions(ranked, limit=5):
     top_actions = []
     for item in ranked[:limit]:
         candidate = item["candidate"]
+        confidence = item.get("confidence")
+        if confidence is None:
+            confidence = item.get("prob")
+        if confidence is None:
+            confidence = max(float(item.get("score", 0.0)), 0.0)
         top_actions.append({
             "action": candidate.label,
-            "confidence": round(item["confidence"] * 100.0, 2),
+            "confidence": round(float(confidence) * 100.0, 2),
             "marker": " / ".join(x for x in [candidate.kind, item.get("marker")] if x),
         })
     return top_actions
@@ -1003,6 +1322,27 @@ def get_items_for_state(state, state_type):
     state_type = str(state_type or "").lower()
     if state_type == "rewards":
         return (state.get("rewards") or {}).get("items", []) or []
+    if state_type == "treasure":
+        treasure = state.get("treasure") or {}
+        for key in ("relics", "items", "rewards", "reward_items"):
+            items = treasure.get(key)
+            if items:
+                rows = []
+                for fallback_index, item in enumerate(items or []):
+                    if not isinstance(item, dict):
+                        continue
+                    row = dict(item)
+                    if key == "relics":
+                        row.setdefault("type", "relic")
+                    row.setdefault("index", fallback_index)
+                    rows.append(row)
+                return rows
+        relic = treasure.get("relic") or treasure.get("reward") or {}
+        if isinstance(relic, dict) and relic:
+            item = dict(relic)
+            item.setdefault("type", "relic")
+            item.setdefault("index", treasure.get("index", 0))
+            return [item]
     if state_type == "shop":
         return (state.get("shop") or {}).get("items", []) or []
     if state_type == "fake_merchant":
@@ -1153,10 +1493,53 @@ def reward_potion_payload(state, item, fallback_index):
     )
 
 
-def reward_item_claim_payload(state, item, fallback_index):
+def reward_item_claim_payload(state, item, fallback_index, state_type=None):
+    if str(state_type or (state or {}).get("state_type") or "").lower() == "treasure":
+        return {"action": "claim_treasure_relic", "index": int(item.get("index", fallback_index))}, "treasure_relic_available"
     if reward_item_type(item) == "potion":
         return reward_potion_payload(state, item, fallback_index)
     return {"action": "claim_reward", "index": int(item.get("index", fallback_index))}, "available"
+
+
+def choose_reward_rule_action(state, state_type):
+    items = list(get_items_for_state(state, state_type))
+    priority = {"relic": 0, "gold": 1, "potion": 2, "card": 3, "special_card": 3}
+    ranked = sorted(
+        enumerate(items),
+        key=lambda row: (priority.get(reward_item_type(row[1]), 4), safe_int(row[1].get("index"), row[0])),
+    )
+    top_actions = []
+    for fallback_index, item in ranked:
+        payload, status = reward_item_claim_payload(state, item, fallback_index, state_type)
+        item_type = reward_item_type(item) or "item"
+        label_index = safe_int(item.get("index"), fallback_index)
+        marker = status
+        top_actions.append({
+            "action": f"claim_reward:index_{label_index}:{item_type}",
+            "confidence": 100.0 - min(len(top_actions), 8),
+            "marker": marker,
+        })
+        if payload:
+            return payload, {
+                "top_actions": top_actions,
+                "chosen_action": f"claim_reward:index_{label_index}:{item_type}",
+                "payload": payload,
+                "reason": f"{state_type}_claim_before_proceed:{status}",
+            }
+    if get_can_proceed(state, state_type):
+        payload = {"action": "proceed"}
+        return payload, {
+            "top_actions": top_actions or [{"action": "proceed", "confidence": 100.0, "marker": "no_claimable_rewards"}],
+            "chosen_action": "proceed",
+            "payload": payload,
+            "reason": f"{state_type}_no_claimable_proceed",
+        }
+    return None, {
+        "top_actions": top_actions,
+        "chosen_action": None,
+        "payload": None,
+        "reason": f"{state_type}_no_claimable_no_proceed",
+    }
 
 
 def rest_option_blob(option):
@@ -1177,6 +1560,18 @@ def rest_option_kind(option):
     return "other"
 
 
+def is_pre_boss_rest_site(state):
+    run = (state or {}).get("run") or {}
+    floor = safe_int(run.get("floor"), 0)
+    act = safe_int(run.get("act"), 0)
+    map_state = (state or {}).get("map") or {}
+    next_options = map_state.get("next_options") or []
+    if any(str(option.get("type") or "").lower() == "boss" for option in next_options if isinstance(option, dict)):
+        return True
+    # STS2 act maps report the final rest site immediately before the boss around floor 15.
+    return bool(act >= 1 and floor >= 15)
+
+
 def choose_rest_site_rule_action(state, exploration=None):
     rest_site = state.get("rest_site") or {}
     options = rest_site.get("options") or []
@@ -1195,8 +1590,12 @@ def choose_rest_site_rule_action(state, exploration=None):
     hp_ratio = hp / max_hp
     smith = next((o for o in enabled if rest_option_kind(o) == "smith"), None)
     heal = next((o for o in enabled if rest_option_kind(o) == "heal"), None)
+    pre_boss = is_pre_boss_rest_site(state)
 
-    if hp_ratio >= 0.62 and smith:
+    if pre_boss and heal and hp < max_hp:
+        chosen = heal
+        reason = f"rest_rule_pre_boss_heal hp={hp_ratio:.2f}"
+    elif hp_ratio >= 0.62 and smith:
         chosen = smith
         reason = f"rest_rule_smith_high_hp hp={hp_ratio:.2f}"
     elif hp_ratio <= 0.45 and heal:
@@ -1217,6 +1616,10 @@ def choose_rest_site_rule_action(state, exploration=None):
         kind = rest_option_kind(option)
         option_index = int(option.get("index", enabled.index(option)))
         score = 100.0 if option is chosen else (60.0 if kind == "smith" else 40.0)
+        if pre_boss and kind == "heal" and hp < max_hp:
+            score = max(score, 120.0)
+        elif pre_boss and kind == "smith" and hp < max_hp:
+            score = min(score, 20.0)
         scored_options.append({
             "option": option,
             "score": score,
@@ -1307,8 +1710,13 @@ def macro_label_to_payload(label, state, allow_shop=False):
             index = int(label.rsplit("_", 1)[1])
         except ValueError:
             return None, "bad_map_index"
+        for fallback_index, option in enumerate(options):
+            option_index = safe_int(option.get("index"), fallback_index)
+            if option_index == index:
+                return {"action": "choose_map_node", "index": option_index}, "available"
         if 0 <= index < len(options):
-            return {"action": "choose_map_node", "index": index}, "available"
+            option = options[index] or {}
+            return {"action": "choose_map_node", "index": safe_int(option.get("index"), index)}, "available"
         return None, "map_index_out_of_range"
 
     if label.startswith("select_map_node:type_"):
@@ -1322,13 +1730,13 @@ def macro_label_to_payload(label, state, allow_shop=False):
         return None, "map_type_unavailable"
 
     if label.startswith("claim_reward:"):
-        if state_type != "rewards":
-            return None, "not_rewards"
+        if state_type not in ("rewards", "treasure"):
+            return None, "not_rewards_or_treasure"
         reward_type = label.split(":", 1)[1].lower().split(" ", 1)[0]
         last_status = f"reward_{reward_type}_unavailable"
         for fallback_index, item in enumerate(get_items_for_state(state, state_type)):
             if reward_matches_type(item, reward_type):
-                payload, status = reward_item_claim_payload(state, item, fallback_index)
+                payload, status = reward_item_claim_payload(state, item, fallback_index, state_type)
                 if payload:
                     return payload, status
                 last_status = status
@@ -1405,6 +1813,10 @@ def macro_label_to_payload(label, state, allow_shop=False):
     if label == "proceed":
         if state_type in ("shop", "fake_merchant") and not allow_shop:
             return None, "shop_protected"
+        if state_type in ("rewards", "treasure"):
+            payload, info = choose_reward_rule_action(state, state_type)
+            if payload and payload.get("action") != "proceed":
+                return None, "claim_reward_before_proceed"
         if get_can_proceed(state, state_type):
             return {"action": "proceed"}, "available"
         return None, "proceed_unavailable"
@@ -1414,20 +1826,13 @@ def macro_label_to_payload(label, state, allow_shop=False):
 
 def macro_fallback_payload(state):
     state_type = str(state.get("state_type") or "").lower()
-    if state_type == "rewards":
-        rewards = state.get("rewards") or {}
-        if not rewards.get("items") and rewards.get("can_proceed"):
-            return {"action": "proceed"}, "rewards_empty_proceed"
-        if rewards.get("can_proceed"):
-            claimable = False
-            for fallback_index, item in enumerate(get_items_for_state(state, state_type)):
-                payload, _ = reward_item_claim_payload(state, item, fallback_index)
-                if payload:
-                    claimable = True
-                    break
-            if not claimable:
-                return {"action": "proceed"}, "rewards_no_claimable_proceed"
-    if state_type in ("rest_site", "treasure") and get_can_proceed(state, state_type):
+    if state_type == "map":
+        payload, info = choose_map_route_action(state)
+        return payload, info.get("reason", "map_route_fallback")
+    if state_type in ("rewards", "treasure"):
+        payload, info = choose_reward_rule_action(state, state_type)
+        return payload, info.get("reason", f"{state_type}_reward_rule")
+    if state_type == "rest_site" and get_can_proceed(state, state_type):
         return {"action": "proceed"}, f"{state_type}_proceed"
     return None, ""
 
@@ -2637,7 +3042,7 @@ def score_event_option_rule(option, state):
     reasons = []
 
     if option.get("is_proceed"):
-        score += 12.0
+        score += 0.4
         reasons.append("继续")
 
     if has_any(text, ("relic", "遗物")):
@@ -2738,10 +3143,6 @@ def choose_event_option_rule_action(state, exploration=None):
     if not available:
         return None, None
 
-    needs_rule = any(event_option_has_cost_risk(o) for o in available)
-    if not needs_rule:
-        return None, None
-
     scored = []
     for fallback_index, option in enumerate(available):
         index = safe_int(option.get("index"), fallback_index)
@@ -2780,7 +3181,7 @@ def choose_event_option_rule_action(state, exploration=None):
         "top_actions": top_actions,
         "chosen_action": f"choose_event_option:index_{best['index']}:{best.get('title')}",
         "payload": payload,
-        "reason": "event_cost_rule: " + (" / ".join(best["reasons"]) or "highest score"),
+        "reason": "event_general_rule: " + (" / ".join(best["reasons"]) or "highest score"),
     }
 
 
@@ -3215,8 +3616,17 @@ def macro_state_signature(state):
 
 def choose_macro_action(macro_agent, state, allow_shop=False, card_baseline_weight=0.35, exploration=None):
     state_type = str(state.get("state_type") or "").lower()
+    constraint_mode = str((exploration or {}).get("constraint_mode") or "guarded").lower()
+    if constraint_mode not in ("guarded", "explore", "free"):
+        constraint_mode = "guarded"
+    prefer_model = constraint_mode in ("explore", "free") and macro_agent
+    effective_allow_shop = bool(allow_shop or constraint_mode in ("explore", "free"))
+    effective_card_baseline_weight = 0.0 if constraint_mode == "free" else (min(card_baseline_weight, 0.10) if constraint_mode == "explore" else card_baseline_weight)
+
     if state_type == "map":
         return choose_map_route_action(state, exploration=exploration)
+    if state_type in ("rewards", "treasure"):
+        return choose_reward_rule_action(state, state_type)
     if state_type == "card_select":
         return choose_card_select_action(state)
     if state_type == "hand_select":
@@ -3225,22 +3635,22 @@ def choose_macro_action(macro_agent, state, allow_shop=False, card_baseline_weig
         event_payload, event_info = choose_event_option_rule_action(state, exploration=exploration)
         if event_payload:
             return event_payload, event_info
-    if state_type == "crystal_sphere":
+    if state_type == "crystal_sphere" and not prefer_model:
         crystal_payload, crystal_info = choose_crystal_sphere_rule_action(state, exploration=exploration)
         if crystal_payload:
             return crystal_payload, crystal_info
-    if state_type == "rest_site":
+    if state_type == "rest_site" and not prefer_model:
         rest_payload, rest_info = choose_rest_site_rule_action(state, exploration=exploration)
         if rest_payload:
             return rest_payload, rest_info
-    if state_type in ("shop", "fake_merchant") and allow_shop:
+    if state_type in ("shop", "fake_merchant") and effective_allow_shop:
         shop_payload, shop_info = choose_shop_rule_action(state, state_type, exploration=exploration)
         if shop_payload:
             return shop_payload, shop_info
 
     if not macro_agent:
         if state_type == "card_reward":
-            return choose_card_reward_baseline_action(state, card_baseline_weight)
+            return choose_card_reward_baseline_action(state, effective_card_baseline_weight)
         return None, {
             "top_actions": [],
             "chosen_action": None,
@@ -3266,7 +3676,7 @@ def choose_macro_action(macro_agent, state, allow_shop=False, card_baseline_weig
         sorted_indices = torch.argsort(outputs[0], descending=True)
 
     if state_type == "card_reward":
-        return choose_card_reward_mixed_action(macro_agent, state, outputs[0], probs, card_baseline_weight, exploration=exploration)
+        return choose_card_reward_mixed_action(macro_agent, state, outputs[0], probs, effective_card_baseline_weight, exploration=exploration)
 
     top_actions = []
     ranked_actions = []
@@ -3274,7 +3684,7 @@ def choose_macro_action(macro_agent, state, allow_shop=False, card_baseline_weig
         label = macro_agent["id_to_action"].get(idx.item(), "UNKNOWN")
         if label in ("UNKNOWN", "PAD"):
             continue
-        payload, status = macro_label_to_payload(label, state, allow_shop=allow_shop)
+        payload, status = macro_label_to_payload(label, state, allow_shop=effective_allow_shop)
         conf = probs[idx].item() * 100
         top_actions.append({"action": label, "confidence": round(conf, 2), "marker": status})
         if payload:
@@ -3320,6 +3730,428 @@ def choose_macro_action(macro_agent, state, allow_shop=False, card_baseline_weig
         "payload": chosen_payload,
         "reason": chosen_reason,
     }
+
+
+def normalize_policy_mode(value):
+    mode = str(value or "current_rl").strip().lower()
+    return mode if mode in ("current_rl", "ppo_experiment", "ppo_best") else "current_rl"
+
+
+def ppo_active(control):
+    return normalize_policy_mode((control or {}).get("policy_mode")) in ("ppo_experiment", "ppo_best")
+
+
+def load_active_ppo_agent(control):
+    mode = normalize_policy_mode((control or {}).get("policy_mode"))
+    if mode not in ("ppo_experiment", "ppo_best"):
+        return None
+    processed_dir = os.path.join(os.path.dirname(__file__), "ProcessedPPOParams")
+    return load_ppo_policy(processed_dir, mode=mode, allow_untrained=(mode == "ppo_experiment"))
+
+
+def action_payload_key(payload):
+    return json.dumps(payload or {}, sort_keys=True, ensure_ascii=False)
+
+
+def ppo_align_row(row):
+    return align_feature_vector(np.asarray(row, dtype=np.float32), PPO_INPUT_DIM).astype(np.float32)
+
+
+def macro_action_features(state, label, payload, score=0.0, index=0, total=1):
+    state_type = str((state or {}).get("state_type") or "").lower()
+    player = (state or {}).get("player") or {}
+    run = (state or {}).get("run") or {}
+    action = str((payload or {}).get("action") or "").lower()
+    state_types = ("map", "rewards", "card_reward", "card_select", "hand_select", "event", "crystal_sphere", "rest_site", "shop", "fake_merchant", "treasure")
+    action_types = ("choose_map_node", "claim_reward", "select_card_reward", "skip_card_reward", "choose_event_option", "choose_rest_option", "shop_purchase", "proceed", "select_card", "confirm_selection", "combat_select_card", "combat_confirm_selection")
+    hp = safe_num(player.get("hp"), 0.0)
+    max_hp = max(safe_num(player.get("max_hp"), 1.0), 1.0)
+    features = []
+    features.extend([1.0 if state_type == item else 0.0 for item in state_types])
+    features.extend([1.0 if action == item else 0.0 for item in action_types])
+    features.extend([
+        hp / max_hp,
+        min(safe_num(player.get("gold"), 0.0) / 300.0, 2.0),
+        min(safe_num(run.get("floor"), 0.0) / 17.0, 2.0),
+        min(safe_num(run.get("act"), 0.0) / 4.0, 2.0),
+        min(safe_num(player.get("deck_size"), len(player.get("deck") or [])) / 40.0, 2.0),
+        min(float(index) / 12.0, 1.0),
+        min(float(total) / 12.0, 1.0),
+        max(min(float(score) / 10.0, 5.0), -5.0),
+        1.0 if get_can_proceed(state, state_type) else 0.0,
+        1.0 if is_pre_boss_rest_site(state) else 0.0,
+    ])
+    return np.asarray(features, dtype=np.float32)
+
+
+def macro_row(macro_agent, state, candidate, index=0, total=1):
+    state_vec = np.zeros(0, dtype=np.float32)
+    if macro_agent:
+        try:
+            record = build_macro_record_from_state(state)
+            state_vec = np.asarray(encode_macro_record(macro_agent["vocab"], record), dtype=np.float32)
+        except Exception:
+            state_vec = np.zeros(0, dtype=np.float32)
+    action_vec = macro_action_features(
+        state,
+        candidate.get("label", ""),
+        candidate.get("payload"),
+        candidate.get("score", 0.0),
+        index,
+        total,
+    )
+    return ppo_align_row(np.concatenate([state_vec, action_vec]))
+
+
+def enumerate_macro_candidates(state, macro_agent=None, allow_shop=False, card_baseline_weight=0.35, exploration=None):
+    state_type = str((state or {}).get("state_type") or "").lower()
+    candidates = []
+
+    def add(label, payload, score=0.0, marker=""):
+        if payload:
+            candidates.append({"label": label, "payload": payload, "score": float(score), "marker": marker})
+
+    if state_type == "map":
+        for fallback_index, option in enumerate(((state.get("map") or {}).get("next_options") or [])):
+            if not isinstance(option, dict):
+                continue
+            idx = safe_int(option.get("index"), fallback_index)
+            node_type = str(option.get("type") or "")
+            add(f"select_map_node:index_{idx}:{node_type}", {"action": "choose_map_node", "index": idx}, 1.0, node_type)
+    elif state_type in ("rewards", "treasure"):
+        for fallback_index, item in enumerate(get_items_for_state(state, state_type)):
+            payload, status = reward_item_claim_payload(state, item, fallback_index, state_type)
+            item_type = reward_item_type(item) or "item"
+            idx = safe_int(item.get("index"), fallback_index)
+            add(f"claim_reward:index_{idx}:{item_type}", payload, 2.0, status)
+        if get_can_proceed(state, state_type):
+            add("proceed", {"action": "proceed"}, 0.25, "available")
+    elif state_type == "card_reward":
+        entries, _profile = card_reward_baseline_entries(state)
+        for entry in entries:
+            add(entry["label"], entry["payload"], entry.get("score", 0.0), "card_reward")
+    elif state_type == "event":
+        for fallback_index, option in enumerate(((state.get("event") or {}).get("options") or [])):
+            if not isinstance(option, dict) or option.get("is_locked"):
+                continue
+            idx = safe_int(option.get("index"), fallback_index)
+            score, reasons = score_event_option_rule(option, state)
+            add(f"choose_event_option:index_{idx}:{option.get('title')}", {"action": "choose_event_option", "index": idx}, score, " / ".join(reasons))
+    elif state_type == "rest_site":
+        for fallback_index, option in enumerate(((state.get("rest_site") or {}).get("options") or [])):
+            if not isinstance(option, dict) or not option.get("is_enabled", True):
+                continue
+            idx = safe_int(option.get("index"), fallback_index)
+            kind = rest_option_kind(option)
+            score = 3.0 if kind == "heal" and is_pre_boss_rest_site(state) else 2.0 if kind == "smith" else 1.0
+            add(f"choose_rest_option:index_{idx}:{kind}", {"action": "choose_rest_option", "index": idx}, score, kind)
+    elif state_type in ("shop", "fake_merchant") and allow_shop:
+        for row in rank_shop_items(state, state_type):
+            idx = safe_int(row["item"].get("index"), row["fallback_index"])
+            add(f"shop_purchase:index_{idx}:{row['category']}", {"action": "shop_purchase", "index": idx}, row["score"], " / ".join(row["reasons"]))
+        if get_can_proceed(state, state_type):
+            add("proceed", {"action": "proceed"}, 0.25, "available")
+
+    if not candidates:
+        payload, info = choose_macro_action(macro_agent, state, allow_shop=allow_shop, card_baseline_weight=card_baseline_weight, exploration=exploration)
+        add(info.get("chosen_action") or ((payload or {}).get("action") or "macro_action"), payload, 1.0, info.get("reason", "fallback"))
+
+    total = max(len(candidates), 1)
+    for idx, candidate in enumerate(candidates):
+        candidate["features"] = macro_row(macro_agent, state, candidate, idx, total).tolist()
+    return candidates
+
+
+def ppo_select(ppo_agent, feature_rows, fallback_index=0, deterministic=False):
+    if not ppo_agent or not feature_rows:
+        return None
+    feature_count = len(feature_rows)
+    chosen_index = max(0, min(int(fallback_index or 0), feature_count - 1))
+    try:
+        device = ppo_agent["device"]
+        x = torch.tensor(np.asarray(feature_rows, dtype=np.float32), dtype=torch.float32).to(device)
+        with torch.no_grad():
+            logits, values = ppo_agent["model"](x)
+            logits = torch.nan_to_num(logits.float(), nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
+            values = torch.nan_to_num(values.float(), nan=0.0, posinf=1000000.0, neginf=-1000000.0)
+            probs = torch.softmax(logits, dim=0)
+            if (not torch.isfinite(probs).all()) or float(probs.sum().detach().cpu()) <= 0.0:
+                probs = torch.ones_like(logits) / max(int(logits.numel()), 1)
+            probs = probs.clamp_min(1e-8)
+            probs = probs / probs.sum()
+            log_probs = torch.log(probs)
+        if ppo_agent.get("trained"):
+            if deterministic:
+                chosen_index = int(torch.argmax(logits).item())
+            else:
+                chosen_index = int(torch.multinomial(probs, 1).item())
+    except Exception as exc:
+        print(Fore.YELLOW + f"  [PPO] Selection failed, using fallback candidate. {exc}")
+        logits = torch.zeros(feature_count, dtype=torch.float32)
+        values = torch.zeros(feature_count, dtype=torch.float32)
+        probs = torch.ones(feature_count, dtype=torch.float32) / max(feature_count, 1)
+        log_probs = torch.log(probs.clamp_min(1e-8))
+    ranked = sorted(
+        [
+            {
+                "index": i,
+                "score": float(logits[i].detach().cpu()),
+                "confidence": float(probs[i].detach().cpu()),
+            }
+            for i in range(len(feature_rows))
+        ],
+        key=lambda item: item["score"],
+        reverse=True,
+    )
+    return {
+        "chosen_index": chosen_index,
+        "logprob": float(log_probs[chosen_index].detach().cpu()),
+        "value": float(values[chosen_index].detach().cpu()),
+        "ranked": ranked,
+    }
+
+
+def ppo_state_summary(state):
+    state = state or {}
+    player = state.get("player") or {}
+    run = state.get("run") or {}
+    battle = state.get("battle") or {}
+    return {
+        "state_type": state.get("state_type"),
+        "act": safe_int(run.get("act"), 0),
+        "floor": safe_int(run.get("floor"), 0),
+        "hp": safe_int(player.get("hp"), 0),
+        "max_hp": safe_int(player.get("max_hp"), 0),
+        "gold": safe_int(player.get("gold"), 0),
+        "energy": safe_int(player.get("energy"), 0),
+        "round": safe_int(battle.get("round"), 0),
+    }
+
+
+def ppo_enemy_hp_by_id(state):
+    battle = (state or {}).get("battle") or {}
+    rows = {}
+    for idx, enemy in enumerate(battle.get("enemies") or []):
+        if not isinstance(enemy, dict):
+            continue
+        key = str(enemy.get("entity_id") or enemy.get("combat_id") or enemy.get("id") or enemy.get("name") or idx)
+        hp = max(0.0, safe_num(enemy.get("hp", enemy.get("current_hp", 0.0)), 0.0))
+        block = max(0.0, safe_num(enemy.get("block"), 0.0))
+        rows[key] = hp + block
+    return rows
+
+
+def ppo_status_entries(entity):
+    entries = []
+    for key in ("status", "statuses", "powers", "buffs", "debuffs"):
+        value = (entity or {}).get(key)
+        if isinstance(value, list):
+            entries.extend(item for item in value if isinstance(item, dict))
+        elif isinstance(value, dict):
+            entries.append(value)
+    return entries
+
+
+def ppo_player_strength(state):
+    player = (state or {}).get("player") or {}
+    return status_amount(ppo_status_entries(player), ("strength", "\u529b\u91cf"))
+
+
+def ppo_payload_card(state, payload):
+    if (payload or {}).get("action") != "play_card":
+        return {}
+    player = (state or {}).get("player") or {}
+    hand = player.get("hand") or []
+    card_index = safe_int((payload or {}).get("card_index", (payload or {}).get("index")), -1)
+    for idx, card in enumerate(hand):
+        if not isinstance(card, dict):
+            continue
+        if safe_int(card.get("index"), idx) == card_index or idx == card_index:
+            return card
+    return {}
+
+
+def ppo_card_is_body_slam(card):
+    text = combat_text(card)
+    card_id = card_id_key(card)
+    return card_id == "BODY_SLAM" or has_any(text, ("body slam", "\u5168\u8eab\u649e\u51fb", "block as damage", "\u683c\u6321\u9020\u6210\u4f24\u5bb3"))
+
+
+def ppo_card_is_multi_hit(card):
+    text = combat_text(card)
+    card_id = card_id_key(card)
+    if card_id in {"SWORD_BOOMERANG", "TWIN_STRIKE", "PUMMEL", "WHIRLWIND", "CLEAVE"}:
+        return True
+    return has_any(text, ("times", "all enemies", "\u6b21", "\u6240\u6709\u654c\u4eba", "\u591a\u6bb5"))
+
+
+def ppo_ironclad_reward_terms(before, after, payload, damage, hp_loss):
+    terms = {}
+    before_type = str((before or {}).get("state_type") or "").lower()
+    if before_type not in ("monster", "elite", "boss"):
+        return terms
+    player_before = (before or {}).get("player") or {}
+    player_after = (after or {}).get("player") or {}
+    battle = (before or {}).get("battle") or {}
+    enemies = battle.get("enemies") or []
+    incoming = enemy_incoming_damage(enemies)
+    before_block = safe_num(player_before.get("block"), 0.0)
+    after_block = safe_num(player_after.get("block"), before_block)
+    block_delta = max(0.0, after_block - before_block)
+    if block_delta > 0 and incoming > before_block:
+        useful_block = min(block_delta, max(0.0, incoming - before_block))
+        terms["ic_effective_block"] = min(0.35, useful_block * 0.025)
+        excess_block = max(0.0, block_delta - useful_block)
+        if excess_block > 8:
+            terms["ic_excess_block"] = -min(0.12, excess_block * 0.01)
+
+    card = ppo_payload_card(before, payload)
+    if not card:
+        return terms
+    profile = card_effect_profile(card)
+    strength_before = ppo_player_strength(before)
+    strength_after = ppo_player_strength(after)
+    strength_gain = max(0.0, strength_after - strength_before)
+    round_no = max(1, safe_int(battle.get("round"), 1))
+
+    if strength_gain > 0:
+        terms["ic_strength_gain"] = min(0.35, 0.12 + strength_gain * 0.06)
+        if round_no <= 3:
+            terms["ic_early_scaling"] = 0.12
+    if profile["is_attack"] and damage > 0 and strength_before > 0:
+        terms["ic_strength_attack"] = min(0.35, strength_before * 0.025 + damage * 0.004)
+        if ppo_card_is_multi_hit(card):
+            terms["ic_multi_hit_strength"] = 0.12
+    if card_applies_vulnerable(card):
+        terms["ic_vulnerable_setup"] = 0.12 if damage <= 0 else 0.18
+    if ppo_card_is_body_slam(card):
+        if damage > 0:
+            terms["ic_block_to_damage"] = min(0.4, 0.16 + damage * 0.01)
+        elif before_block > 0:
+            terms["ic_missed_block_slam"] = -0.15
+    if profile["self_damage"] > 0:
+        converted = damage > 0 or strength_gain > 0 or card_gain_energy(card) > 0
+        terms["ic_self_damage_value"] = 0.12 if converted else -min(0.3, profile["self_damage"] * 0.05)
+        if hp_loss > 0 and not converted:
+            terms["ic_bad_self_damage"] = -min(0.3, hp_loss * 0.04)
+    return terms
+
+
+def ppo_combat_reward_terms(state_before, state_after, ok, payload):
+    if not ok:
+        return {"illegal_action": -1.0}
+    before = state_before or {}
+    after = state_after or {}
+    before_run = before.get("run") or {}
+    after_run = after.get("run") or {}
+    before_type = str(before.get("state_type") or "").lower()
+    after_type = str(after.get("state_type") or "").lower()
+    terms = {}
+    floor_delta = safe_int(after_run.get("floor"), 0) - safe_int(before_run.get("floor"), 0)
+    if floor_delta > 0:
+        terms["floor_delta"] = 0.05 * floor_delta
+    before_is_combat = before_type in ("monster", "elite", "boss")
+    after_is_combat = after_type in ("monster", "elite", "boss")
+    if before_is_combat:
+        before_hp = ppo_enemy_hp_by_id(before)
+        after_hp = ppo_enemy_hp_by_id(after) if after_is_combat else {}
+        damage = 0.0
+        kills = 0
+        for key, hp_before in before_hp.items():
+            hp_after = after_hp.get(key, 0.0)
+            damage += max(0.0, hp_before - hp_after)
+            if hp_before > 0 and hp_after <= 0:
+                kills += 1
+        player_before = before.get("player") or {}
+        player_after = after.get("player") or {}
+        hp_loss = max(0.0, safe_num(player_before.get("hp"), 0.0) - safe_num(player_after.get("hp"), 0.0))
+        if damage > 0:
+            total_before_hp = max(1.0, sum(before_hp.values()))
+            terms["combat_damage"] = min(0.35, 0.35 * damage / total_before_hp)
+        if kills > 0:
+            kill_value = 0.35 if before_type == "monster" else 0.65 if before_type == "elite" else 1.0
+            terms["enemy_kill"] = min(1.0, kills * kill_value)
+        if hp_loss > 0:
+            max_hp = max(1.0, safe_num(player_before.get("max_hp"), 1.0))
+            terms["hp_loss"] = -min(0.65, 0.65 * hp_loss / max_hp)
+        if (payload or {}).get("action") == "end_turn" and damage <= 0:
+            terms["idle_end_turn"] = -0.08
+        terms.update(ppo_ironclad_reward_terms(before, after, payload, damage, hp_loss))
+        if before_type in ("monster", "elite", "boss") and not after_is_combat:
+            round_no = max(1, safe_int((before.get("battle") or {}).get("round"), 1))
+            terms["combat_win"] = 0.7 if before_type == "monster" else 1.0 if before_type == "elite" else 1.5
+            terms["combat_speed"] = max(0.0, 0.35 - max(0, round_no - 3) * 0.07)
+            if hp_loss <= 0:
+                terms["clean_finish"] = 0.15
+    if after_type == "boss" and before_type != "boss":
+        terms["enter_boss"] = 1.0
+    if safe_int(before_run.get("act"), 0) < 2 and safe_int(after_run.get("act"), 0) >= 2:
+        terms["act2_reached"] = 3.0
+    progress = boss_hp_progress(before, after)
+    if progress:
+        terms["boss_damage"] = min(0.5, safe_num(progress.get("damage"), 0.0) * 0.02)
+    if before_type == "rest_site" and is_pre_boss_rest_site(before):
+        player = before.get("player") or {}
+        hp = safe_num(player.get("hp"), 0.0)
+        max_hp = safe_num(player.get("max_hp"), 0.0)
+        if hp < max_hp and (payload or {}).get("action") == "choose_rest_option":
+            options = (before.get("rest_site") or {}).get("options") or []
+            chosen_idx = safe_int((payload or {}).get("index"), -1)
+            chosen = next((o for o in options if safe_int(o.get("index"), -2) == chosen_idx), {})
+            kind = rest_option_kind(chosen)
+            terms["pre_boss_rest"] = 0.8 if kind == "heal" else -0.8 if kind == "smith" else 0.0
+    return {key: round(float(value), 4) for key, value in terms.items() if abs(float(value)) > 1e-9}
+
+
+def ppo_step_reward(state_before, state_after, ok, payload):
+    reward = sum(ppo_combat_reward_terms(state_before, state_after, ok, payload).values())
+    return round(float(max(-1.0, min(1.0, reward))), 4)
+
+
+def append_ppo_rollout(session_id, mode, state_before, state_after, payload, ok, candidates, features, chosen_index, ppo_decision, behavior_policy):
+    if mode not in ("ppo_experiment", "ppo_best") or not candidates or chosen_index is None or not ppo_decision:
+        return
+    os.makedirs(PPO_LOG_DIR, exist_ok=True)
+    path = os.path.join(PPO_LOG_DIR, f"ppo_rollouts_{datetime.now():%Y-%m-%d}.jsonl")
+    run = (state_before or {}).get("run") or {}
+    reward_terms = ppo_combat_reward_terms(state_before, state_after, ok, payload)
+    reward = ppo_step_reward(state_before, state_after, ok, payload)
+    record = {
+        "type": "ppo_step",
+        "timestamp": int(time.time() * 1000),
+        "run_id": session_id,
+        "seed": str((state_before or {}).get("seed") or run.get("seed") or ""),
+        "act": safe_int(run.get("act"), 0),
+        "floor": safe_int(run.get("floor"), 0),
+        "state_type": (state_before or {}).get("state_type"),
+        "policy_mode": mode,
+        "behavior_policy": behavior_policy,
+        "reward_schema": "ironclad_v1",
+        "ok": bool(ok),
+        "action": payload,
+        "chosen_index": int(chosen_index),
+        "logprob": float(ppo_decision.get("logprob", 0.0)),
+        "value": float(ppo_decision.get("value", 0.0)),
+        "reward": reward,
+        "reward_terms": reward_terms,
+        "done": False,
+        "features": features,
+        "candidates": [
+            {
+                "label": c.get("label") if isinstance(c, dict) else getattr(c, "label", ""),
+                "kind": c.get("kind", "macro") if isinstance(c, dict) else getattr(c, "kind", ""),
+                "payload": c.get("payload") if isinstance(c, dict) else getattr(c, "payload", {}),
+            }
+            for c in candidates
+        ],
+        "state_before": ppo_state_summary(state_before),
+        "state_after": ppo_state_summary(state_after),
+    }
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=True) + "\n")
+    except Exception as exc:
+        print(Fore.YELLOW + f"[PPO] rollout write failed: {exc}")
 
 
 def get_enemy_hp(enemy):
@@ -3455,6 +4287,9 @@ def load_exploration_config(control):
     mode = str(control.get("exploration_mode") or "aggressive").lower()
     if mode not in ("aggressive", "off"):
         mode = "aggressive"
+    constraint_mode = str(control.get("self_play_constraint_mode") or "explore").lower()
+    if constraint_mode not in ("guarded", "explore", "free"):
+        constraint_mode = "explore"
     try:
         combat_epsilon = max(0.0, min(float(control.get("combat_exploration_epsilon", 0.35)), 1.0))
     except (TypeError, ValueError):
@@ -3474,6 +4309,7 @@ def load_exploration_config(control):
     return {
         "enabled": enabled and mode != "off",
         "mode": mode,
+        "constraint_mode": constraint_mode,
         "combat_epsilon": combat_epsilon,
         "macro_epsilon": macro_epsilon,
         "top_k": top_k,
@@ -3549,6 +4385,66 @@ def payload_with_policy(payload, policy_name, model_version):
     return tagged
 
 
+def combat_enemies_from_state(state):
+    if not isinstance(state, dict):
+        return []
+    battle = state.get("battle") if isinstance(state.get("battle"), dict) else {}
+    return [e for e in (battle.get("enemies") or []) if isinstance(e, dict)]
+
+
+def enemy_identity(enemy):
+    return str(enemy.get("entity_id") or enemy.get("combat_id") or enemy.get("id") or enemy.get("name") or "")
+
+
+def boss_hp_snapshot(state):
+    if not isinstance(state, dict) or str(state.get("state_type") or "").lower() != "boss":
+        return None
+    enemies = combat_enemies_from_state(state)
+    rows = []
+    total_hp = 0
+    total_max_hp = 0
+    for index, enemy in enumerate(enemies):
+        max_hp = safe_int(enemy.get("max_hp"), 0)
+        hp = max(0, safe_int(enemy.get("hp", enemy.get("current_hp")), 0))
+        if max_hp <= 0 and hp <= 0:
+            continue
+        identity = enemy_identity(enemy) or f"enemy_{index}"
+        total_hp += hp
+        total_max_hp += max(max_hp, hp)
+        rows.append({
+            "id": identity,
+            "name": enemy.get("name") or enemy.get("id") or identity,
+            "hp": hp,
+            "max_hp": max(max_hp, hp),
+            "block": safe_int(enemy.get("block"), 0),
+        })
+    if not rows:
+        return None
+    return {
+        "total_hp": total_hp,
+        "total_max_hp": total_max_hp,
+        "hp_ratio": round(total_hp / max(total_max_hp, 1), 4),
+        "enemies": rows,
+    }
+
+
+def boss_hp_progress(before, after):
+    before_snapshot = boss_hp_snapshot(before)
+    after_snapshot = boss_hp_snapshot(after)
+    if not before_snapshot and not after_snapshot:
+        return None
+    progress = {
+        "before": before_snapshot,
+        "after": after_snapshot,
+        "damage": 0,
+        "hp_ratio_drop": 0.0,
+    }
+    if before_snapshot and after_snapshot:
+        progress["damage"] = max(0, before_snapshot["total_hp"] - after_snapshot["total_hp"])
+        progress["hp_ratio_drop"] = round(before_snapshot["hp_ratio"] - after_snapshot["hp_ratio"], 4)
+    return progress
+
+
 def append_ai_action_log(session_id, action_payload, state_before, state_after, ok, policy_name="", model_version=""):
     control = load_control()
     if not control.get("record_ai_actions", True):
@@ -3556,6 +4452,7 @@ def append_ai_action_log(session_id, action_payload, state_before, state_after, 
 
     os.makedirs(AI_LOG_DIR, exist_ok=True)
     path = os.path.join(AI_LOG_DIR, f"ai_combat_run_{datetime.now():%Y-%m-%d}.jsonl")
+    boss_progress = boss_hp_progress(state_before, state_after)
     record = {
         "type": "action",
         "run_id": session_id,
@@ -3569,6 +4466,10 @@ def append_ai_action_log(session_id, action_payload, state_before, state_after, 
         "state_before": state_before,
         "state_after": state_after,
     }
+    if boss_progress:
+        record["boss_hp_progress"] = boss_progress
+        record["boss_damage_delta"] = boss_progress.get("damage", 0)
+        record["boss_hp_ratio_drop"] = boss_progress.get("hp_ratio_drop", 0.0)
     try:
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -3629,12 +4530,18 @@ def run_agent():
     encoder, id_to_action, model, device, combat_metadata = load_agent(processed_dir)
     candidate_agent = load_candidate_agent(processed_dir)
     macro_agent = load_macro_agent(macro_processed_dir)
+    startup_control = load_control()
+    ppo_agent = load_active_ppo_agent(startup_control)
+    ppo_policy_mode = normalize_policy_mode(startup_control.get("policy_mode"))
     combat_policy_name = "bc_combat"
     combat_model_version = combat_metadata.get("model_version", "")
     candidate_policy_name = "candidate_bc_combat"
     candidate_model_version = (candidate_agent or {}).get("model_version", "")
+    if candidate_agent and str(candidate_agent.get("model_path") or "").startswith("candidate_rl_"):
+        candidate_policy_name = "candidate_rl_combat"
     macro_policy_name = "macro_mixed"
     macro_model_version = (macro_agent or {}).get("model_version", "rules")
+    ppo_model_version = (ppo_agent or {}).get("model_version", "")
     session_id = f"ai_{datetime.now():%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:8]}"
     
     print(Fore.GREEN + Style.BRIGHT + "\n====== STS2 AI Control System v2 ======")
@@ -3644,6 +4551,7 @@ def run_agent():
     last_status_print = 0
     last_data_source = None
     last_macro_decision_key = None
+    last_macro_decision_ts = 0.0
     card_select_memory = {}
     potion_used_turn_key = None
 
@@ -3660,6 +4568,7 @@ def run_agent():
 
         control = load_control()
         exploration = load_exploration_config(control)
+        current_policy_mode = normalize_policy_mode(control.get("policy_mode"))
         if not control.get("ai_enabled", True):
             if last_data_source != "human":
                 set_data_source("human")
@@ -3686,7 +4595,8 @@ def run_agent():
         
         # 只在：战斗中 + 出牌阶段 + 轮到玩家 + 没有锁定 时才行动
         if not (state_type in ("monster", "elite", "boss") and is_play and turn == "player"):
-            if state_type in ("shop", "fake_merchant") and not control.get("macro_shop_enabled", False):
+            constraint_mode = exploration.get("constraint_mode", "guarded")
+            if state_type in ("shop", "fake_merchant") and not control.get("macro_shop_enabled", False) and constraint_mode == "guarded":
                 write_ai_logic_snapshot({
                     "timestamp": int(time.time() * 1000),
                     "session_id": session_id,
@@ -3706,7 +4616,7 @@ def run_agent():
                 continue
 
             if control.get("macro_enabled", False) and state_type in ("map", "rewards", "card_reward", "card_select", "hand_select", "event", "crystal_sphere", "rest_site", "shop", "fake_merchant", "treasure"):
-                allow_shop = bool(control.get("macro_shop_enabled", False))
+                allow_shop = bool(control.get("macro_shop_enabled", False) or constraint_mode in ("explore", "free"))
                 card_baseline_weight = safe_num(control.get("macro_card_reward_weight"), 0.35)
                 card_select_key = None
                 if is_selection_state_type(state_type):
@@ -3721,6 +4631,60 @@ def run_agent():
                     card_baseline_weight=card_baseline_weight,
                     exploration=exploration,
                 )
+                macro_ppo_candidates = []
+                macro_ppo_features = []
+                macro_ppo_decision = None
+                macro_ppo_chosen_index = None
+                if current_policy_mode in ("ppo_experiment", "ppo_best") and ppo_agent:
+                    macro_ppo_candidates = enumerate_macro_candidates(
+                        state,
+                        macro_agent=macro_agent,
+                        allow_shop=allow_shop,
+                        card_baseline_weight=card_baseline_weight,
+                        exploration=exploration,
+                    )
+                    payload_key = action_payload_key(payload)
+                    fallback_index = next(
+                        (i for i, c in enumerate(macro_ppo_candidates) if action_payload_key(c.get("payload")) == payload_key),
+                        -1,
+                    )
+                    if fallback_index < 0 and payload:
+                        macro_ppo_candidates.append({
+                            "label": macro_info.get("chosen_action") or payload.get("action") or "macro_fallback",
+                            "payload": payload,
+                            "score": 1.0,
+                            "marker": macro_info.get("reason", "fallback"),
+                            "features": macro_row(macro_agent, state, {
+                                "label": macro_info.get("chosen_action") or payload.get("action") or "macro_fallback",
+                                "payload": payload,
+                                "score": 1.0,
+                            }, len(macro_ppo_candidates), len(macro_ppo_candidates) + 1).tolist(),
+                        })
+                        fallback_index = len(macro_ppo_candidates) - 1
+                    macro_ppo_features = [c.get("features", []) for c in macro_ppo_candidates]
+                    macro_ppo_decision = ppo_select(
+                        ppo_agent,
+                        macro_ppo_features,
+                        fallback_index=max(0, fallback_index),
+                        deterministic=(current_policy_mode == "ppo_best"),
+                    )
+                    if macro_ppo_decision:
+                        macro_ppo_chosen_index = int(macro_ppo_decision["chosen_index"])
+                        if ppo_agent.get("trained") and 0 <= macro_ppo_chosen_index < len(macro_ppo_candidates):
+                            chosen_ppo_macro = macro_ppo_candidates[macro_ppo_chosen_index]
+                            payload = chosen_ppo_macro.get("payload")
+                            macro_info["chosen_action"] = chosen_ppo_macro.get("label")
+                            macro_info["payload"] = payload
+                            macro_info["reason"] = f"ppo_macro:{ppo_agent.get('source')} {chosen_ppo_macro.get('marker', '')}"
+                        macro_info["top_actions"] = [
+                            {
+                                "action": macro_ppo_candidates[item["index"]].get("label"),
+                                "confidence": round(item["confidence"] * 100.0, 2),
+                                "marker": "ppo_macro",
+                            }
+                            for item in (macro_ppo_decision.get("ranked") or [])[:6]
+                            if 0 <= item["index"] < len(macro_ppo_candidates)
+                        ] or macro_info.get("top_actions", [])
                 decision_key = json.dumps({
                     "signature": macro_state_signature(state),
                     "payload": payload,
@@ -3730,24 +4694,34 @@ def run_agent():
                     "session_id": session_id,
                     "state_type": state_type,
                     "mode": "macro",
-                    "policy_name": macro_policy_name,
-                    "model_version": macro_model_version,
+                    "policy_name": current_policy_mode if current_policy_mode in ("ppo_experiment", "ppo_best") and ppo_agent and ppo_agent.get("trained") else macro_policy_name,
+                    "model_version": ppo_model_version if current_policy_mode in ("ppo_experiment", "ppo_best") and ppo_agent and ppo_agent.get("trained") else macro_model_version,
                     "top_actions": macro_info.get("top_actions", []),
                     "chosen_action": macro_info.get("chosen_action"),
                     "payload": payload,
                     "reason": macro_info.get("reason"),
+                    "constraint_mode": constraint_mode,
                     "deck_profile": macro_info.get("deck_profile"),
                     "reward_baseline": macro_info.get("reward_baseline"),
                     "exploration": exploration,
                 })
-                if payload and decision_key != last_macro_decision_key:
+                now_ts = time.time()
+                macro_retry_after = 1.0 if state_type in ("rewards", "treasure", "card_reward") else 2.0 if state_type in ("rest_site", "event", "card_select", "hand_select") else 6.0
+                should_retry_macro = bool(
+                    payload
+                    and decision_key == last_macro_decision_key
+                    and now_ts - last_macro_decision_ts >= macro_retry_after
+                )
+                if payload and (decision_key != last_macro_decision_key or should_retry_macro):
                     print(Fore.GREEN + Style.BRIGHT + f"  >>> MACRO EXECUTE: {macro_info.get('chosen_action')}")
                     print(Fore.WHITE + f"  Sending: {json.dumps(payload, ensure_ascii=False)}")
                     if last_data_source != "ai":
                         set_data_source("ai")
                         last_data_source = "ai"
                     raw_payload = payload
-                    payload = payload_with_policy(payload, macro_policy_name, macro_model_version)
+                    active_macro_policy = current_policy_mode if current_policy_mode in ("ppo_experiment", "ppo_best") and ppo_agent and ppo_agent.get("trained") else macro_policy_name
+                    active_macro_version = ppo_model_version if current_policy_mode in ("ppo_experiment", "ppo_best") and ppo_agent and ppo_agent.get("trained") else macro_model_version
+                    payload = payload_with_policy(payload, active_macro_policy, active_macro_version)
                     success = send_action(payload)
                     if is_selection_state_type(state_type) and card_select_key and success:
                         action_name = raw_payload.get("action")
@@ -3757,10 +4731,26 @@ def run_agent():
                         elif action_name in ("confirm_selection", "cancel_selection", "combat_confirm_selection"):
                             card_select_memory.pop(card_select_key, None)
                     last_macro_decision_key = decision_key
+                    last_macro_decision_ts = now_ts
                     if not success and last_data_source != "human":
                         set_data_source("human")
                         last_data_source = "human"
-                    agent_sleep(1.5, control)
+                    state_after = fetch_game_state()
+                    append_ppo_rollout(
+                        session_id,
+                        current_policy_mode,
+                        state,
+                        state_after,
+                        raw_payload,
+                        success,
+                        macro_ppo_candidates,
+                        macro_ppo_features,
+                        macro_ppo_chosen_index,
+                        macro_ppo_decision,
+                        active_macro_policy,
+                    )
+                    macro_post_delay = 0.6 if state_type in ("rewards", "treasure", "card_reward") else 1.0
+                    agent_sleep(macro_post_delay, control)
                     continue
                 if state_type in ("shop", "fake_merchant") and not allow_shop:
                     agent_sleep(4.0, control)
@@ -3834,6 +4824,62 @@ def run_agent():
                 state,
                 exploration=exploration,
             )
+            combat_ppo_features = []
+            combat_ppo_decision = None
+            combat_ppo_chosen_index = None
+            if current_policy_mode in ("ppo_experiment", "ppo_best") and ppo_agent and legal_candidates:
+                try:
+                    ppo_state_part = align_feature_vector(state_vec, max(0, PPO_INPUT_DIM - CANDIDATE_FEATURE_DIM))
+                    combat_ppo_features = [
+                        ppo_align_row(np.concatenate([
+                            np.asarray(ppo_state_part, dtype=np.float32),
+                            np.asarray(candidate.features, dtype=np.float32),
+                        ])).tolist()
+                        for candidate in legal_candidates
+                    ]
+                    fallback_index = 0
+                    if candidate_decision:
+                        fallback_candidate = candidate_decision.get("candidate")
+                        fallback_index = next(
+                            (idx for idx, candidate in enumerate(legal_candidates) if candidate is fallback_candidate),
+                            0,
+                        )
+                    combat_ppo_decision = ppo_select(
+                        ppo_agent,
+                        combat_ppo_features,
+                        fallback_index=fallback_index,
+                        deterministic=(current_policy_mode == "ppo_best"),
+                    )
+                    if combat_ppo_decision:
+                        combat_ppo_chosen_index = int(combat_ppo_decision.get("chosen_index", 0))
+                        if ppo_agent.get("trained") and 0 <= combat_ppo_chosen_index < len(legal_candidates):
+                            chosen_ppo_candidate = legal_candidates[combat_ppo_chosen_index]
+                            chosen_score = next(
+                                (
+                                    float(item.get("score", 0.0))
+                                    for item in (combat_ppo_decision.get("ranked") or [])
+                                    if int(item.get("index", -1)) == combat_ppo_chosen_index
+                                ),
+                                0.0,
+                            )
+                            candidate_decision = {
+                                "candidate": chosen_ppo_candidate,
+                                "score": chosen_score,
+                                "reason": f"ppo_combat:{ppo_agent.get('source')}",
+                            }
+                            decision_source = f"ppo_{current_policy_mode}"
+                            ranked_candidates = [
+                                {
+                                    "candidate": legal_candidates[item["index"]],
+                                    "score": float(item.get("score", item.get("confidence", 0.0))),
+                                    "confidence": float(item.get("confidence", 0.0)),
+                                    "reason": "ppo_combat",
+                                }
+                                for item in (combat_ppo_decision.get("ranked") or [])
+                                if 0 <= int(item.get("index", -1)) < len(legal_candidates)
+                            ]
+                except Exception as exc:
+                    print(Fore.YELLOW + f"  [PPO] Combat policy unavailable, using current RL. {exc}")
             
             # === 选择最佳合法动作 ===
             if candidate_decision:
@@ -3841,13 +4887,20 @@ def run_agent():
                 chosen_action = chosen_candidate.kind
                 chosen_candidate_label = chosen_candidate.label
                 top_actions = candidate_top_actions(ranked_candidates)
-                active_policy_name = candidate_policy_name
-                active_model_version = candidate_model_version
+                ppo_is_active = bool(
+                    current_policy_mode in ("ppo_experiment", "ppo_best")
+                    and ppo_agent
+                    and ppo_agent.get("trained")
+                    and combat_ppo_decision
+                )
+                active_policy_name = current_policy_mode if ppo_is_active else candidate_policy_name
+                active_model_version = ppo_model_version if ppo_is_active else candidate_model_version
                 print(Fore.CYAN + "  [Candidate] Top 5 candidate scores:")
                 for item in top_actions:
                     print(f"    {item['action'][:58]:58s}  {item['confidence']:5.1f}% [{item['marker']}]")
                 print(Fore.GREEN + Style.BRIGHT + f"  >>> EXECUTE: {chosen_candidate_label}")
-                payload = payload_with_policy(chosen_candidate.payload, active_policy_name, active_model_version)
+                raw_payload = chosen_candidate.payload
+                payload = payload_with_policy(raw_payload, active_policy_name, active_model_version)
                 write_ai_logic_snapshot({
                     "timestamp": int(time.time() * 1000),
                     "session_id": session_id,
@@ -3870,6 +4923,7 @@ def run_agent():
                     "chosen_candidate": chosen_candidate_label,
                     "payload": payload,
                     "reason": "candidate scorer plus tactical guards chose the highest scoring legal action",
+                    "constraint_mode": exploration.get("constraint_mode", "guarded"),
                     "exploration": exploration,
                 })
                 if payload:
@@ -3880,6 +4934,19 @@ def run_agent():
                     success = send_action(payload)
                     state_after = fetch_game_state()
                     append_ai_action_log(session_id, payload, state, state_after, success, active_policy_name, active_model_version)
+                    append_ppo_rollout(
+                        session_id,
+                        current_policy_mode,
+                        state,
+                        state_after,
+                        raw_payload,
+                        success,
+                        legal_candidates,
+                        combat_ppo_features,
+                        combat_ppo_chosen_index,
+                        combat_ppo_decision,
+                        active_policy_name,
+                    )
                     if success and chosen_candidate.kind == "use_potion":
                         potion_used_turn_key = current_turn_key
                     if success:
@@ -3917,6 +4984,7 @@ def run_agent():
                     "chosen_candidate": chosen_candidate_label,
                     "payload": payload,
                     "reason": "zero-cost first, otherwise model-ranked affordable card",
+                    "constraint_mode": exploration.get("constraint_mode", "guarded"),
                     "exploration": exploration,
                 })
                 
@@ -3957,6 +5025,7 @@ def run_agent():
                     "chosen_candidate": end_turn_candidate.label if end_turn_candidate else "end_turn",
                     "payload": payload,
                     "reason": "no affordable playable card",
+                    "constraint_mode": exploration.get("constraint_mode", "guarded"),
                     "exploration": exploration,
                 })
                 if last_data_source != "ai":
@@ -3968,4 +5037,11 @@ def run_agent():
                 agent_sleep(1.5, control)
                         
 if __name__ == "__main__":
-    run_agent()
+    try:
+        run_agent()
+    except Exception:
+        error_path = os.path.join(os.path.dirname(__file__), "ai_agent_error.log")
+        with open(error_path, "a", encoding="utf-8") as f:
+            f.write(f"\n[{datetime.now().isoformat(timespec='seconds')}] ai_agent crashed\n")
+            traceback.print_exc(file=f)
+        raise

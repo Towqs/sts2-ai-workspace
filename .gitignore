@@ -18,6 +18,7 @@ RL_Datasets/
 Data_Packages/
 AI_Training/ProcessedParams/
 AI_Training/ProcessedMacroParams/
+AI_Training/ProcessedPPOParams/
 !AI_Training/ModelZoo/
 !AI_Training/ModelZoo/**/
 !AI_Training/ModelZoo/**/*.json
@@ -31,6 +32,7 @@ AI_Training/ai_logic_state.json
 AI_Training/llm_logic_state.json
 AI_Training/control_panel_state.json
 AI_Training/model_config.json
+AI_Training/self_play_state.json
 
 # Legacy local copy; active mod source is under 训练脚本/STS2MCP
 RL_Training/

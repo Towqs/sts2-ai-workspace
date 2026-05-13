@@ -663,6 +663,7 @@ def build_dataset(data_dirs, output_dir):
     candidate_X_data = [] # 状态向量 + 候选动作特征
     candidate_Y_data = [] # 1 表示该候选动作匹配人类记录
     candidate_group_data = [] # 同一个原始样本下的候选动作分组
+    candidate_group_meta = [] # group_id -> run/source/quality metadata for RL fine-tuning
     candidate_groups = 0
     candidate_match_misses = 0
     accepted_sources = {}
@@ -711,6 +712,13 @@ def build_dataset(data_dirs, output_dir):
                         candidates = enumerate_combat_actions(state)
                         matched_idx = match_logged_action(candidates, action)
                         if matched_idx >= 0:
+                            candidate_group_meta.append({
+                                "group_id": int(group_id),
+                                "run_id": run_id,
+                                "source": source,
+                                "quality": quality,
+                                "matched_idx": int(matched_idx),
+                            })
                             for idx, candidate_features in enumerate(candidate_feature_rows(candidates)):
                                 candidate_X_data.append(np.concatenate([
                                     state_vec,
@@ -748,6 +756,8 @@ def build_dataset(data_dirs, output_dir):
     np.save(os.path.join(output_dir, 'candidate_X_train.npy'), candidate_X_data)
     np.save(os.path.join(output_dir, 'candidate_Y_train.npy'), candidate_Y_data)
     np.save(os.path.join(output_dir, 'candidate_group_train.npy'), candidate_group_data)
+    with open(os.path.join(output_dir, "candidate_group_meta.json"), "w", encoding="utf-8") as f:
+        json.dump({"groups": candidate_group_meta}, f, indent=2, ensure_ascii=False)
 
     # per-run 详细列表（按样本数降序）
     runs_detail = []
@@ -773,6 +783,7 @@ def build_dataset(data_dirs, output_dir):
         "candidate_groups": int(candidate_groups),
         "candidate_positive": int(candidate_Y_data.sum()) if len(candidate_Y_data) else 0,
         "candidate_match_misses": int(candidate_match_misses),
+        "candidate_group_meta_path": "candidate_group_meta.json",
         "candidate_feature_dim": int(CANDIDATE_FEATURE_DIM),
         "candidate_total_features": int(candidate_X_data.shape[1]) if candidate_X_data.ndim == 2 else 0,
         "accepted_sources": accepted_sources,

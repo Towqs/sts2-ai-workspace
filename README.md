@@ -4,12 +4,12 @@
   <img src="AI_Training/assets/sts2_ai_logo.png" alt="STS2 AI Logo" width="180">
 </p>
 
-STS2 AI Workspace 是一个面向 **Slay the Spire 2** 的本地 AI 工作区。它把游戏状态读取、数据采集、网页控制台、行为克隆训练、模型切换和 OpenAI-compatible LLM 接入放在同一个工作流里。
+STS2 AI Workspace 是一个面向 **Slay the Spire 2** 的本地 AI 工作区。它把游戏状态读取、数据采集、网页控制台、行为克隆训练、自训练评测、模型切换和 OpenAI-compatible LLM 接入放在同一个工作流里。
 
 项目当前是半成品，但已经可以跑通一条完整闭环：
 
 ```text
-游戏 Mod 读取状态 -> 控制台展示和写日志 -> 数据管线生成样本 -> 训练 BC 模型 -> AI/LLM 决策 -> 继续回收数据
+游戏 Mod 读取状态 -> 控制台展示和写日志 -> 数据管线生成样本 -> 训练 BC / 候选动作 / Phase 2A 微调模型 -> AI/LLM 决策 -> 继续回收数据
 ```
 
 ## 当前能做什么
@@ -22,6 +22,8 @@ STS2 AI Workspace 是一个面向 **Slay the Spire 2** 的本地 AI 工作区。
 | 宏观 AI | 初版可用，支持地图、奖励、选卡、事件和营火；商店购买默认保护。 |
 | 训练数据采集 | 支持 Human / AI / LLM 来源，按 run_id 汇总和体检。 |
 | 数据重构与训练 | 支持战斗 BC、候选动作 BC、宏观 BC。 |
+| 自训练 | 已支持固定 seed、自训练 run 评分、入训门槛和按批次触发训练。 |
+| Phase 2A 微调 | 已接入基于 self-play 评分的候选动作 reward-weighted 微调；完整 PPO 仍是后续方向。 |
 | LLM 接入 | 支持 OpenAI-compatible Chat Completions；推荐只从合法候选动作中选择。 |
 | 模型包切换 | 已支持 `AI_Training/ModelZoo/` 下的可切换模型包。 |
 
@@ -31,9 +33,10 @@ STS2 AI Workspace 是一个面向 **Slay the Spire 2** 的本地 AI 工作区。
 
 主要短板：
 
-- 高质量人类数据仍然太少。
+- 高质量人类数据和高价值 self-play run 仍然太少。
 - 宏观选择还需要更多路线、奖励、事件、营火和商店样本。
 - AI 数据已经可以筛选入训，但仍需要人工复核失败原因。
+- 当前 Phase 2A 只有在出现 admitted self-play run 后才会真正微调；A1 死亡局不会直接回灌。
 - LLM 更适合作为“大脑”和解释器，自动执行必须继续受合法动作校验约束。
 
 ## 快速开始
@@ -202,6 +205,7 @@ AI_Training/ModelZoo/demo_local_20260430/
 | 记录 AI 战斗动作 | 写入 AI 战斗日志，便于复盘和后续入训。 |
 | AI 数据进入 BC | 默认关闭；打开后只允许合格 AI 样本进入训练数据。 |
 | 最低训练质量 | 过滤低质量 run，例如只使用一关 Boss 后或更高质量数据。 |
+| 自训练固定 Seed | 用于复现局面和诊断死因；长期训练建议使用 seed 池。 |
 
 ## 仓库结构
 
@@ -235,9 +239,12 @@ AI_Training/ModelZoo/demo_local_20260430/
 .\.venv\Scripts\python.exe .\AI_Training\data_pipeline.py
 .\.venv\Scripts\python.exe .\AI_Training\train_bc.py
 .\.venv\Scripts\python.exe .\AI_Training\train_candidate_bc.py
+.\.venv\Scripts\python.exe .\AI_Training\train_rl_finetune.py
 .\.venv\Scripts\python.exe .\AI_Training\macro_data_pipeline.py
 .\.venv\Scripts\python.exe .\AI_Training\train_macro_bc.py
 ```
+
+`train_rl_finetune.py` 会读取 `RL_Datasets/self_play_scores.json`，只使用 `admitted=true` 的 self-play run。没有合格 run 时会安全跳过，不会污染现有 BC baseline。
 
 训练输出默认在：
 

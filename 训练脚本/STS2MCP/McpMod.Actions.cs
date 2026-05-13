@@ -172,29 +172,52 @@ public static partial class McpMod
         var character = (OptionalString(data, "character") ?? "IRONCLAD").Trim().ToUpperInvariant();
         var ascension = (int)OptionalDouble(data, "ascension", 0);
         var seed = OptionalString(data, "seed");
+        if (!string.IsNullOrWhiteSpace(seed))
+            seed = seed.Trim().ToUpperInvariant();
 
         if (character != "IRONCLAD")
             return Error("start_new_run currently supports character=IRONCLAD only");
         if (ascension != 0)
             return Error("start_new_run currently supports ascension=0 only");
-        if (!string.IsNullOrWhiteSpace(seed))
-            return Error("start_new_run currently supports seed=null only");
         if (RunManager.Instance.IsInProgress)
             return Error("A run is already in progress");
 
         RL_DataCollector.SetDataSource(RL_DataCollector.DataSource.AI);
-        RL_DataCollector.MarkMenuRunIntent("new", null);
+        RL_DataCollector.MarkMenuRunIntent("new", seed, RL_DataCollector.DataSource.AI);
 
         var root = ((SceneTree)Engine.GetMainLoop()).Root;
-        var characterSelect = TryHandleCharacterSelectStart(root);
+        var characterSelect = TryHandleCharacterSelectStart(root, seed);
         if (characterSelect != null)
             return characterSelect;
+
+        var direct = TryInvokeMenuStartMethod(root, seed);
+        if (direct != null)
+            return direct;
+
+        if (!string.IsNullOrWhiteSpace(seed))
+        {
+            var opened = TryClickMenuStartButton(root);
+            if (opened != null)
+            {
+                opened["message"] = $"{opened["message"]}; opened character select before applying seed {seed}";
+                return opened;
+            }
+
+            opened = TryInvokeMenuStartMethod(root);
+            if (opened != null)
+            {
+                opened["message"] = $"{opened["message"]}; opened character select before applying seed {seed}";
+                return opened;
+            }
+
+            return Error("start_new_run with seed could not reach the character select screen");
+        }
 
         var clicked = TryClickMenuStartButton(root);
         if (clicked != null)
             return clicked;
 
-        var direct = TryInvokeMenuStartMethod(root);
+        direct = TryInvokeMenuStartMethod(root);
         if (direct != null)
             return direct;
 
@@ -237,7 +260,7 @@ public static partial class McpMod
         }
 
         RL_DataCollector.SetDataSource(RL_DataCollector.DataSource.AI);
-        RL_DataCollector.MarkMenuRunIntent("continue");
+        RL_DataCollector.MarkMenuRunIntent("continue", null, RL_DataCollector.DataSource.AI);
 
         var root = ((SceneTree)Engine.GetMainLoop()).Root;
         var buttons = FindAll<NButton>(root)
@@ -350,7 +373,7 @@ public static partial class McpMod
         };
     }
 
-    private static Dictionary<string, object?>? TryHandleCharacterSelectStart(Node root)
+    private static Dictionary<string, object?>? TryHandleCharacterSelectStart(Node root, string? seed = null)
     {
         var characterButtons = FindAll<NCharacterSelectButton>(root)
             .Where(button => button.IsVisibleInTree() && button.IsEnabled)
@@ -368,6 +391,14 @@ public static partial class McpMod
         if (ironcladButton != null)
         {
             ironcladButton.ForceClick();
+
+            if (!string.IsNullOrWhiteSpace(seed))
+            {
+                var seeded = TryStartCharacterSelectWithSeed(root, seed);
+                if (seeded != null)
+                    return seeded;
+                return Error("Could not set seed and embark on the character select screen");
+            }
 
             var confirmButton = FindAll<NConfirmButton>(root)
                 .FirstOrDefault(button => button.IsVisibleInTree() && button.IsEnabled);
@@ -392,6 +423,14 @@ public static partial class McpMod
             .FirstOrDefault(button => button.IsVisibleInTree() && button.IsEnabled);
         if (confirmOnly != null)
         {
+            if (!string.IsNullOrWhiteSpace(seed))
+            {
+                var seeded = TryStartCharacterSelectWithSeed(root, seed);
+                if (seeded != null)
+                    return seeded;
+                return Error("Could not set seed and embark on the character select screen");
+            }
+
             confirmOnly.ForceClick();
             return new Dictionary<string, object?>
             {
@@ -403,7 +442,45 @@ public static partial class McpMod
         return null;
     }
 
-    private static Dictionary<string, object?>? TryInvokeMenuStartMethod(Node root)
+    private static Dictionary<string, object?>? TryStartCharacterSelectWithSeed(Node root, string seed)
+    {
+        foreach (var screen in FindAll<NCharacterSelectScreen>(root))
+        {
+            if (!screen.IsVisibleInTree())
+                continue;
+
+            try
+            {
+                var lobby = screen.Lobby;
+                var begin = lobby.GetType().GetMethod("BeginRunLocally", BindingFlags.NonPublic | BindingFlags.Instance);
+                if (begin == null)
+                    return Error("Could not find StartRunLobby.BeginRunLocally(seed, modifiers)");
+
+                var parameters = begin.GetParameters();
+                if (parameters.Length != 2 || parameters[0].ParameterType != typeof(string))
+                    return Error("StartRunLobby.BeginRunLocally signature is not supported");
+
+                var emptyModifiers = System.Activator.CreateInstance(parameters[1].ParameterType);
+                begin.Invoke(lobby, new object?[] { seed, emptyModifiers });
+                return new Dictionary<string, object?>
+                {
+                    ["status"] = "ok",
+                    ["message"] = $"Invoked StartRunLobby.BeginRunLocally with seed {seed}"
+                };
+            }
+            catch (System.Exception ex)
+            {
+                var message = ex is TargetInvocationException && ex.InnerException != null
+                    ? ex.InnerException.Message
+                    : ex.Message;
+                return Error($"Failed to start seeded character select run: {message}");
+            }
+        }
+
+        return null;
+    }
+
+    private static Dictionary<string, object?>? TryInvokeMenuStartMethod(Node root, string? seed = null)
     {
         foreach (var node in FindAll<Node>(root))
         {
@@ -411,7 +488,8 @@ public static partial class McpMod
             if (!typeName.Contains("MainMenu") && !typeName.Contains("Singleplayer") && !typeName.Contains("CharacterSelect"))
                 continue;
 
-            foreach (var methodName in new[]
+            foreach (var methodName in string.IsNullOrWhiteSpace(seed)
+                     ? new[]
                      {
                          "StartNewSingleplayerRun",
                          "StartNewRun",
@@ -420,9 +498,19 @@ public static partial class McpMod
                          "OnEmbarkButtonPressed",
                          "OnNewRunButtonPressed",
                          "OnSingleplayerButtonPressed",
+                     }
+                     : new[]
+                     {
+                         "BeginRun",
+                         "StartNewRun",
+                         "StartNewSingleplayerRun",
+                         "OnNewRunButtonPressed",
+                         "OnEmbarkPressed",
+                         "OnEmbarkButtonPressed",
+                         "OnSingleplayerButtonPressed",
                      })
             {
-                var result = TryInvokeMenuMethod(node, methodName);
+                var result = TryInvokeMenuMethod(node, methodName, seed);
                 if (result)
                 {
                     return new Dictionary<string, object?>
@@ -520,14 +608,24 @@ public static partial class McpMod
         return null;
     }
 
-    private static bool TryInvokeMenuMethod(object target, string methodName)
+    private static bool TryInvokeMenuMethod(object target, string methodName, string? seed = null)
     {
         try
         {
             var methods = target.GetType()
                 .GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static)
-                .Where(method => method.Name == methodName)
-                .OrderBy(method => method.GetParameters().Length);
+                .Where(method => method.Name == methodName);
+            if (!string.IsNullOrWhiteSpace(seed))
+            {
+                methods = methods
+                    .OrderByDescending(method => method.GetParameters().Length == 1
+                        && method.GetParameters()[0].ParameterType == typeof(string))
+                    .ThenBy(method => method.GetParameters().Length);
+            }
+            else
+            {
+                methods = methods.OrderBy(method => method.GetParameters().Length);
+            }
 
             foreach (var method in methods)
             {
@@ -535,14 +633,18 @@ public static partial class McpMod
                 object?[] args;
                 if (parameters.Length == 0)
                 {
+                    if (!string.IsNullOrWhiteSpace(seed))
+                        continue;
                     args = System.Array.Empty<object?>();
                 }
                 else if (parameters.Length == 1 && parameters[0].ParameterType == typeof(string))
                 {
-                    args = new object?[] { "" };
+                    args = new object?[] { seed ?? "" };
                 }
                 else if (parameters.Length == 1 && !parameters[0].ParameterType.IsValueType)
                 {
+                    if (!string.IsNullOrWhiteSpace(seed))
+                        continue;
                     args = new object?[] { null };
                 }
                 else

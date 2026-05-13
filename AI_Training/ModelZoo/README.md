@@ -20,9 +20,11 @@ ModelZoo/<model_id>/
   ProcessedParams/
     bc_model_best.pth
     candidate_bc_model_best.pth
+    candidate_rl_model_best.pth      # 可选，Phase 2A 微调产物
     vocab.json
     metadata.json
     candidate_metadata.json
+    candidate_rl_metadata.json       # 可选，Phase 2A 微调摘要
   ProcessedMacroParams/
     macro_bc_model_best.pth
     vocab.json
@@ -53,5 +55,7 @@ AI 进程只在启动时加载模型，所以切换后必须重启 AI。
 - 对应 vocab。
 - metadata / training_summary。
 - `manifest.json`，说明训练日期、样本规模、数据来源和已知问题。
+
+如果模型包包含 Phase 2A 微调，请同时包含 `candidate_rl_model_best.pth` 和 `candidate_rl_metadata.json`。不包含时 AI 会自动回退到 `candidate_bc_model_best.pth`。
 
 不要把原始数据、训练矩阵、API Key 或本机配置放进 ModelZoo。

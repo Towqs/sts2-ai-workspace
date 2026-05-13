@@ -16,13 +16,18 @@ WORKSPACE = Path(__file__).resolve().parents[1]
 CONTROL_PATH = WORKSPACE / "AI_Training" / "control_state.json"
 SELF_PLAY_STATE_PATH = WORKSPACE / "AI_Training" / "self_play_state.json"
 SERVER_STATE_PATH = WORKSPACE / "AI_Training" / "control_panel_state.json"
+SELF_PLAY_SCORES_PATH = WORKSPACE / "RL_Datasets" / "self_play_scores.json"
 PANEL_BASE_URL = f"http://127.0.0.1:{int(os.environ.get('STS2_AI_PANEL_PORT', '8765'))}"
 GAME_API_URL = "http://127.0.0.1:15526/api/v1/singleplayer"
 
 DEFAULT_CONFIG = {
     "self_play_character": "IRONCLAD",
     "self_play_ascension": 0,
-    "self_play_target_runs": 20,
+    "self_play_seed": "",
+    "policy_mode": "current_rl",
+    "ppo_seed_mode": "fixed",
+    "ppo_fixed_seed": "101",
+    "self_play_target_runs": 0,
     "self_play_train_every_admitted_runs": 5,
     "self_play_max_run_minutes": 75,
     "self_play_stall_seconds": 120,
@@ -37,6 +42,7 @@ DEFAULT_CONFIG = {
     "ai_min_training_quality": "partial_act1",
     "exploration_enabled": True,
     "exploration_mode": "aggressive",
+    "self_play_constraint_mode": "explore",
     "combat_exploration_epsilon": 0.35,
     "macro_exploration_epsilon": 0.25,
     "exploration_top_k": 5,
@@ -78,14 +84,60 @@ def clamp_float(value, default, minimum, maximum):
         return default
 
 
+def normalize_seed(value):
+    text = str(value or "").strip().upper()
+    return text if text else ""
+
+
+def normalize_constraint_mode(value):
+    mode = str(value or "explore").strip().lower()
+    return mode if mode in {"guarded", "explore", "free"} else "explore"
+
+
+def normalize_policy_mode(value):
+    mode = str(value or "current_rl").strip().lower()
+    return mode if mode in {"current_rl", "ppo_experiment", "ppo_best"} else "current_rl"
+
+
+def normalize_ppo_seed_mode(value):
+    mode = str(value or "fixed").strip().lower()
+    return mode if mode in {"fixed", "random"} else "fixed"
+
+
+def is_game_over_state(state):
+    state = state or {}
+    overlay = state.get("overlay") if isinstance(state.get("overlay"), dict) else {}
+    screen_type = str(overlay.get("screen_type") or "").lower()
+    message = str(overlay.get("message") or "").lower()
+    hp = safe_int((state.get("player") or {}).get("hp"), 1)
+    return (
+        "gameover" in screen_type
+        or "game over" in screen_type
+        or "gameover" in message
+        or ("game over" in message and hp <= 0)
+    )
+
+
 def merged_config(overrides=None):
     data = read_control()
     if overrides:
         data.update(overrides)
+    policy_mode = normalize_policy_mode(data.get("policy_mode"))
+    ppo_seed_mode = normalize_ppo_seed_mode(data.get("ppo_seed_mode"))
+    base_seed = normalize_seed(data.get("self_play_seed"))
+    ppo_fixed_seed = normalize_seed(data.get("ppo_fixed_seed") or DEFAULT_CONFIG["ppo_fixed_seed"])
+    effective_seed = base_seed
+    if policy_mode in {"ppo_experiment", "ppo_best"}:
+        effective_seed = ppo_fixed_seed if ppo_seed_mode == "fixed" else ""
     return {
         "self_play_character": str(data.get("self_play_character") or DEFAULT_CONFIG["self_play_character"]).upper(),
         "self_play_ascension": clamp_int(data.get("self_play_ascension"), 0, 0, 20),
-        "self_play_target_runs": clamp_int(data.get("self_play_target_runs"), 20, 1, 999),
+        "self_play_seed": effective_seed,
+        "base_self_play_seed": base_seed,
+        "policy_mode": policy_mode,
+        "ppo_seed_mode": ppo_seed_mode,
+        "ppo_fixed_seed": ppo_fixed_seed,
+        "self_play_target_runs": clamp_int(data.get("self_play_target_runs"), 0, 0, 999),
         "self_play_train_every_admitted_runs": clamp_int(data.get("self_play_train_every_admitted_runs"), 5, 1, 999),
         "self_play_max_run_minutes": clamp_int(data.get("self_play_max_run_minutes"), 75, 5, 720),
         "self_play_stall_seconds": clamp_int(data.get("self_play_stall_seconds"), 120, 15, 3600),
@@ -104,6 +156,7 @@ def merged_config(overrides=None):
         "ai_min_training_quality": str(data.get("ai_min_training_quality") or "partial_act1"),
         "exploration_enabled": bool(data.get("exploration_enabled", True)),
         "exploration_mode": str(data.get("exploration_mode") or "aggressive"),
+        "self_play_constraint_mode": normalize_constraint_mode(data.get("self_play_constraint_mode")),
         "combat_exploration_epsilon": clamp_float(data.get("combat_exploration_epsilon"), 0.35, 0.0, 1.0),
         "macro_exploration_epsilon": clamp_float(data.get("macro_exploration_epsilon"), 0.25, 0.0, 1.0),
         "exploration_top_k": clamp_int(data.get("exploration_top_k"), 5, 1, 12),
@@ -129,6 +182,7 @@ def default_self_play_state():
         "finished_at": "",
         "last_updated_at": "",
         "current_run_id": "",
+        "current_seed": "",
         "current_state_type": "",
         "completed_runs": 0,
         "admitted_runs": 0,
@@ -141,6 +195,39 @@ def default_self_play_state():
         "last_model_id": "",
         "last_train_at": "",
         "loop_count": 0,
+    }
+
+
+def self_play_history_summary(config):
+    seed = normalize_seed((config or {}).get("self_play_seed"))
+    interval = int((config or {}).get("self_play_train_every_admitted_runs") or 5)
+    raw = read_json(SELF_PLAY_SCORES_PATH, {})
+    scores = raw.get("scores") if isinstance(raw, dict) else {}
+    if not isinstance(scores, dict):
+        return {
+            "completed_runs": 0,
+            "admitted_runs": 0,
+            "recent_scores": [],
+            "last_score": None,
+            "next_training_in": next_training_in(0, interval),
+        }
+    rows = []
+    for score in scores.values():
+        if not isinstance(score, dict):
+            continue
+        if seed and normalize_seed(score.get("seed")) != seed:
+            continue
+        rows.append(score)
+    rows.sort(key=lambda item: str(item.get("updated_at") or ""))
+    admitted = sum(1 for item in rows if item.get("admitted"))
+    recent = list(reversed(rows[-8:]))
+    use_completed_interval = normalize_policy_mode((config or {}).get("policy_mode")) in {"ppo_experiment", "ppo_best"}
+    return {
+        "completed_runs": len(rows),
+        "admitted_runs": admitted,
+        "recent_scores": recent,
+        "last_score": rows[-1] if rows else None,
+        "next_training_in": next_training_in(len(rows) if use_completed_interval else admitted, interval),
     }
 
 
@@ -158,6 +245,7 @@ class SelfPlayManager:
             "finished": None,
             "current_state": "idle",
             "current_run_id": "",
+            "current_seed": "",
             "current_floor": 0,
             "completed_runs": 0,
             "admitted_runs": 0,
@@ -189,6 +277,7 @@ class SelfPlayManager:
             "finished_at": self._status.get("finished") or "",
             "last_updated_at": datetime.now().isoformat(timespec="seconds"),
             "current_run_id": self._status.get("current_run_id") or "",
+            "current_seed": self._status.get("current_seed") or "",
             "current_state_type": self._status.get("current_state_type") or "",
             "completed_runs": int(self._status.get("completed_runs") or 0),
             "admitted_runs": int(self._status.get("admitted_runs") or 0),
@@ -215,6 +304,7 @@ class SelfPlayManager:
             if self._thread and self._thread.is_alive():
                 return {"status": "busy", "message": "自训练已经在运行中。", "self_play": deepcopy(self._status)}
             config = merged_config(overrides)
+            history = self_play_history_summary(config)
             self._stop_event.clear()
             self._status = {
                 "running": True,
@@ -223,18 +313,20 @@ class SelfPlayManager:
                 "finished": None,
                 "current_state": "starting",
                 "current_run_id": "",
+                "current_seed": normalize_seed(config.get("self_play_seed")),
                 "current_floor": 0,
-                "completed_runs": 0,
-                "admitted_runs": 0,
+                "completed_runs": int(history.get("completed_runs") or 0),
+                "admitted_runs": int(history.get("admitted_runs") or 0),
                 "target_runs": int(config["self_play_target_runs"]),
-                "recent_scores": [],
-                "last_score": None,
-                "next_training_in": int(config["self_play_train_every_admitted_runs"]),
+                "recent_scores": deepcopy(history.get("recent_scores") or []),
+                "last_score": deepcopy(history.get("last_score")),
+                "next_training_in": int(history.get("next_training_in") or config["self_play_train_every_admitted_runs"]),
                 "training_running": False,
-                "exploration": {
-                    "enabled": bool(config["exploration_enabled"]),
-                    "mode": config["exploration_mode"],
-                    "combat_epsilon": config["combat_exploration_epsilon"],
+            "exploration": {
+                "enabled": bool(config["exploration_enabled"]),
+                "mode": config["exploration_mode"],
+                "constraint_mode": config["self_play_constraint_mode"],
+                "combat_epsilon": config["combat_exploration_epsilon"],
                     "macro_epsilon": config["macro_exploration_epsilon"],
                     "top_k": config["exploration_top_k"],
                     "temperature": config["exploration_temperature"],
@@ -294,12 +386,17 @@ class SelfPlayManager:
             "next_run_mode": "new",
             "exploration_enabled": bool(config["exploration_enabled"]),
             "exploration_mode": config["exploration_mode"],
+            "self_play_constraint_mode": config["self_play_constraint_mode"],
             "combat_exploration_epsilon": float(config["combat_exploration_epsilon"]),
             "macro_exploration_epsilon": float(config["macro_exploration_epsilon"]),
             "exploration_top_k": int(config["exploration_top_k"]),
             "exploration_temperature": float(config["exploration_temperature"]),
             "self_play_character": config["self_play_character"],
             "self_play_ascension": int(config["self_play_ascension"]),
+            "self_play_seed": config.get("base_self_play_seed", config["self_play_seed"]),
+            "policy_mode": config["policy_mode"],
+            "ppo_seed_mode": config["ppo_seed_mode"],
+            "ppo_fixed_seed": config["ppo_fixed_seed"],
             "self_play_target_runs": int(config["self_play_target_runs"]),
             "self_play_train_every_admitted_runs": int(config["self_play_train_every_admitted_runs"]),
             "self_play_max_run_minutes": int(config["self_play_max_run_minutes"]),
@@ -325,10 +422,21 @@ class SelfPlayManager:
     def _existing_run_ids(self):
         return {run.get("run_id") for run in latest_runs(limit=200) if run.get("run_id")}
 
+    def _is_self_play_run(self, run):
+        run_id = str(run.get("run_id") or "")
+        if run_id.startswith("ai_"):
+            return True
+        ai_records = safe_int(run.get("ai"))
+        human_records = safe_int(run.get("human"))
+        game_start = safe_int(run.get("game_start"))
+        game_resume = safe_int(run.get("game_resume"))
+        startup_records = game_start + game_resume
+        return ai_records > 0 and human_records <= startup_records + 1
+
     def _find_new_run(self, existing_run_ids, started_ms):
         for run in latest_runs(limit=50):
             run_id = run.get("run_id")
-            if not run_id or run_id in existing_run_ids or not str(run_id).startswith("ai_"):
+            if not run_id or run_id in existing_run_ids or not self._is_self_play_run(run):
                 continue
             first_ts = safe_int(run.get("first_ts") or run.get("last_ts"))
             if first_ts and first_ts + 5000 < started_ms:
@@ -342,6 +450,7 @@ class SelfPlayManager:
         last_message = ""
         start_attempted = False
         transitional_since = None
+        recovered_existing_screen = False
         while time.time() < deadline and not self._stop_event.is_set():
             state = self._game_get(timeout=10)
             state_type = str(state.get("state_type") or "").lower()
@@ -349,11 +458,12 @@ class SelfPlayManager:
             if state_type == "menu":
                 transitional_since = None
                 self._panel_post("/api/control", {"next_run_mode": "new"}, timeout=10)
+                seed = config["self_play_seed"] or None
                 result = self._game_post({
                     "action": "start_new_run",
                     "character": config["self_play_character"],
                     "ascension": config["self_play_ascension"],
-                    "seed": None,
+                    "seed": seed,
                 }, timeout=20)
                 if result.get("status") == "error" or result.get("error"):
                     error_text = str(result.get("error") or result.get("message") or "")
@@ -366,7 +476,25 @@ class SelfPlayManager:
                 else:
                     last_message = str(result.get("message") or "正在尝试开新局。")
                     start_attempted = True
-                self._set_status(last_message=last_message, current_state="launching")
+                self._set_status(last_message=last_message, current_state="launching", current_seed=config["self_play_seed"])
+            elif is_game_over_state(state):
+                last_message = "Game-over overlay detected; returning to menu before new self-play run."
+                self._set_status(last_message=last_message, current_state="recovering", current_state_type=state_type)
+                self._recover_to_menu("launch_from_game_over")
+                start_attempted = False
+                recovered_existing_screen = False
+            elif not start_attempted and not recovered_existing_screen:
+                recovered_existing_screen = True
+                last_message = f"Game is still on {state_type}; recovering to menu before new self-play run."
+                self._set_status(last_message=last_message, current_state="recovering", current_state_type=state_type)
+                self._recover_to_menu("launch_from_" + state_type)
+                try:
+                    recovered_state = self._game_get(timeout=4)
+                    if str(recovered_state.get("state_type") or "").lower() == "menu":
+                        start_attempted = False
+                        recovered_existing_screen = False
+                except Exception:
+                    pass
             elif start_attempted:
                 # 角色已选择，游戏正在加载/过渡（overlay / card_select 等）
                 # AI agent 需要处理这些界面，runner 只需等待
@@ -398,19 +526,19 @@ class SelfPlayManager:
         return None
 
     def _recover_to_menu(self, reason):
-        deadline = time.time() + 45
+        deadline = time.time() + 18
         while time.time() < deadline and not self._stop_event.is_set():
             for action in ("return_to_menu", "abandon_run"):
                 try:
                     self._set_status(last_message=f"正在恢复到主菜单：{reason} ({action})", current_state="recovering")
-                    self._game_post({"action": action}, timeout=20)
-                    time.sleep(3.0)
-                    state = self._game_get(timeout=10)
+                    self._game_post({"action": action}, timeout=6)
+                    time.sleep(0.8)
+                    state = self._game_get(timeout=4)
                     if str(state.get("state_type") or "").lower() == "menu":
                         return True
                 except Exception:
                     continue
-            time.sleep(2.0)
+            time.sleep(0.5)
         return False
 
     def _monitor_run(self, run_id, config):
@@ -423,6 +551,16 @@ class SelfPlayManager:
             run = self._latest_run(run_id)
             state = self._game_get(timeout=10)
             state_type = str(state.get("state_type") or "").lower()
+            if is_game_over_state(state):
+                self._set_status(last_message=f"Game-over overlay detected; returning to menu: {run_id}", current_state="recovering")
+                self._recover_to_menu("game_over_overlay")
+                deadline = time.time() + 15
+                while time.time() < deadline and not self._stop_event.is_set():
+                    run = self._latest_run(run_id)
+                    if run and safe_int(run.get("records")) > 0:
+                        return run
+                    time.sleep(1.0)
+                return self._latest_run(run_id)
             if run:
                 marker = (
                     safe_int(run.get("last_ts")),
@@ -438,21 +576,27 @@ class SelfPlayManager:
                 self._set_status(
                     current_state="running",
                     current_run_id=run_id,
+                    current_seed=str(run.get("seed") or config["self_play_seed"] or ""),
                     current_state_type=state_type,
                     current_floor=safe_int(run.get("max_floor")),
                     last_message=f"运行中：floor {safe_int(run.get('max_floor'))} / act {safe_int(run.get('max_act'))}",
                 )
+                if safe_int(run.get("losses")) > 0 and safe_int(run.get("records")) > 0:
+                    if state_type != "menu":
+                        self._set_status(last_message=f"检测到死亡，快速返回主菜单：{run_id}", current_state="recovering")
+                        self._recover_to_menu("death_detected")
+                    return self._latest_run(run_id) or run
 
             if state_type == "menu":
                 # Fast path: data already flushed
                 if run and safe_int(run.get("records")) > 0:
                     stable_menu_polls += 1
-                    if stable_menu_polls >= 2:
+                    if stable_menu_polls >= 1:
                         return run
                 # Slow path: menu持续超过10秒，即使数据还没flush也认为局已结束
                 if menu_since is None:
                     menu_since = time.time()
-                elif time.time() - menu_since > 10:
+                elif time.time() - menu_since > 2:
                     self._set_status(last_message=f"菜单持续超过10秒，认定局 {run_id} 已结束。")
                     return run or self._latest_run(run_id)
             else:
@@ -465,15 +609,15 @@ class SelfPlayManager:
             if time.time() - last_progress_ts > config["self_play_stall_seconds"]:
                 self._recover_to_menu("stalled")
                 return self._latest_run(run_id)
-            time.sleep(3.0)
+            time.sleep(1.0)
         return self._latest_run(run_id)
 
-    def _wait_for_training(self, triggered_at, timeout_sec=3600):
+    def _wait_for_training(self, triggered_at, timeout_sec=3600, status_key="training"):
         deadline = time.time() + timeout_sec
         saw_current_training = False
         while time.time() < deadline and not self._stop_event.is_set():
             status = self._panel_get("/api/status", timeout=20)
-            training = status.get("training") or {}
+            training = status.get(status_key) or {}
             started = str(training.get("started") or "")
             finished = str(training.get("finished") or "")
             if started >= triggered_at or finished >= triggered_at:
@@ -503,22 +647,71 @@ class SelfPlayManager:
             last_model_id=str(registry.get("active_model_id") or ""),
             last_train_at=str(training.get("finished") or datetime.now().isoformat(timespec="seconds")),
         )
+        return status
+
+    def _trigger_ppo_training(self):
+        self._set_status(current_state="ppo_training", training_running=True, last_message="PPO batch reached; updating PPO policy.")
+        triggered_at = datetime.now().isoformat(timespec="seconds")
+        response = self._panel_post("/api/ppo/train", {}, timeout=20)
+        if response.get("status") not in {"ok", "busy"}:
+            raise RuntimeError(response.get("message") or response.get("error") or "PPO training failed to start.")
+        training = self._wait_for_training(triggered_at, status_key="ppo_training")
+        output = str(training.get("output") or "")
+        if "ERROR:" in output:
+            raise RuntimeError("PPO training reported an error.")
+        self._panel_post("/api/ai/restart", {}, timeout=20)
+        status = self._panel_get("/api/status", timeout=20)
+        ppo = status.get("ppo") or {}
+        self._set_status(
+            training_running=False,
+            last_message="PPO training complete; AI restarted with latest policy state.",
+            last_model_id=str(((ppo.get("metadata") or {}).get("model_version")) or ""),
+            last_train_at=str(training.get("finished") or datetime.now().isoformat(timespec="seconds")),
+        )
+        return status
+
+    def _save_model_snapshot(self, label, description="", activate=False):
+        response = self._panel_post("/api/model/snapshot", {
+            "label": label,
+            "description": description,
+            "activate": bool(activate),
+        }, timeout=30)
+        if response.get("status") != "ok":
+            raise RuntimeError(response.get("error") or "model snapshot failed")
+        return response
+
+    def _is_clear_score(self, score):
+        return bool(
+            score.get("probable_clear")
+            or score.get("reason_group") == "clear"
+            or score.get("reason") == "clear_or_probable_clear"
+            or safe_int(score.get("max_act")) >= 2
+        )
 
     def _worker(self, config):
         try:
             self._ensure_control(config)
             self._wait_for_ai()
             existing_run_ids = self._existing_run_ids()
-            admitted_runs = 0
-            completed_runs = 0
-            recent_scores = []
+            history = self_play_history_summary(config)
+            admitted_runs = int(history.get("admitted_runs") or 0)
+            completed_runs = int(history.get("completed_runs") or 0)
+            recent_scores = list(history.get("recent_scores") or [])
             target = int(config["self_play_target_runs"])
+            use_ppo = config.get("policy_mode") in ("ppo_experiment", "ppo_best")
+            training_interval = int(config["self_play_train_every_admitted_runs"])
             while (target <= 0 or completed_runs < target) and not self._stop_event.is_set():
                 new_run = self._launch_run(config, existing_run_ids)
                 run_id = str(new_run.get("run_id"))
                 existing_run_ids.add(run_id)
                 run_started_at = time.time()
-                self._set_status(current_run_id=run_id, current_floor=0, current_state="launching", run_started_at=run_started_at)
+                self._set_status(
+                    current_run_id=run_id,
+                    current_seed=str(new_run.get("seed") or config["self_play_seed"] or ""),
+                    current_floor=0,
+                    current_state="launching",
+                    run_started_at=run_started_at,
+                )
                 run_summary = self._monitor_run(run_id, config)
                 # 等待数据 flush：JSONL 可能还没写完，重试几次避免误判
                 for _retry in range(3):
@@ -526,6 +719,13 @@ class SelfPlayManager:
                         break
                     time.sleep(3)
                     run_summary = self._latest_run(run_id) or run_summary
+                if run_summary:
+                    ready_deadline = time.time() + 20
+                    while time.time() < ready_deadline and safe_int(run_summary.get("records")) > 0 and run_summary.get("data_health") == "missing":
+                        time.sleep(2)
+                        refreshed = self._latest_run(run_id)
+                        if refreshed:
+                            run_summary = refreshed
                 if not run_summary:
                     raise RuntimeError(f"无法读取 run 结果：{run_id}")
                 score = save_self_play_run_score(run_summary)
@@ -537,10 +737,44 @@ class SelfPlayManager:
                     admitted_runs=admitted_runs,
                     last_score=score,
                     recent_scores=recent_scores,
-                    next_training_in=next_training_in(admitted_runs, config["self_play_train_every_admitted_runs"]),
+                    next_training_in=next_training_in(completed_runs if use_ppo else admitted_runs, training_interval),
                     last_message=f"Run {run_id} 结束，score={score.get('score')}，admitted={score.get('admitted')}",
                 )
-                if score.get("admitted") and admitted_runs % config["self_play_train_every_admitted_runs"] == 0:
+                if self._is_clear_score(score):
+                    if use_ppo:
+                        self._trigger_ppo_training()
+                        self._set_status(
+                            running=True,
+                            training_running=False,
+                            finished=None,
+                            current_state="running",
+                            current_run_id="",
+                            last_message=f"Act1 clear reached by {run_id}; PPO checkpoint updated, continuing self-play.",
+                        )
+                        continue
+                    self._save_model_snapshot(
+                        f"Clear policy {run_id}",
+                        "Policy artifacts that produced a clear/probable-clear self-play run.",
+                        activate=False,
+                    )
+                    if score.get("admitted") and admitted_runs % training_interval != 0:
+                        self._trigger_training()
+                    self._save_model_snapshot(
+                        f"Post-clear trained model {run_id}",
+                        "Model artifacts after training on the clear/probable-clear self-play run.",
+                        activate=True,
+                    )
+                    self._set_status(
+                        running=False,
+                        training_running=False,
+                        finished=datetime.now().isoformat(timespec="seconds"),
+                        current_state="finished",
+                        last_message=f"Clear reached by {run_id}; model snapshots saved.",
+                    )
+                    break
+                if use_ppo and completed_runs > 0 and completed_runs % training_interval == 0:
+                    self._trigger_ppo_training()
+                elif not use_ppo and score.get("admitted") and admitted_runs % training_interval == 0:
                     self._trigger_training()
             self._set_status(
                 running=False,

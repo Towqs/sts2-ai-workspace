@@ -45,6 +45,12 @@ namespace STS2_MCP
                 record["model_version"] = _currentModelVersion;
         }
 
+        private static void StampRunContext(Dictionary<string, object> record)
+        {
+            if (!string.IsNullOrWhiteSpace(_currentRunSeed) && !record.ContainsKey("seed"))
+                record["seed"] = _currentRunSeed;
+        }
+
         private static void WriteCombatRecord(Dictionary<string, object> record)
         {
             try
@@ -55,6 +61,7 @@ namespace STS2_MCP
                     return;
                 }
                 StampSchemaVersion(record);
+                StampRunContext(record);
                 StampPolicyContext(record);
                 var writer = GetCombatWriter();
                 lock (writer)
@@ -80,6 +87,7 @@ namespace STS2_MCP
                     return;
                 }
                 StampSchemaVersion(record);
+                StampRunContext(record);
                 StampPolicyContext(record);
                 var writer = GetMacroWriter();
                 lock (writer)

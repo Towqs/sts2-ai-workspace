@@ -36,7 +36,7 @@ python AI_Training\monster_profile_builder.py
 python AI_Training\monster_profile_builder.py --limit-files 3
 ```
 
-网页里的“重构数据加重练”流程会先生成怪物画像，再继续重构战斗/宏观训练数据。
+网页里的“重构数据并训练”流程会先生成怪物画像，再继续重构战斗/宏观训练数据。
 
 ## 文件含义
 

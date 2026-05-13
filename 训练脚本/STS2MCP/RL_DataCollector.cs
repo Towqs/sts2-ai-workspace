@@ -134,6 +134,9 @@ namespace STS2_MCP
         private static string? _currentModelVersion;
         private static string? _pendingMenuRunIntent;
         private static string? _pendingMenuRunSeed;
+        private static DataSource _pendingMenuRunSource = DataSource.Human;
+        private static bool _pendingMenuRunSourceActive;
+        private static string? _currentRunSeed;
         // v3: MCP 防重复记录（记录上一个动作的哈希）
         private static string? _lastActionHash;
         private static long _lastActionTimestamp = 0;
@@ -187,7 +190,13 @@ namespace STS2_MCP
             _currentModelVersion = string.IsNullOrWhiteSpace(modelVersion) ? null : modelVersion;
         }
 
-        public static void MarkMenuRunIntent(string intent, string? seed = null)
+        private static string? NormalizeRunSeed(string? seed)
+        {
+            var text = seed?.Trim();
+            return string.IsNullOrWhiteSpace(text) ? null : text.ToUpperInvariant();
+        }
+
+        public static void MarkMenuRunIntent(string intent, string? seed = null, DataSource? source = null)
         {
             if (!string.Equals(intent, "new", StringComparison.OrdinalIgnoreCase)
                 && !string.Equals(intent, "continue", StringComparison.OrdinalIgnoreCase))
@@ -195,17 +204,36 @@ namespace STS2_MCP
                 return;
             }
 
-            _pendingMenuRunIntent = intent.ToLowerInvariant();
-            _pendingMenuRunSeed = string.IsNullOrWhiteSpace(seed) ? null : seed;
+            var normalizedIntent = intent.ToLowerInvariant();
+            var normalizedSeed = NormalizeRunSeed(seed);
+            bool preserveExplicitSource = source == null
+                && string.Equals(_pendingMenuRunIntent, normalizedIntent, StringComparison.OrdinalIgnoreCase)
+                && _pendingMenuRunSource == DataSource.AI;
+
+            _pendingMenuRunIntent = normalizedIntent;
+            _pendingMenuRunSource = preserveExplicitSource ? _pendingMenuRunSource : (source ?? DataSource.Human);
+            _pendingMenuRunSourceActive = true;
+            if (normalizedSeed != null || _pendingMenuRunSeed == null)
+                _pendingMenuRunSeed = normalizedSeed;
             Debug.Log("RunState", $"[MENU INTENT] {_pendingMenuRunIntent}"
+                + $" source={_pendingMenuRunSource}"
                 + (_pendingMenuRunSeed == null ? "" : $" seed={_pendingMenuRunSeed}"));
         }
 
-        public static void StartNewRun()
+        public static void ApplyMenuRunDataSource()
+        {
+            if (!_pendingMenuRunSourceActive)
+                return;
+            SetDataSource(_pendingMenuRunSource);
+            _pendingMenuRunSourceActive = false;
+        }
+
+        public static void StartNewRun(string? seed = null)
         {
             // 生成新的 run_id（带来源前缀）
             string sourcePrefix = _currentDataSource == DataSource.AI ? "ai" : "hum";
             _currentRunId = $"{sourcePrefix}_{DateTime.Now:yyyyMMdd_HHmmss}_{Guid.NewGuid().ToString("N")[..8]}";
+            _currentRunSeed = NormalizeRunSeed(seed);
             _inCombat = false;
             _lastRoundNumber = 0;
             _lastCombatState = null;
@@ -213,7 +241,8 @@ namespace STS2_MCP
             _lastActionHash = null;
             _lastActionTimestamp = 0;
 
-            Debug.Log($"[NEW RUN] Run ID: {_currentRunId}, Source: {_currentDataSource}");
+            Debug.Log($"[NEW RUN] Run ID: {_currentRunId}, Source: {_currentDataSource}"
+                + (_currentRunSeed == null ? "" : $", Seed: {_currentRunSeed}"));
             PersistRunSession(false);
         }
 
@@ -226,16 +255,18 @@ namespace STS2_MCP
             if (string.Equals(controlMode, "new", StringComparison.OrdinalIgnoreCase))
             {
                 Debug.Log("RunState", "[NEW RUN REQUEST] control_state requested a fresh run");
+                string? pendingSeed = _pendingMenuRunSeed;
                 ResetNextRunModeToAuto();
-                StartNewRun();
+                StartNewRun(pendingSeed);
+                ConsumePendingMenuRunIntent(out _);
                 return false;
             }
 
-            string? menuIntent = ConsumePendingMenuRunIntent();
+            string? menuIntent = ConsumePendingMenuRunIntent(out var menuSeed);
             if (string.Equals(menuIntent, "new", StringComparison.OrdinalIgnoreCase))
             {
                 Debug.Log("RunState", "[MENU INTENT] Starting a fresh run from character select");
-                StartNewRun();
+                StartNewRun(menuSeed);
                 return false;
             }
 
@@ -313,6 +344,12 @@ namespace STS2_MCP
                 }
 
                 _currentRunId = runElem.GetString();
+                _currentDataSource = string.Equals(root.TryGetProperty("source", out var sourceElem) ? sourceElem.GetString() : null, "ai", StringComparison.OrdinalIgnoreCase)
+                    ? DataSource.AI
+                    : DataSource.Human;
+                _currentRunSeed = root.TryGetProperty("seed", out var seedElem)
+                    ? NormalizeRunSeed(seedElem.GetString())
+                    : null;
                 return !string.IsNullOrWhiteSpace(_currentRunId);
             }
             catch (Exception ex)
@@ -331,12 +368,14 @@ namespace STS2_MCP
                 var session = new Dictionary<string, object?>
                 {
                     ["run_id"] = _currentRunId,
-                    ["source"] = _currentRunId.StartsWith("ai_", StringComparison.OrdinalIgnoreCase) ? "ai" : "human",
+                    ["source"] = _currentDataSource == DataSource.AI ? "ai" : "human",
                     ["act"] = act,
                     ["floor"] = floor,
                     ["ended"] = ended,
                     ["updated_at"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
                 };
+                if (!string.IsNullOrWhiteSpace(_currentRunSeed))
+                    session["seed"] = _currentRunSeed;
                 File.WriteAllText(_sessionPath, System.Text.Json.JsonSerializer.Serialize(session, _compactJson));
             }
             catch (Exception ex)
@@ -345,9 +384,10 @@ namespace STS2_MCP
             }
         }
 
-        private static string ConsumePendingMenuRunIntent()
+        private static string ConsumePendingMenuRunIntent(out string? seed)
         {
             string intent = _pendingMenuRunIntent ?? "";
+            seed = _pendingMenuRunSeed;
             _pendingMenuRunIntent = null;
             _pendingMenuRunSeed = null;
             return intent;
@@ -401,6 +441,8 @@ namespace STS2_MCP
             // session resumable so Continue Game appends to the same run_id.
             PersistRunSession(false);
             _currentRunId = null;
+            _currentRunSeed = null;
+            _pendingMenuRunSourceActive = false;
         }
 
         public static void OnModInit()
@@ -425,6 +467,8 @@ namespace STS2_MCP
                     ["state"] = state,
                     ["screen_state"] = BuildCurrentScreenState()
                 };
+                if (!string.IsNullOrWhiteSpace(_currentRunSeed))
+                    record["seed"] = _currentRunSeed;
 
                 WriteMacroRecord(record);
                 Debug.Log("Data", $"[RecordGameStart] game_start recorded, run_id={_currentRunId}");
@@ -451,6 +495,8 @@ namespace STS2_MCP
                     ["state"] = state,
                     ["screen_state"] = BuildCurrentScreenState()
                 };
+                if (!string.IsNullOrWhiteSpace(_currentRunSeed))
+                    record["seed"] = _currentRunSeed;
 
                 WriteMacroRecord(record);
                 Debug.Log("Data", $"[RecordGameResume] game_resume recorded, run_id={_currentRunId}");

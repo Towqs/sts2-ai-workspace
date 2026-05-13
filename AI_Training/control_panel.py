@@ -40,6 +40,9 @@ LLM_CONFIG_PATH = AI_DIR / "model_config.json"
 LLM_LOGIC_PATH = AI_DIR / "llm_logic_state.json"
 SELF_PLAY_RUNNER_PATH = AI_DIR / "self_play_runner.py"
 SELF_PLAY_STATE_PATH = AI_DIR / "self_play_state.json"
+SELF_PLAY_SCORES_PATH = DATA_DIR / "self_play_scores.json"
+PPO_DIR = AI_DIR / "ProcessedPPOParams"
+PPO_ROLLOUT_DIR = DATA_DIR / "PPO"
 DISCARDED_PATH = DATA_DIR / "discarded_runs.json"
 SERVER_STATE_PATH = AI_DIR / "control_panel_state.json"
 DEFAULT_PYTHON_EXE = WORKSPACE / ".venv" / "Scripts" / "python.exe"
@@ -60,6 +63,12 @@ MODEL_ARTIFACTS = {
         "vocab.json",
         "metadata.json",
         "training_summary.json",
+    ],
+}
+OPTIONAL_MODEL_ARTIFACTS = {
+    "ProcessedParams": [
+        "candidate_rl_model_best.pth",
+        "candidate_rl_metadata.json",
     ],
 }
 
@@ -189,13 +198,18 @@ DEFAULT_CONTROL = {
     "min_training_quality": "unknown",
     "exploration_enabled": False,
     "exploration_mode": "aggressive",
+    "self_play_constraint_mode": "explore",
     "combat_exploration_epsilon": 0.35,
     "macro_exploration_epsilon": 0.25,
     "exploration_top_k": 5,
     "exploration_temperature": 1.35,
     "self_play_character": "IRONCLAD",
     "self_play_ascension": 0,
-    "self_play_target_runs": 20,
+    "self_play_seed": "",
+    "policy_mode": "current_rl",
+    "ppo_seed_mode": "fixed",
+    "ppo_fixed_seed": "101",
+    "self_play_target_runs": 0,
     "self_play_train_every_admitted_runs": 5,
     "self_play_max_run_minutes": 75,
     "self_play_stall_seconds": 120,
@@ -223,6 +237,7 @@ UPDATE_LOCK = threading.Lock()
 LLM_TEST_LOCK = threading.Lock()
 LLM_TEST_COOLDOWN_SEC = 60
 LAST_TRAIN = {"running": False, "started": None, "finished": None, "output": ""}
+LAST_PPO_TRAIN = {"running": False, "started": None, "finished": None, "output": ""}
 LAST_EXPORT = {"path": None, "filename": None, "created": None, "size": 0, "file_count": 0}
 LAST_UPDATE = {"running": False, "started": None, "finished": None, "status": "idle", "output": ""}
 LLM_TEST_STATE = {"running": False, "last_started": 0.0, "last_finished": 0.0}
@@ -286,9 +301,22 @@ def update_control(patch):
             elif key == "exploration_mode":
                 mode = str(patch[key] or "aggressive").strip().lower()
                 data[key] = mode if mode in ("aggressive", "off") else "aggressive"
+            elif key == "self_play_constraint_mode":
+                mode = str(patch[key] or "explore").strip().lower()
+                data[key] = mode if mode in ("guarded", "explore", "free") else "explore"
             elif key == "self_play_character":
                 character = str(patch[key] or "IRONCLAD").strip().upper()
                 data[key] = character if character == "IRONCLAD" else "IRONCLAD"
+            elif key == "self_play_seed":
+                data[key] = str(patch[key] or "").strip().upper()
+            elif key == "policy_mode":
+                mode = str(patch[key] or "current_rl").strip().lower()
+                data[key] = mode if mode in ("current_rl", "ppo_experiment", "ppo_best") else "current_rl"
+            elif key == "ppo_seed_mode":
+                mode = str(patch[key] or "fixed").strip().lower()
+                data[key] = mode if mode in ("fixed", "random") else "fixed"
+            elif key == "ppo_fixed_seed":
+                data[key] = str(patch[key] or "101").strip().upper() or "101"
             elif key == "active_model_id":
                 data[key] = str(patch[key] or "local")
             elif key == "macro_card_reward_weight":
@@ -320,7 +348,7 @@ def update_control(patch):
             elif key == "self_play_ascension":
                 data[key] = clamp_int(patch[key], DEFAULT_CONTROL[key], 0, 20)
             elif key == "self_play_target_runs":
-                data[key] = clamp_int(patch[key], DEFAULT_CONTROL[key], 1, 500)
+                data[key] = clamp_int(patch[key], DEFAULT_CONTROL[key], 0, 500)
             elif key == "self_play_train_every_admitted_runs":
                 data[key] = clamp_int(patch[key], DEFAULT_CONTROL[key], 1, 100)
             elif key == "self_play_max_run_minutes":
@@ -818,6 +846,77 @@ def default_self_play_state():
     }
 
 
+def _safe_int(value, default=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalize_seed(value):
+    return str(value or "").strip().upper()
+
+
+def _normalize_policy_mode(value):
+    mode = str(value or "current_rl").strip().lower()
+    return mode if mode in ("current_rl", "ppo_experiment", "ppo_best") else "current_rl"
+
+
+def _normalize_ppo_seed_mode(value):
+    mode = str(value or "fixed").strip().lower()
+    return mode if mode in ("fixed", "random") else "fixed"
+
+
+def _effective_self_play_seed(control):
+    control = control or {}
+    policy_mode = _normalize_policy_mode(control.get("policy_mode"))
+    ppo_seed_mode = _normalize_ppo_seed_mode(control.get("ppo_seed_mode"))
+    if policy_mode in ("ppo_experiment", "ppo_best") and ppo_seed_mode == "fixed":
+        return _normalize_seed(control.get("ppo_fixed_seed") or DEFAULT_CONTROL["ppo_fixed_seed"])
+    return _normalize_seed(control.get("self_play_seed"))
+
+
+def _next_training_in(admitted_runs, interval):
+    interval = max(1, _safe_int(interval, 5))
+    admitted_runs = max(0, _safe_int(admitted_runs, 0))
+    if admitted_runs <= 0:
+        return interval
+    remainder = admitted_runs % interval
+    return 0 if remainder == 0 else interval - remainder
+
+
+def self_play_history_summary(control):
+    seed = _effective_self_play_seed(control)
+    interval = _safe_int((control or {}).get("self_play_train_every_admitted_runs"), DEFAULT_CONTROL["self_play_train_every_admitted_runs"])
+    raw = read_json(SELF_PLAY_SCORES_PATH, {})
+    scores = raw.get("scores") if isinstance(raw, dict) else {}
+    if not isinstance(scores, dict):
+        return {
+            "completed_runs": 0,
+            "admitted_runs": 0,
+            "recent_scores": [],
+            "last_score": None,
+            "pending_training_runs": _next_training_in(0, interval),
+        }
+    rows = []
+    for score in scores.values():
+        if not isinstance(score, dict):
+            continue
+        if seed and _normalize_seed(score.get("seed")) != seed:
+            continue
+        rows.append(score)
+    rows.sort(key=lambda item: str(item.get("updated_at") or ""))
+    admitted = sum(1 for item in rows if item.get("admitted"))
+    use_completed_interval = _normalize_policy_mode((control or {}).get("policy_mode")) in ("ppo_experiment", "ppo_best")
+    return {
+        "completed_runs": len(rows),
+        "admitted_runs": admitted,
+        "recent_scores": list(reversed(rows[-8:])),
+        "last_score": rows[-1] if rows else None,
+        "pending_training_runs": _next_training_in(len(rows) if use_completed_interval else admitted, interval),
+    }
+
+
 def read_self_play_state():
     data = default_self_play_state()
     data.update(read_json(SELF_PLAY_STATE_PATH, {}))
@@ -835,6 +934,15 @@ def self_play_status_payload():
     server_state = read_json(SERVER_STATE_PATH, {})
     pid = get_self_play_pid()
     control = read_control()
+    history = self_play_history_summary(control)
+    state_seed = _normalize_seed(state.get("current_seed") or _effective_self_play_seed(control))
+    control_seed = _effective_self_play_seed(control)
+    if state_seed == control_seed and _safe_int(history.get("completed_runs")) > _safe_int(state.get("completed_runs")):
+        state["completed_runs"] = int(history.get("completed_runs") or 0)
+        state["admitted_runs"] = int(history.get("admitted_runs") or 0)
+        state["pending_training_runs"] = int(history.get("pending_training_runs") or 0)
+        state["recent_scores"] = history.get("recent_scores") or []
+        state["last_score"] = history.get("last_score")
     if not pid and state.get("running"):
         state["running"] = False
         if not state.get("finished_at"):
@@ -844,6 +952,9 @@ def self_play_status_payload():
     state["config"] = {
         "character": control.get("self_play_character", DEFAULT_CONTROL["self_play_character"]),
         "ascension": control.get("self_play_ascension", DEFAULT_CONTROL["self_play_ascension"]),
+        "policy_mode": _normalize_policy_mode(control.get("policy_mode")),
+        "ppo_seed_mode": _normalize_ppo_seed_mode(control.get("ppo_seed_mode")),
+        "ppo_fixed_seed": _normalize_seed(control.get("ppo_fixed_seed") or DEFAULT_CONTROL["ppo_fixed_seed"]),
         "target_runs": control.get("self_play_target_runs", DEFAULT_CONTROL["self_play_target_runs"]),
         "train_every_admitted_runs": control.get("self_play_train_every_admitted_runs", DEFAULT_CONTROL["self_play_train_every_admitted_runs"]),
         "max_run_minutes": control.get("self_play_max_run_minutes", DEFAULT_CONTROL["self_play_max_run_minutes"]),
@@ -870,12 +981,22 @@ def start_ai():
             "message": "AI 未启动：Python 环境缺少 " + ", ".join(missing),
             "python_runtime": runtime,
         }
-    proc = subprocess.Popen(
-        [str(PYTHON_EXE), str(AGENT_PATH)],
-        cwd=str(WORKSPACE),
-        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
-        env=python_subprocess_env(),
-    )
+    log_path = AI_DIR / "ai_agent_stdout.log"
+    log_file = open(log_path, "a", encoding="utf-8")
+    log_file.write(f"\n[{datetime.now().isoformat(timespec='seconds')}] starting ai_agent\n")
+    log_file.flush()
+    try:
+        proc = subprocess.Popen(
+            [str(PYTHON_EXE), str(AGENT_PATH)],
+            cwd=str(WORKSPACE),
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+            env=python_subprocess_env(),
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    finally:
+        log_file.close()
     state = read_json(SERVER_STATE_PATH, {})
     state["ai_pid"] = proc.pid
     state["ai_started_at"] = datetime.now().isoformat(timespec="seconds")
@@ -977,6 +1098,7 @@ def start_self_play():
         "multiplier": control.get("game_speed_multiplier", DEFAULT_CONTROL["game_speed_multiplier"]),
     })
 
+    history = self_play_history_summary(control)
     state_payload = default_self_play_state()
     state_payload.update({
         "running": True,
@@ -984,8 +1106,14 @@ def start_self_play():
         "message": "正在启动自训练 runner...",
         "started_at": datetime.now().isoformat(timespec="seconds"),
         "last_updated_at": datetime.now().isoformat(timespec="seconds"),
+        "current_seed": _effective_self_play_seed(control),
+        "completed_runs": int(history.get("completed_runs") or 0),
+        "admitted_runs": int(history.get("admitted_runs") or 0),
+        "pending_training_runs": int(history.get("pending_training_runs") or 0),
         "target_runs": int(control.get("self_play_target_runs", DEFAULT_CONTROL["self_play_target_runs"])),
         "train_every_admitted_runs": int(control.get("self_play_train_every_admitted_runs", DEFAULT_CONTROL["self_play_train_every_admitted_runs"])),
+        "recent_scores": history.get("recent_scores") or [],
+        "last_score": history.get("last_score"),
     })
     write_json(SELF_PLAY_STATE_PATH, state_payload)
 
@@ -1088,6 +1216,7 @@ def run_training_background():
                     [str(PYTHON_EXE), str(AI_DIR / "data_pipeline.py")],
                     [str(PYTHON_EXE), str(AI_DIR / "train_bc.py")],
                     [str(PYTHON_EXE), str(AI_DIR / "train_candidate_bc.py")],
+                    [str(PYTHON_EXE), str(AI_DIR / "train_rl_finetune.py")],
                     [str(PYTHON_EXE), str(AI_DIR / "macro_data_pipeline.py")],
                     [str(PYTHON_EXE), str(AI_DIR / "train_macro_bc.py")],
                 ]:
@@ -1126,6 +1255,54 @@ def run_training_background():
         return {"status": "busy", "message": "Training is already running."}
     threading.Thread(target=worker, daemon=True).start()
     return {"status": "ok", "message": "Training started."}
+
+
+def run_ppo_training_background():
+    runtime = python_runtime_status()
+    if not runtime.get("training_ready"):
+        missing = [m for m in REQUIRED_TRAINING_MODULES if m in (runtime.get("missing") or [])] or REQUIRED_TRAINING_MODULES
+        message = "PPO training not started: Python environment missing " + ", ".join(missing)
+        LAST_PPO_TRAIN.update({
+            "running": False,
+            "started": None,
+            "finished": datetime.now().isoformat(timespec="seconds"),
+            "output": message,
+        })
+        return {"status": "error", "message": message, "python_runtime": runtime}
+
+    def worker():
+        with TRAIN_LOCK:
+            LAST_PPO_TRAIN.update({"running": True, "started": datetime.now().isoformat(timespec="seconds"), "finished": None, "output": ""})
+            output = []
+            try:
+                cmd = [str(PYTHON_EXE), str(AI_DIR / "train_ppo.py")]
+                proc = subprocess.run(
+                    cmd,
+                    cwd=str(WORKSPACE),
+                    capture_output=True,
+                    text=True,
+                    timeout=1800,
+                    env=python_subprocess_env(),
+                )
+                output.append("> " + " ".join(cmd))
+                if proc.stdout:
+                    output.append(proc.stdout)
+                if proc.stderr:
+                    output.append(proc.stderr)
+                if proc.returncode != 0:
+                    output.append(f"ERROR: command exited with {proc.returncode}")
+            except Exception as exc:
+                output.append(f"ERROR: {exc}")
+            LAST_PPO_TRAIN.update({
+                "running": False,
+                "finished": datetime.now().isoformat(timespec="seconds"),
+                "output": "\n".join(output)[-12000:],
+            })
+
+    if LAST_PPO_TRAIN.get("running"):
+        return {"status": "busy", "message": "PPO training is already running."}
+    threading.Thread(target=worker, daemon=True).start()
+    return {"status": "ok", "message": "PPO training started."}
 
 
 def export_database_package():
@@ -1305,18 +1482,23 @@ def model_package_status(model_id):
     missing = []
     artifacts = {}
     total_size = 0
-    for dirname, filenames in MODEL_ARTIFACTS.items():
+    artifact_map = {
+        dirname: list(filenames) + list(OPTIONAL_MODEL_ARTIFACTS.get(dirname, []))
+        for dirname, filenames in MODEL_ARTIFACTS.items()
+    }
+    for dirname, filenames in artifact_map.items():
         artifacts[dirname] = {}
         for filename in filenames:
             path = root / dirname / filename
             status = file_status(path)
             artifacts[dirname][filename] = status
             total_size += int(status.get("size") or 0)
-            if not status.get("exists"):
+            if filename not in OPTIONAL_MODEL_ARTIFACTS.get(dirname, []) and not status.get("exists"):
                 missing.append(f"{dirname}/{filename}")
 
     combat_meta = read_json(root / "ProcessedParams" / "metadata.json", {})
     candidate_meta = read_json(root / "ProcessedParams" / "candidate_metadata.json", {})
+    candidate_rl_meta = read_json(root / "ProcessedParams" / "candidate_rl_metadata.json", {})
     macro_meta = read_json(root / "ProcessedMacroParams" / "metadata.json", {})
     macro_summary = read_json(root / "ProcessedMacroParams" / "training_summary.json", {})
     retention = manifest.get("retention") or ("auto" if model_id.startswith("auto_train_") else "manual")
@@ -1338,6 +1520,7 @@ def model_package_status(model_id):
             "combat_features": combat_meta.get("features", 0),
             "candidate_rows": candidate_meta.get("samples", combat_meta.get("candidate_rows", 0)),
             "candidate_features": candidate_meta.get("features", combat_meta.get("candidate_total_features", 0)),
+            "candidate_rl": candidate_rl_meta,
             "macro_samples": macro_summary.get("samples", macro_meta.get("samples", 0)),
             "macro_features": macro_summary.get("features", macro_meta.get("features", 0)),
             "include_ai": combat_meta.get("include_ai", False) or macro_meta.get("include_ai", False),
@@ -1359,6 +1542,13 @@ def copy_current_model_artifacts(target_root):
             src = AI_DIR / dirname / filename
             if not src.exists():
                 missing.append(f"{dirname}/{filename}")
+                continue
+            dst = dst_dir / filename
+            shutil.copy2(src, dst)
+            copied.append(str(dst.relative_to(target_root)))
+        for filename in OPTIONAL_MODEL_ARTIFACTS.get(dirname, []):
+            src = AI_DIR / dirname / filename
+            if not src.exists():
                 continue
             dst = dst_dir / filename
             shutil.copy2(src, dst)
@@ -1624,6 +1814,13 @@ def activate_model_package(model_id):
         dst_dir.mkdir(parents=True, exist_ok=True)
         for filename in filenames:
             shutil.copy2(root / dirname / filename, dst_dir / filename)
+        for filename in OPTIONAL_MODEL_ARTIFACTS.get(dirname, []):
+            src = root / dirname / filename
+            dst = dst_dir / filename
+            if src.exists():
+                shutil.copy2(src, dst)
+            elif dst.exists():
+                dst.unlink()
 
     control = read_control()
     control["active_model_id"] = model_id
@@ -1778,6 +1975,61 @@ def models_status():
             },
         },
         "registry": model_registry_status(control.get("active_model_id", "local")),
+    }
+
+
+def ppo_status():
+    control = read_control()
+    metadata = read_json(PPO_DIR / "ppo_metadata.json", {})
+    rollout_files = sorted(PPO_ROLLOUT_DIR.glob("ppo_rollouts_*.jsonl")) if PPO_ROLLOUT_DIR.exists() else []
+    scores_raw = read_json(SELF_PLAY_SCORES_PATH, {})
+    scores = scores_raw.get("scores") if isinstance(scores_raw, dict) else {}
+    rows = [row for row in (scores or {}).values() if isinstance(row, dict)]
+    rows.sort(key=lambda item: str(item.get("updated_at") or ""))
+    recent5 = rows[-5:]
+    recent20 = rows[-20:]
+    fixed_seed = _normalize_seed(control.get("ppo_fixed_seed") or DEFAULT_CONTROL["ppo_fixed_seed"])
+    fixed_rows = [row for row in rows if _normalize_seed(row.get("seed")) == fixed_seed]
+    fixed_best = {}
+    if fixed_rows:
+        fixed_best = max(
+            fixed_rows,
+            key=lambda row: (
+                1 if int(row.get("max_act") or 0) >= 2 or row.get("reason_group") == "clear" else 0,
+                int(row.get("max_floor") or 0),
+                float(row.get("boss_damage") or 0.0),
+                float(row.get("score") or 0.0),
+            ),
+        )
+
+    def avg(items, key):
+        if not items:
+            return 0.0
+        return round(sum(float(item.get(key) or 0.0) for item in items) / len(items), 3)
+
+    def clear_count(items):
+        return sum(1 for item in items if int(item.get("max_act") or 0) >= 2 or item.get("reason_group") == "clear")
+
+    return {
+        "mode": _normalize_policy_mode(control.get("policy_mode")),
+        "seed_mode": _normalize_ppo_seed_mode(control.get("ppo_seed_mode")),
+        "fixed_seed": fixed_seed,
+        "latest": file_status(PPO_DIR / "ppo_policy_latest.pth"),
+        "best": file_status(PPO_DIR / "ppo_policy_best.pth"),
+        "metadata": metadata,
+        "rollout_file_count": len(rollout_files),
+        "latest_rollout": file_status(rollout_files[-1]) if rollout_files else file_status(PPO_ROLLOUT_DIR / "ppo_rollouts_none.jsonl"),
+        "avg_floor_5": avg(recent5, "max_floor"),
+        "avg_floor_20": avg(recent20, "max_floor"),
+        "avg_boss_damage_5": avg(recent5, "boss_damage"),
+        "avg_boss_damage_20": avg(recent20, "boss_damage"),
+        "act1_clear_count": clear_count(rows),
+        "act1_clear_count_20": clear_count(recent20),
+        "fixed_seed_clear": bool(fixed_best and (int(fixed_best.get("max_act") or 0) >= 2 or fixed_best.get("reason_group") == "clear")),
+        "fixed_seed_best": fixed_best,
+        "loss": (metadata.get("metrics") or {}).get("loss"),
+        "value_loss": (metadata.get("metrics") or {}).get("value_loss"),
+        "entropy": (metadata.get("metrics") or {}).get("entropy"),
     }
 
 
@@ -1997,6 +2249,8 @@ def status_payload():
             "logic": llm_logic_snapshot(),
         },
         "training": LAST_TRAIN,
+        "ppo": ppo_status(),
+        "ppo_training": LAST_PPO_TRAIN,
         "training_composition": training_composition(),
         "export": LAST_EXPORT,
         "update": LAST_UPDATE,
@@ -3966,6 +4220,14 @@ INDEX_HTML = r"""<!doctype html>
           <input id="exploration_enabled" type="checkbox" onchange="saveSelfPlayConfig()">
         </div>
         <div class="field">
+          <span>行为约束模式</span>
+          <select id="self_play_constraint_mode" onchange="saveSelfPlayConfig()">
+            <option value="guarded">保守：完整规则护栏</option>
+            <option value="explore">探索：弱化策略护栏</option>
+            <option value="free">自由：只保留合法动作</option>
+          </select>
+        </div>
+        <div class="field">
           <span>战斗探索</span>
           <input id="combat_exploration_epsilon" type="number" min="0" max="1" step="0.05" onchange="saveSelfPlayConfig()">
         </div>
@@ -5191,13 +5453,20 @@ function renderStatus(s) {
   document.getElementById("game_speed_enabled").checked = !!s.control.game_speed_enabled;
   document.getElementById("game_speed_multiplier").value = String(s.control.game_speed_multiplier || 2);
   document.getElementById("min_training_quality").value = s.control.min_training_quality || "unknown";
+  ensureSelfPlaySeedField();
+  ensurePPOFields();
   document.getElementById("self_play_character").value = s.control.self_play_character || "IRONCLAD";
-  document.getElementById("self_play_target_runs").value = Number(s.control.self_play_target_runs || 20);
+  document.getElementById("self_play_seed").value = s.control.self_play_seed || "";
+  document.getElementById("policy_mode").value = s.control.policy_mode || "current_rl";
+  document.getElementById("ppo_seed_mode").value = s.control.ppo_seed_mode || "fixed";
+  document.getElementById("ppo_fixed_seed").value = s.control.ppo_fixed_seed || "101";
+  document.getElementById("self_play_target_runs").value = Number(s.control.self_play_target_runs ?? 0);
   document.getElementById("self_play_train_every_admitted_runs").value = Number(s.control.self_play_train_every_admitted_runs || 5);
   document.getElementById("self_play_max_run_minutes").value = Number(s.control.self_play_max_run_minutes || 75);
   document.getElementById("self_play_stall_seconds").value = Number(s.control.self_play_stall_seconds || 120);
   document.getElementById("self_play_game_speed_multiplier").value = String(s.control.self_play_game_speed_multiplier || 3);
   document.getElementById("exploration_enabled").checked = !!s.control.exploration_enabled;
+  document.getElementById("self_play_constraint_mode").value = s.control.self_play_constraint_mode || "explore";
   document.getElementById("combat_exploration_epsilon").value = Number(s.control.combat_exploration_epsilon ?? 0.35);
   document.getElementById("macro_exploration_epsilon").value = Number(s.control.macro_exploration_epsilon ?? 0.25);
   document.getElementById("exploration_top_k").value = Number(s.control.exploration_top_k || 5);
@@ -5279,7 +5548,7 @@ function renderStatus(s) {
   renderAiLogic(s.ai_logic);
   renderLLMLogic(s.llm && s.llm.logic, llmCfg);
   renderTrainingComposition(s.training_composition || {});
-  renderSelfPlay(s.self_play || {}, s.control || {});
+  renderSelfPlay(s.self_play || {}, s.control || {}, s.ppo || {}, s.ppo_training || {});
 
   setPill("trainStatus", s.training.running ? `训练中 ${s.training.started || ""}` : (s.training.finished ? `完成 ${s.training.finished}` : "未运行"), s.training.running ? "warn" : "info");
   document.getElementById("trainOutput").textContent = s.training.output || "暂无输出";
@@ -5498,7 +5767,89 @@ function selfPlayTrendText(scores) {
     .filter(Boolean);
   return parts.length ? `近 ${recent.length} 局：${parts.join(" / ")}` : "近 6 局：暂无";
 }
-function renderSelfPlay(info, control) {
+function ensureSelfPlaySeedField() {
+  if (document.getElementById("self_play_seed")) return;
+  const characterField = document.getElementById("self_play_character")?.closest(".field");
+  if (!characterField || !characterField.parentElement) return;
+  const field = document.createElement("div");
+  field.className = "field";
+  field.innerHTML = '<span>固定 Seed</span><input id="self_play_seed" type="text" maxlength="64" onchange="saveSelfPlayConfig()">';
+  characterField.parentElement.insertBefore(field, characterField.nextSibling);
+}
+function ensurePPOFields() {
+  const characterField = document.getElementById("self_play_character")?.closest(".field");
+  if (!characterField || !characterField.parentElement) return;
+  const parent = characterField.parentElement;
+  const summary = document.getElementById("selfPlaySummary");
+  let ppoBlock = document.getElementById("ppoConfigBlock");
+  if (!ppoBlock && summary && summary.parentElement) {
+    ppoBlock = document.createElement("div");
+    ppoBlock.id = "ppoConfigBlock";
+    ppoBlock.style.marginTop = "10px";
+    ppoBlock.innerHTML = `
+      <div class="field">
+        <span>策略模式</span>
+        <select id="policy_mode" onchange="saveSelfPlayConfig()">
+          <option value="current_rl">当前 RL</option>
+          <option value="ppo_experiment">PPO 实验</option>
+          <option value="ppo_best">PPO best</option>
+        </select>
+      </div>
+      <div class="field">
+        <span>PPO Seed 模式</span>
+        <select id="ppo_seed_mode" onchange="saveSelfPlayConfig()">
+          <option value="fixed">固定 seed</option>
+          <option value="random">随机 seed</option>
+        </select>
+      </div>
+      <div class="field">
+        <span>PPO 固定 Seed</span>
+        <input id="ppo_fixed_seed" type="text" maxlength="64" onchange="saveSelfPlayConfig()">
+      </div>`;
+    summary.parentElement.insertBefore(ppoBlock, summary);
+  }
+  if (ppoBlock) {
+    ["policy_mode", "ppo_seed_mode", "ppo_fixed_seed"].forEach(id => {
+      const control = document.getElementById(id);
+      const field = control?.closest(".field");
+      if (field && field.parentElement !== ppoBlock) {
+        ppoBlock.appendChild(field);
+      }
+    });
+  }
+  if (!document.getElementById("policy_mode")) {
+    const field = document.createElement("div");
+    field.className = "field";
+    field.innerHTML = '<span>策略模式</span><select id="policy_mode" onchange="saveSelfPlayConfig()"><option value="current_rl">当前 RL</option><option value="ppo_experiment">PPO 实验</option><option value="ppo_best">PPO best</option></select>';
+    parent.insertBefore(field, characterField);
+  }
+  if (!document.getElementById("ppo_seed_mode")) {
+    const field = document.createElement("div");
+    field.className = "field";
+    field.innerHTML = '<span>PPO Seed 模式</span><select id="ppo_seed_mode" onchange="saveSelfPlayConfig()"><option value="fixed">固定 seed</option><option value="random">随机 seed</option></select>';
+    parent.insertBefore(field, characterField.nextSibling);
+  }
+  if (!document.getElementById("ppo_fixed_seed")) {
+    const field = document.createElement("div");
+    field.className = "field";
+    field.innerHTML = '<span>PPO 固定 Seed</span><input id="ppo_fixed_seed" type="text" maxlength="64" onchange="saveSelfPlayConfig()">';
+    const seedField = document.getElementById("self_play_seed")?.closest(".field");
+    parent.insertBefore(field, seedField ? seedField.nextSibling : characterField.nextSibling);
+  }
+  if (!document.getElementById("ppoManualTrainBtn")) {
+    const buttonRow = summary?.parentElement?.querySelector(".button-row");
+    if (buttonRow) {
+      const btn = document.createElement("button");
+      btn.id = "ppoManualTrainBtn";
+      btn.className = "primary";
+      btn.type = "button";
+      btn.textContent = "PPO update";
+      btn.onclick = trainPPO;
+      buttonRow.appendChild(btn);
+    }
+  }
+}
+function renderSelfPlay(info, control, ppo, ppoTraining) {
   const summary = document.getElementById("selfPlaySummary");
   const state = document.getElementById("selfPlayState");
   const progressEl = document.getElementById("selfPlayProgress");
@@ -5514,6 +5865,7 @@ function renderSelfPlay(info, control) {
   const targetLabel = rawTarget <= 0 ? "∞" : String(rawTarget);
   const pending = Number((info && info.pending_training_runs) || 0);
   const currentRun = (info && info.current_run_id) || "-";
+  const currentSeed = (info && info.current_seed) || (control && control.self_play_seed) || "";
   const currentFloor = Number((info && info.current_floor) || 0);
   const lastScore = info && info.last_score;
   const lastReasonLabel = lastScore ? (lastScore.reason_label || selfPlayReasonLabel(lastScore.reason)) : "-";
@@ -5525,11 +5877,36 @@ function renderSelfPlay(info, control) {
   const trendText = selfPlayTrendText((info && info.recent_scores) || []);
   const explore = [
     control && control.exploration_enabled ? "探索开" : "探索关",
+    `约束 ${((control && control.self_play_constraint_mode) || "explore")}`,
     `战斗 ${Number((control && control.combat_exploration_epsilon) ?? 0.35).toFixed(2)}`,
     `宏观 ${Number((control && control.macro_exploration_epsilon) ?? 0.25).toFixed(2)}`,
     `TopK ${Number((control && control.exploration_top_k) || 5)}`,
     `T ${Number((control && control.exploration_temperature) || 1.35).toFixed(2)}`,
   ].join(" · ");
+
+  const ppoMeta = (ppo && ppo.metadata) || {};
+  const ppoLoss = ppo && ppo.loss != null ? `loss ${Number(ppo.loss).toFixed(3)}` : "loss -";
+  const ppoEntropy = ppo && ppo.entropy != null ? `entropy ${Number(ppo.entropy).toFixed(3)}` : "entropy -";
+  const ppoBest = (ppo && ppo.best && ppo.best.exists) ? (ppo.best.mtime || "best saved") : "best missing";
+  const ppoLatest = (ppo && ppo.latest && ppo.latest.exists) ? (ppo.latest.mtime || "latest saved") : "latest missing";
+  const fixedBest = (ppo && ppo.fixed_seed_best) || {};
+  const ppoText = [
+    `mode ${(control && control.policy_mode) || "current_rl"}`,
+    `seed ${(control && control.ppo_seed_mode) || "fixed"}:${(control && control.ppo_fixed_seed) || "101"}`,
+    `avgF5 ${Number((ppo && ppo.avg_floor_5) || 0).toFixed(1)}`,
+    `bossD20 ${Number((ppo && ppo.avg_boss_damage_20) || 0).toFixed(1)}`,
+    `clear ${Number((ppo && ppo.act1_clear_count) || 0)}`,
+    `fixedBest A${fixedBest.max_act || 0}/F${fixedBest.max_floor || 0}`,
+    ppoLoss,
+    ppoEntropy,
+    ppoTraining && ppoTraining.running ? "training running" : (ppoMeta.status ? `status ${ppoMeta.status}` : "status idle"),
+    `${ppoLatest}`,
+    `${ppoBest}`,
+  ].join(" | ");
+
+  const ppoHint = ((control && control.policy_mode) || "current_rl") === "current_rl"
+    ? "当前未启用 PPO：请把策略模式从“当前 RL”切到“PPO 实验”，然后重启自训练。"
+    : "";
 
   if (running) {
     setPill("selfPlayBadge", `${phase || "运行中"}`, "warn");
@@ -5548,6 +5925,8 @@ function renderSelfPlay(info, control) {
     <div class="kv"><span>最近评分</span><span>${escapeHtml(scoreText)}</span></div>
     <div class="kv"><span>最近趋势</span><span>${escapeHtml(trendText)}</span></div>
     <div class="kv"><span>探索强度</span><span>${escapeHtml(explore)}</span></div>
+    <div class="kv"><span>PPO</span><span>${escapeHtml(ppoText)}</span></div>
+    ${ppoHint ? `<div class="fine" style="margin-top:4px;color:#b45309">${escapeHtml(ppoHint)}</div>` : ""}
     ${lastScore && lastScore.reason_detail ? `<div class="fine" style="margin-top:4px">${escapeHtml(lastScore.reason_detail)}</div>` : ""}
     ${message ? `<div class="fine" style="margin-top:8px">${escapeHtml(message)}</div>` : ""}
   `;
@@ -6232,6 +6611,7 @@ async function restartAI(){ await api("/api/ai/restart", {}); refresh(); }
 async function startLLM(){ await saveLLMConfig(); await api("/api/llm/start", {}); refresh(); }
 async function stopLLM(){ await api("/api/llm/stop", {}); refresh(); }
 async function train(){ await api("/api/train", {}); refresh(); }
+async function trainPPO(){ await api("/api/ppo/train", {}); refresh(); }
 async function startSelfPlay(){
   setPill("selfPlayBadge", "启动中", "warn");
   const summary = document.getElementById("selfPlaySummary");
@@ -6246,15 +6626,22 @@ async function stopSelfPlay(){
   refresh();
 }
 async function saveSelfPlayConfig(){
+  ensureSelfPlaySeedField();
+  ensurePPOFields();
   const body = {
     self_play_character: document.getElementById("self_play_character").value,
-    self_play_target_runs: Number(document.getElementById("self_play_target_runs").value || 20),
+    self_play_seed: document.getElementById("self_play_seed")?.value || "",
+    policy_mode: document.getElementById("policy_mode")?.value || "current_rl",
+    ppo_seed_mode: document.getElementById("ppo_seed_mode")?.value || "fixed",
+    ppo_fixed_seed: document.getElementById("ppo_fixed_seed")?.value || "101",
+    self_play_target_runs: Number(document.getElementById("self_play_target_runs").value || 0),
     self_play_train_every_admitted_runs: Number(document.getElementById("self_play_train_every_admitted_runs").value || 5),
     self_play_max_run_minutes: Number(document.getElementById("self_play_max_run_minutes").value || 75),
     self_play_stall_seconds: Number(document.getElementById("self_play_stall_seconds").value || 120),
     self_play_game_speed_multiplier: Number(document.getElementById("self_play_game_speed_multiplier").value || 3),
     exploration_enabled: !!document.getElementById("exploration_enabled").checked,
     exploration_mode: "aggressive",
+    self_play_constraint_mode: document.getElementById("self_play_constraint_mode")?.value || "explore",
     combat_exploration_epsilon: Number(document.getElementById("combat_exploration_epsilon").value || 0.35),
     macro_exploration_epsilon: Number(document.getElementById("macro_exploration_epsilon").value || 0.25),
     exploration_top_k: Number(document.getElementById("exploration_top_k").value || 5),
@@ -6525,6 +6912,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, {"control": update_control(body), "self_play": self_play_status_payload()})
             elif self.path == "/api/train":
                 self._json(200, run_training_background())
+            elif self.path == "/api/ppo/train":
+                self._json(200, run_ppo_training_background())
             elif self.path == "/api/update":
                 self._json(200, run_workspace_update_background())
             elif self.path == "/api/model/activate":

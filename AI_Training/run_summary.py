@@ -267,7 +267,10 @@ def is_ai_run_summary(summary):
     run_id = str(summary.get("run_id") or "")
     if run_id.startswith("ai_"):
         return True
-    return safe_int(summary.get("ai")) > 0 and safe_int(summary.get("human")) == 0
+    ai_records = safe_int(summary.get("ai"))
+    human_records = safe_int(summary.get("human"))
+    startup_records = safe_int(summary.get("game_start")) + safe_int(summary.get("game_resume"))
+    return ai_records > 0 and human_records <= startup_records + 1
 
 
 def is_stuck_run(summary):
@@ -298,9 +301,26 @@ def classify_self_play_outcome(summary):
     wins = safe_int(summary.get("wins"))
     losses = safe_int(summary.get("losses"))
     invalid_actions = safe_int(summary.get("invalid_actions"))
+    boss_damage = safe_int(summary.get("boss_damage"))
     stuck = is_stuck_run(summary)
     data_missing = summary.get("data_health") == "missing"
     stage = self_play_stage_bucket(max_act, max_floor)
+    promising_act1_failure = (
+        is_ai_run_summary(summary)
+        and invalid_actions <= 0
+        and not stuck
+        and not data_missing
+        and max_act == 1
+        and (max_floor >= 12 or wins >= 5)
+    )
+    boss_progress_failure = (
+        is_ai_run_summary(summary)
+        and invalid_actions <= 0
+        and not stuck
+        and not data_missing
+        and max_act == 1
+        and boss_damage > 0
+    )
 
     reason = "early_failed_before_act2"
     reason_group = "early_failure"
@@ -325,6 +345,12 @@ def classify_self_play_outcome(summary):
     elif max_floor >= 18:
         reason = "floor18_plus"
         reason_group = "progress"
+    elif boss_progress_failure:
+        reason = "boss_progress_failure"
+        reason_group = "progress"
+    elif promising_act1_failure:
+        reason = "promising_act1_failure"
+        reason_group = "progress"
 
     admission_reason = "early_failed_before_act2"
     admitted = False
@@ -343,11 +369,18 @@ def classify_self_play_outcome(summary):
     elif max_floor >= 18:
         admitted = True
         admission_reason = "floor18_plus"
+    elif boss_progress_failure:
+        admitted = True
+        admission_reason = "boss_progress_failure"
+    elif promising_act1_failure:
+        admitted = True
+        admission_reason = "promising_act1_failure"
 
     reason_detail = (
         f"stage={stage}; max_act={max_act}; max_floor={max_floor}; "
         f"wins={wins}; losses={losses}; invalid_actions={invalid_actions}; "
-        f"records={safe_int(summary.get('records'))}; data_missing={int(bool(data_missing))}"
+        f"records={safe_int(summary.get('records'))}; data_missing={int(bool(data_missing))}; "
+        f"boss_damage={boss_damage}; boss_hp_min={safe_int(summary.get('boss_hp_min'))}"
     )
 
     return {
@@ -368,6 +401,10 @@ def classify_self_play_outcome(summary):
         "wins": wins,
         "losses": losses,
         "invalid_actions": invalid_actions,
+        "boss_damage": boss_damage,
+        "boss_hp_start": safe_int(summary.get("boss_hp_start")),
+        "boss_hp_min": safe_int(summary.get("boss_hp_min")),
+        "boss_hp_ratio_min": summary.get("boss_hp_ratio_min", 1.0),
         "stuck": stuck,
         "data_missing": data_missing,
     }
@@ -409,15 +446,27 @@ def evaluate_self_play_run(summary):
     wins = outcome["wins"]
     losses = outcome["losses"]
     invalid_actions = outcome["invalid_actions"]
+    boss_damage = outcome["boss_damage"]
+    boss_hp_start = outcome["boss_hp_start"]
+    boss_hp_min = outcome["boss_hp_min"]
     stuck = outcome["stuck"]
     data_missing = outcome["data_missing"]
+    promising_act1_failure = outcome["admission_reason"] in ("promising_act1_failure", "boss_progress_failure")
     policy_signal = collect_run_policy_signal(run_id)
+    act_progress = max(0, max_act - 1)
+    early_death = losses > 0 and max_act <= 1 and max_floor < 10
+    very_early_death = losses > 0 and max_act <= 1 and max_floor < 6
 
     score = 0
     score += max_floor * 5
-    score += max_act * 120
+    score += act_progress * 120
     score += wins * 20
+    score += min(220, boss_damage * 2)
     score -= losses * 160
+    if early_death:
+        score -= 80
+    if very_early_death:
+        score -= 80
     score -= invalid_actions * 400
     if probable_clear:
         score += 1000
@@ -431,10 +480,32 @@ def evaluate_self_play_run(summary):
         score -= 250
     if stuck:
         score -= 300
+    reward_terms = {
+        "progress": max_floor * 0.05 + act_progress * 1.2,
+        "combat_wins": wins * 0.2,
+        "boss_damage": min(4.0, boss_damage * 0.04),
+        "death": -1.6 * losses,
+        "early_death": -1.2 if early_death else 0.0,
+        "very_early_death": -1.2 if very_early_death else 0.0,
+        "invalid_actions": -4.0 * invalid_actions,
+        "clear_bonus": 10.0 if probable_clear else 4.5 if max_act >= 3 else 2.5 if max_act >= 2 else 1.25 if max_floor >= 18 else 0.0,
+        "data_missing": -2.5 if data_missing else 0.0,
+        "stuck": -3.0 if stuck else 0.0,
+    }
+    total_reward = round(sum(reward_terms.values()), 3)
+    if outcome["admitted"]:
+        sample_weight = max(1.0, min(5.0, 1.0 + max(score, 0) / 500.0))
+        if promising_act1_failure:
+            sample_weight = min(sample_weight, 1.35)
+    else:
+        sample_weight = 0.0
 
     return {
         "run_id": run_id,
         "score": int(score),
+        "reward": total_reward,
+        "reward_terms": reward_terms,
+        "sample_weight": round(sample_weight, 3),
         "admitted": outcome["admitted"],
         "reason": outcome["reason"],
         "reason_label": outcome["reason_label"],
@@ -451,10 +522,15 @@ def evaluate_self_play_run(summary):
         "model_version": policy_signal.get("model_version", ""),
         "max_act": max_act,
         "max_floor": max_floor,
+        "boss_damage": boss_damage,
+        "boss_hp_start": boss_hp_start,
+        "boss_hp_min": boss_hp_min,
+        "boss_hp_ratio_min": outcome["boss_hp_ratio_min"],
         "wins": wins,
         "losses": losses,
         "invalid_actions": invalid_actions,
         "data_health": summary.get("data_health"),
+        "seed": summary.get("seed", ""),
         "stuck": stuck,
         "updated_at": datetime.now().isoformat(timespec="seconds"),
     }
@@ -499,12 +575,18 @@ def empty_run_summary(run_id):
         "buy_item": 0,
         "invalid_actions": 0,
         "unknown_actions": 0,
+        "boss_damage": 0,
+        "boss_hp_start": 0,
+        "boss_hp_min": 0,
+        "boss_hp_ratio_min": 1.0,
+        "boss_hp_samples": 0,
         "max_act": 0,
         "max_floor": 0,
         "max_round": 0,
         "run_victory": False,
         "last_ts": 0,
         "first_ts": 0,
+        "seeds": set(),
         "schema_versions": set(),
         "files": set(),
     }
@@ -540,6 +622,9 @@ def update_run_summary(item, record, path):
     schema_version = record.get("schema_version")
     if schema_version is not None:
         item["schema_versions"].add(str(schema_version))
+    seed = record.get("seed")
+    if seed not in (None, ""):
+        item["seeds"].add(str(seed))
 
     rec_type = record.get("type")
     if rec_type in ("game_start", "game_resume", "battle_start", "battle_end", "turn_start", "turn_end"):
@@ -564,6 +649,28 @@ def update_run_summary(item, record, path):
     error = str(record.get("error") or record.get("message") or "").lower()
     if status == "error" or "invalid" in error or "out of range" in error or "cannot" in error:
         item["invalid_actions"] += 1
+
+    boss_progress = record.get("boss_hp_progress")
+    if isinstance(boss_progress, dict):
+        item["boss_hp_samples"] += 1
+        item["boss_damage"] += max(0, safe_int(boss_progress.get("damage")))
+        before = boss_progress.get("before") if isinstance(boss_progress.get("before"), dict) else {}
+        after = boss_progress.get("after") if isinstance(boss_progress.get("after"), dict) else {}
+        before_hp = safe_int(before.get("total_hp"))
+        after_hp = safe_int(after.get("total_hp"))
+        if before_hp > 0 and (item["boss_hp_start"] <= 0 or before_hp > item["boss_hp_start"]):
+            item["boss_hp_start"] = before_hp
+        observed_hp = [hp for hp in (before_hp, after_hp) if hp > 0]
+        if observed_hp:
+            lowest = min(observed_hp)
+            item["boss_hp_min"] = lowest if item["boss_hp_min"] <= 0 else min(item["boss_hp_min"], lowest)
+        for snapshot in (before, after):
+            ratio = snapshot.get("hp_ratio")
+            try:
+                ratio = float(ratio)
+            except (TypeError, ValueError):
+                continue
+            item["boss_hp_ratio_min"] = min(item["boss_hp_ratio_min"], ratio)
 
     for state in iter_record_states(record):
         update_progress_from_state(item, state)
@@ -666,6 +773,8 @@ def finalize_run_summary(item, discarded, labels, self_play_scores):
         item["quality_note"] = label.get("note", inferred_note)
     self_play = self_play_scores.get(item["run_id"])
     if isinstance(self_play, dict):
+        if not item.get("seed") and self_play.get("seed"):
+            item["seed"] = str(self_play.get("seed"))
         item["self_play_score"] = self_play.get("score")
         item["self_play_admitted"] = bool(self_play.get("admitted"))
         item["self_play_reason"] = self_play.get("reason", "")
@@ -681,6 +790,8 @@ def finalize_run_summary(item, discarded, labels, self_play_scores):
     item["inferred_quality"] = inferred_quality
     item["inferred_quality_label"] = QUALITY_LABELS.get(inferred_quality, inferred_quality)
     item["files"] = sorted(item["files"])
+    item["seeds"] = sorted(item["seeds"], key=str)
+    item["seed"] = item["seeds"][0] if len(item["seeds"]) == 1 else ""
     item["schema_versions"] = sorted(item["schema_versions"], key=str)
     item["duration_sec"] = int((item["last_ts"] - item["first_ts"]) / 1000) if item["first_ts"] and item["last_ts"] else 0
 

@@ -90,8 +90,7 @@ namespace STS2_MCP
                 _wasInRun = true;
                 Debug.Log("RunState", "[HOOK] Run started");
                 RL_DataCollector.Initialize();
-                // v3: 手动开始新游戏，切换回 Human 数据源
-                RL_DataCollector.SetDataSource(RL_DataCollector.DataSource.Human);
+                RL_DataCollector.ApplyMenuRunDataSource();
                 bool resumed = RL_DataCollector.StartOrResumeRun();
                 if (resumed)
                     RL_DataCollector.RecordGameResume();
