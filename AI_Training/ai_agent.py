@@ -3299,8 +3299,15 @@ def choose_crystal_sphere_rule_action(state, exploration=None):
     tool = str(crystal.get("tool") or "").lower()
     can_proceed = bool(crystal.get("can_proceed"))
     divinations_left_text = str(crystal.get("divinations_left_text") or "")
-    clickable_cells = crystal.get("clickable_cells") or []
-    revealed_items = crystal.get("revealed_items") or []
+    cells = crystal.get("cells") or []
+    clickable_cells = crystal.get("clickable_cells") or [
+        cell for cell in cells
+        if isinstance(cell, dict) and cell.get("is_clickable")
+    ]
+    revealed_items = crystal.get("revealed_items") or [
+        cell for cell in cells
+        if isinstance(cell, dict) and cell.get("item_type")
+    ]
     grid_width = max(safe_int(crystal.get("grid_width"), 11), 1)
     grid_height = max(safe_int(crystal.get("grid_height"), 11), 1)
     center_x = (grid_width - 1) / 2.0
@@ -3744,7 +3751,7 @@ def choose_macro_action(macro_agent, state, allow_shop=False, card_baseline_weig
         event_payload, event_info = choose_event_option_rule_action(state, exploration=exploration)
         if event_payload:
             return event_payload, event_info
-    if state_type == "crystal_sphere" and not prefer_model:
+    if state_type == "crystal_sphere":
         crystal_payload, crystal_info = choose_crystal_sphere_rule_action(state, exploration=exploration)
         if crystal_payload:
             return crystal_payload, crystal_info
