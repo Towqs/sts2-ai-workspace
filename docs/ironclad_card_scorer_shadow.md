@@ -102,6 +102,49 @@ options
 skip 是否合理参与竞争？
 ```
 
+## Shadow 分析脚本
+
+可以用下面的脚本汇总 shadow 日志：
+
+```powershell
+.\.venv\Scripts\python.exe .\AI_Training\analyze_card_shadow.py --date 2026-05-13 --report
+```
+
+默认读取：
+
+```text
+RL_Datasets/OptionShadow/card_scorer_YYYY-MM-DD.jsonl
+```
+
+并生成：
+
+```text
+RL_Datasets/OptionShadow/reports/shadow_report_YYYY-MM-DD.md
+```
+
+核心指标包括：
+
+```text
+total_card_reward_events
+avg_candidate_count
+old_vs_scorer_agreement_rate
+scorer_disagreed_with_old_policy
+scorer_recommended_skip_rate
+old_policy_skip_rate
+avg_confidence_gap
+score_nan_count
+score_inf_count
+archetype_distribution
+archetype_consistency
+avg_deck_size
+avg_deck_bloat_score
+reward_term_distribution
+reward_term_nan_count
+reward_term_inf_count
+```
+
+其中 `confidence_gap = best_score - second_best_score`。后续判断能否打开 active 时，重点看分歧案例里 scorer 是否有足够高的 confidence gap，以及是否存在异常 skip、NaN、inf 或候选数量异常。
+
 ## PPO / Rollout 预留字段
 
 PPO v0 仍然保持原训练语义，但 rollout 记录已补齐后续 PPO v2 需要的字段：

@@ -4299,7 +4299,7 @@ def score_distribution(values):
     }
 
 
-def append_card_scorer_shadow_log(session_id, state, actual_payload, macro_info, behavior_policy):
+def append_card_scorer_shadow_log(session_id, state, actual_payload, macro_info, behavior_policy, model_version=""):
     scorer = (macro_info or {}).get("card_scorer")
     if not isinstance(scorer, dict) or scorer.get("mode") == "off":
         return
@@ -4320,9 +4320,16 @@ def append_card_scorer_shadow_log(session_id, state, actual_payload, macro_info,
         "act": safe_int(run.get("act"), 0),
         "floor": safe_int(run.get("floor"), 0),
         "screen_type": "card_reward",
+        "policy_version": str(model_version or behavior_policy or ""),
         "behavior_policy": behavior_policy,
+        "reward_schema": "ironclad_shadow_v1",
         "actual_payload": actual_payload,
         "actual_action": (actual_payload or {}).get("action"),
+        "action_index": safe_int((actual_payload or {}).get("card_index", (actual_payload or {}).get("index")), -1),
+        "old_logprob": None,
+        "old_value": None,
+        "done": False,
+        "truncated": False,
         "actual_skip": (actual_payload or {}).get("action") == "skip_card_reward",
         "legacy_chosen_action": (macro_info or {}).get("chosen_action"),
         "recommended_action": selected.get("label"),
@@ -4899,6 +4906,7 @@ def run_agent():
                         payload,
                         macro_info,
                         snapshot_policy_name,
+                        snapshot_model_version,
                     )
                 write_ai_logic_snapshot({
                     "timestamp": int(time.time() * 1000),
