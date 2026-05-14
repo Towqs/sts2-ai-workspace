@@ -31,6 +31,7 @@ class CardScorerTests(unittest.TestCase):
         self.assertIn("exhaust_engine", enabled)
         self.assertNotIn("self_damage_rupture", enabled)
         self.assertFalse(config["templates"]["self_damage_rupture"]["enabled"])
+        self.assertEqual(config["template_selection"]["min_consistency_target"], 0.65)
 
     def test_card_reward_options_include_cards_and_skip(self):
         state = {
@@ -74,6 +75,9 @@ class CardScorerTests(unittest.TestCase):
         result = build_card_reward_options(state, mode="shadow")
         self.assertEqual(result.selected.label, "skip_reward")
         self.assertGreater(result.selected.score, 0.0)
+        skip = next(option for option in result.to_dict()["options"] if option["label"] == "skip_reward")
+        self.assertIn("skip_diagnostics", skip["metadata"])
+        self.assertLess(skip["metadata"]["skip_diagnostics"]["best_card_score"], 0.8)
 
     def test_multihit_scores_higher_in_strength_template(self):
         state = {

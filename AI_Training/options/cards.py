@@ -21,6 +21,7 @@ DEFAULT_TEMPLATE_CONFIG = {
         "warmup_card_rewards": 3,
         "switch_margin": 1.0,
         "switch_patience": 2,
+        "min_consistency_target": 0.65,
     },
     "templates": {
         "strength_multihit": {
@@ -41,9 +42,12 @@ DEFAULT_TEMPLATE_CONFIG = {
         },
     },
     "skip": {
-        "soft_deck_size": 22,
-        "hard_deck_size": 30,
-        "low_best_score": 0.5,
+        "soft_deck_size": 20,
+        "hard_deck_size": 24,
+        "low_best_score": 0.8,
+        "target_best_score": 1.0,
+        "low_archetype_fit": 0.3,
+        "low_confidence_gap": 0.2,
     },
 }
 
@@ -345,46 +349,84 @@ def score_card(state, deck_summary, card, template_id=None, config=None):
     }
 
 
+def _candidate_diagnostics(scored_cards):
+    scores = []
+    archetype_fits = []
+    duplicate_like = 0
+    low_fit = 0
+    for item in scored_cards or []:
+        if isinstance(item, dict):
+            score = _safe_float(item.get("score"), 0.0)
+            breakdown = item.get("score_breakdown") if isinstance(item.get("score_breakdown"), dict) else {}
+            tags = item.get("tags") if isinstance(item.get("tags"), dict) else {}
+        else:
+            score = _safe_float(item, 0.0)
+            breakdown = {}
+            tags = {}
+        scores.append(score)
+        fit = _safe_float(breakdown.get("archetype_fit"), 0.0)
+        archetype_fits.append(fit)
+        if _safe_float(breakdown.get("duplicate_penalty"), 0.0) < 0.0:
+            duplicate_like += 1
+        if fit < 0.3 and not tags.get("premium"):
+            low_fit += 1
+
+    sorted_scores = sorted(scores, reverse=True)
+    best = sorted_scores[0] if sorted_scores else 0.0
+    second = sorted_scores[1] if len(sorted_scores) > 1 else 0.0
+    return {
+        "best_card_score": round(float(best), 4),
+        "second_best_card_score": round(float(second), 4),
+        "confidence_gap": round(float(best - second), 4),
+        "max_archetype_fit": round(float(max(archetype_fits) if archetype_fits else 0.0), 4),
+        "all_candidates_low_fit": bool(scored_cards) and low_fit >= len(scored_cards),
+        "all_candidates_duplicates_or_low_fit": bool(scored_cards) and (duplicate_like + low_fit) >= len(scored_cards),
+    }
+
+
 def score_skip(state, deck_summary, card_scores, template_id=None, config=None):
     config = config or load_template_config()
     skip_cfg = config.get("skip") or {}
     ctx = _run_context(state)
     deck_size = _safe_int((deck_summary or {}).get("deck_size"), 0)
-    best = max(card_scores) if card_scores else 0.0
+    diagnostics = _candidate_diagnostics(card_scores)
+    best = diagnostics["best_card_score"]
+    confidence_gap = diagnostics["confidence_gap"]
+    max_archetype_fit = diagnostics["max_archetype_fit"]
     score = -1.0
     reasons = ["default take bias"]
     breakdown = {
         "base_take_bias": -1.0,
         "deck_bloat_bonus": 0.0,
         "low_value_bonus": 0.0,
+        "low_fit_bonus": 0.0,
+        "low_confidence_bonus": 0.0,
         "template_coherence_bonus": 0.0,
         "early_deck_penalty": 0.0,
     }
-    soft_size = _safe_int(skip_cfg.get("soft_deck_size"), 22)
-    hard_size = _safe_int(skip_cfg.get("hard_deck_size"), 30)
-    low_best = _safe_float(skip_cfg.get("low_best_score"), 0.5)
+    soft_size = _safe_int(skip_cfg.get("soft_deck_size"), 20)
+    hard_size = _safe_int(skip_cfg.get("hard_deck_size"), 24)
+    low_best = _safe_float(skip_cfg.get("low_best_score"), 0.8)
+    target_best = _safe_float(skip_cfg.get("target_best_score"), 1.0)
+    low_fit_threshold = _safe_float(skip_cfg.get("low_archetype_fit"), 0.3)
+    low_gap = _safe_float(skip_cfg.get("low_confidence_gap"), 0.2)
 
-    if deck_size >= hard_size and best < 1.4:
-        score += 2.5
-        _add_component(breakdown, "deck_bloat_bonus", 2.5)
-        reasons.append("hard deck bloat")
-    elif deck_size >= soft_size and best < low_best:
-        score += 1.8
-        _add_component(breakdown, "deck_bloat_bonus", 1.8)
-        reasons.append("weak candidates in large deck")
-    elif deck_size >= soft_size:
+    if deck_size >= soft_size and best < low_best:
         score += 0.5
         _add_component(breakdown, "deck_bloat_bonus", 0.5)
-        reasons.append("deck size caution")
-
-    if deck_size >= 24 and best < 1.0:
-        score += 1.0
-        _add_component(breakdown, "deck_bloat_bonus", 1.0)
-        reasons.append("large deck low card value")
-    if deck_size >= 26:
+        reasons.append("deck 20+ with weak best card")
+    if deck_size >= 22 and best < target_best:
         score += 0.8
         _add_component(breakdown, "deck_bloat_bonus", 0.8)
-        reasons.append("deck size 26+")
+        reasons.append("deck 22+ with low value offer")
+    if deck_size >= hard_size:
+        score += 0.8
+        _add_component(breakdown, "deck_bloat_bonus", 0.8)
+        reasons.append("deck 24+ bloat pressure")
+    elif deck_size >= soft_size:
+        score += 0.25
+        _add_component(breakdown, "deck_bloat_bonus", 0.25)
+        reasons.append("deck size caution")
 
     if best < 0.0:
         score += 1.1
@@ -395,8 +437,21 @@ def score_skip(state, deck_summary, card_scores, template_id=None, config=None):
         _add_component(breakdown, "low_value_bonus", 0.5)
         reasons.append("low best card score")
 
+    if max_archetype_fit < low_fit_threshold:
+        score += 0.6
+        _add_component(breakdown, "low_fit_bonus", 0.6)
+        reasons.append("low archetype fit")
+    if confidence_gap < low_gap and deck_size >= soft_size:
+        score += 0.4
+        _add_component(breakdown, "low_confidence_bonus", 0.4)
+        reasons.append("low confidence in large deck")
+    if diagnostics["all_candidates_duplicates_or_low_fit"]:
+        score += 0.6
+        _add_component(breakdown, "low_fit_bonus", 0.6)
+        reasons.append("all candidates duplicate or low-fit")
+
     consistency = archetype_consistency(deck_summary, config)
-    if deck_size >= soft_size and consistency.get("consistency", 0.0) >= 0.65 and best < 1.0:
+    if deck_size >= soft_size and consistency.get("consistency", 0.0) >= 0.65 and best < target_best:
         score += 0.4
         _add_component(breakdown, "template_coherence_bonus", 0.4)
         reasons.append("template already coherent")
@@ -410,6 +465,7 @@ def score_skip(state, deck_summary, card_scores, template_id=None, config=None):
         "score": round(float(score), 4),
         "reasons": reasons[:5],
         "score_breakdown": breakdown,
+        "diagnostics": diagnostics,
         "template_id": template_id or select_template(deck_summary, config),
     }
 
@@ -429,13 +485,13 @@ def build_card_reward_options(state, mode=None, template_id=None, config=None, d
     card_reward = (state or {}).get("card_reward") if isinstance(state, dict) else {}
     cards = (card_reward or {}).get("cards") or []
     options = []
-    card_scores = []
+    scored_cards = []
     for fallback_index, card in enumerate(cards):
         if not isinstance(card, dict):
             continue
         index = _safe_int(card.get("index"), fallback_index)
         scored = score_card(state, deck_summary, card, template_id=template_id, config=config)
-        card_scores.append(scored["score"])
+        scored_cards.append(scored)
         options.append(Option(
             label=f"choose_card:index_{index}",
             payload={"action": "select_card_reward", "card_index": index},
@@ -461,7 +517,7 @@ def build_card_reward_options(state, mode=None, template_id=None, config=None, d
         ))
 
     if (card_reward or {}).get("can_skip"):
-        skipped = score_skip(state, deck_summary, card_scores, template_id=template_id, config=config)
+        skipped = score_skip(state, deck_summary, scored_cards, template_id=template_id, config=config)
         options.append(Option(
             label="skip_reward",
             payload={"action": "skip_card_reward"},
@@ -474,6 +530,7 @@ def build_card_reward_options(state, mode=None, template_id=None, config=None, d
                 "scorer_version": CARD_SCORER_VERSION,
                 "skip": True,
                 "score_breakdown": skipped["score_breakdown"],
+                "skip_diagnostics": skipped["diagnostics"],
             },
             index=len(options),
         ))

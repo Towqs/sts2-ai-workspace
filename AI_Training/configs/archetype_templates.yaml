@@ -8,6 +8,7 @@ template_selection:
   warmup_card_rewards: 3
   switch_margin: 1.0
   switch_patience: 2
+  min_consistency_target: 0.65
 
 templates:
   strength_multihit:
@@ -24,6 +25,9 @@ templates:
     description: Self-damage growth package; disabled in phase 1.
 
 skip:
-  soft_deck_size: 22
-  hard_deck_size: 30
-  low_best_score: 1.0
+  soft_deck_size: 20
+  hard_deck_size: 24
+  low_best_score: 0.8
+  target_best_score: 1.0
+  low_archetype_fit: 0.3
+  low_confidence_gap: 0.2

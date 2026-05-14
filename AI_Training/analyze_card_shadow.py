@@ -137,11 +137,15 @@ def summarize_records(records):
     old_counts = Counter()
     scorer_counts = Counter()
     archetype_counts = Counter()
+    locked_template_counts = Counter()
+    run_template_counts = {}
     candidate_counts = []
     gaps = []
     consistency_values = []
     deck_sizes = []
     bloat_scores = []
+    skip_scores = []
+    best_card_scores = []
     reward_term_values = {}
     disagreement_examples = []
     high_confidence_examples = []
@@ -153,6 +157,7 @@ def summarize_records(records):
     agreement_count = 0
     skip_recommended_count = 0
     old_skip_count = 0
+    template_locked_count = 0
     candidate_count_anomalies = 0
 
     for record in valid:
@@ -183,11 +188,40 @@ def summarize_records(records):
 
         template_id = str(record.get("template_id") or selected.get("metadata", {}).get("template_id") or "unknown")
         archetype_counts[template_id] += 1
+        run_key = str(record.get("run_id") or "unknown")
+        run_template_counts.setdefault(run_key, Counter())[template_id] += 1
+        template_lock = record.get("template_lock") if isinstance(record.get("template_lock"), dict) else {}
+        if bool(record.get("template_locked") or template_lock.get("locked")):
+            template_locked_count += 1
+        locked_template = str(record.get("locked_template") or template_lock.get("locked_template") or "")
+        if locked_template:
+            locked_template_counts[locked_template] += 1
         consistency = record.get("archetype_consistency")
         if isinstance(consistency, dict):
             value = safe_float(consistency.get("consistency"))
             if value is not None and math.isfinite(value):
                 consistency_values.append(value)
+
+        skip_score = safe_float(record.get("skip_score"))
+        best_score = safe_float(record.get("best_card_score"))
+        if skip_score is None:
+            skip_option = next(
+                (option for option in options if isinstance(option, dict) and option.get("label") == "skip_reward"),
+                {},
+            )
+            skip_score = safe_float(skip_option.get("score"))
+        if best_score is None:
+            card_scores = [
+                safe_float(option.get("score"))
+                for option in options
+                if isinstance(option, dict) and option.get("label") != "skip_reward"
+            ]
+            card_scores = [value for value in card_scores if value is not None and math.isfinite(value)]
+            best_score = max(card_scores) if card_scores else None
+        if skip_score is not None and math.isfinite(skip_score):
+            skip_scores.append(skip_score)
+        if best_score is not None and math.isfinite(best_score):
+            best_card_scores.append(best_score)
 
         deck_summary = record.get("deck_summary") if isinstance(record.get("deck_summary"), dict) else {}
         deck_size = safe_float(deck_summary.get("deck_size"))
@@ -216,6 +250,8 @@ def summarize_records(records):
             "scorer": scorer_label,
             "gap": round4(gap),
             "template_id": template_id,
+            "template_locked": bool(record.get("template_locked") or template_lock.get("locked")),
+            "locked_template": locked_template,
             "deck_size": deck_summary.get("deck_size"),
             "line": record.get("_line"),
             "file": os.path.basename(str(record.get("_path") or "")),
@@ -224,6 +260,10 @@ def summarize_records(records):
             "selected_score": selected.get("score"),
             "selected_reasons": selected.get("reasons"),
             "score_breakdown": selected.get("score_breakdown"),
+            "skip_score": skip_score,
+            "best_card_score": best_score,
+            "skip_reasons": record.get("skip_reasons") or [],
+            "skip_score_breakdown": record.get("skip_score_breakdown") or {},
         }
         if old_label != scorer_label:
             disagreement_examples.append(example)
@@ -235,6 +275,11 @@ def summarize_records(records):
     total = len(valid)
     agreement_rate = agreement_count / total if total else 0.0
     disagreement_count = total - agreement_count
+    run_consistencies = []
+    for counts in run_template_counts.values():
+        count_total = sum(counts.values())
+        if count_total:
+            run_consistencies.append(max(counts.values()) / count_total)
     metrics = {
         "total_card_reward_events": total,
         "run_count": len(run_ids),
@@ -245,6 +290,8 @@ def summarize_records(records):
         "scorer_disagreed_with_old_policy_rate": round4(1.0 - agreement_rate if total else 0.0),
         "scorer_recommended_skip_rate": round4(skip_recommended_count / total if total else 0.0),
         "old_policy_skip_rate": round4(old_skip_count / total if total else 0.0),
+        "avg_skip_score": round4(mean(skip_scores)),
+        "avg_best_card_score": round4(mean(best_card_scores)),
         "avg_confidence_gap": round4(mean(gaps)),
         "score_nan_count": nan_count,
         "score_inf_count": inf_count,
@@ -255,7 +302,10 @@ def summarize_records(records):
             for name, values in sorted(reward_term_values.items())
         },
         "archetype_distribution": dict(archetype_counts),
+        "locked_template_distribution": dict(locked_template_counts),
+        "template_locked_rate": round4(template_locked_count / total if total else 0.0),
         "archetype_consistency": round4(mean(consistency_values)),
+        "template_sequence_consistency": round4(mean(run_consistencies)),
         "avg_deck_size": round4(mean(deck_sizes)),
         "avg_deck_bloat_score": round4(mean(bloat_scores)),
         "json_decode_errors": len(errors),
@@ -307,18 +357,21 @@ def _card_label(card):
 
 def examples_table(examples):
     if not examples:
-        return "| run | floor | old | old card | scorer | scorer card | gap | template | deck | location |\n| --- | ---: | --- | --- | --- | --- | ---: | --- | ---: | --- |\n| - | 0 | - | - | - | - | 0 | - | 0 | - |\n"
+        return "| run | floor | old | old card | scorer | scorer card | gap | template | locked | deck | skip | best | location |\n| --- | ---: | --- | --- | --- | --- | ---: | --- | --- | ---: | ---: | ---: | --- |\n| - | 0 | - | - | - | - | 0 | - | - | 0 | 0 | 0 | - |\n"
     lines = [
-        "| run | floor | old | old card | scorer | scorer card | gap | template | deck | location |",
-        "| --- | ---: | --- | --- | --- | --- | ---: | --- | ---: | --- |",
+        "| run | floor | old | old card | scorer | scorer card | gap | template | locked | deck | skip | best | location |",
+        "| --- | ---: | --- | --- | --- | --- | ---: | --- | --- | ---: | ---: | ---: | --- |",
     ]
     for item in examples:
         location = f"{item.get('file')}:{item.get('line')}"
+        locked = item.get("locked_template") if item.get("template_locked") else "-"
         lines.append(
             f"| `{item.get('run_id') or ''}` | {item.get('floor') or 0} | "
             f"`{item.get('old')}` | `{_card_label(item.get('old_card'))}` | "
             f"`{item.get('scorer')}` | `{_card_label(item.get('scorer_card'))}` | {item.get('gap')} | "
-            f"`{item.get('template_id')}` | {item.get('deck_size') or 0} | `{location}` |"
+            f"`{item.get('template_id')}` | `{locked}` | {item.get('deck_size') or 0} | "
+            f"{item.get('skip_score') if item.get('skip_score') is not None else 0} | "
+            f"{item.get('best_card_score') if item.get('best_card_score') is not None else 0} | `{location}` |"
         )
     return "\n".join(lines) + "\n"
 
@@ -334,7 +387,10 @@ def details_list(examples):
             f"- `{item.get('run_id')}` floor {item.get('floor')}: "
             f"{_card_label(item.get('scorer_card'))}, score={item.get('selected_score')}, "
             f"gap={item.get('gap')}, reasons={'; '.join(map(str, reasons)) or '-'}, "
-            f"breakdown={json.dumps(breakdown, ensure_ascii=False, sort_keys=True)}"
+            f"breakdown={json.dumps(breakdown, ensure_ascii=False, sort_keys=True)}, "
+            f"skip_score={item.get('skip_score')}, best_card_score={item.get('best_card_score')}, "
+            f"skip_reasons={'; '.join(map(str, item.get('skip_reasons') or [])) or '-'}, "
+            f"skip_breakdown={json.dumps(item.get('skip_score_breakdown') or {}, ensure_ascii=False, sort_keys=True)}"
         )
     return "\n".join(lines) + "\n"
 
@@ -353,12 +409,16 @@ def render_report(summary, input_files, report_date):
         f"- Disagreements: {metrics['scorer_disagreed_with_old_policy']} ({pct(metrics['scorer_disagreed_with_old_policy_rate'])}%)",
         f"- Scorer skip rate: {pct(metrics['scorer_recommended_skip_rate'])}%",
         f"- Old policy skip rate: {pct(metrics['old_policy_skip_rate'])}%",
+        f"- Avg skip score: {metrics['avg_skip_score']}",
+        f"- Avg best card score: {metrics['avg_best_card_score']}",
         f"- Avg confidence gap: {metrics['avg_confidence_gap']}",
         f"- Score NaN / inf: {metrics['score_nan_count']} / {metrics['score_inf_count']}",
         f"- Reward term NaN / inf: {metrics['reward_term_nan_count']} / {metrics['reward_term_inf_count']}",
         f"- Avg deck size: {metrics['avg_deck_size']}",
         f"- Avg deck bloat score: {metrics['avg_deck_bloat_score']}",
         f"- Archetype consistency: {metrics['archetype_consistency']}",
+        f"- Template lock rate: {pct(metrics['template_locked_rate'])}%",
+        f"- Template sequence consistency: {metrics['template_sequence_consistency']}",
         "",
         "## Input Files",
         "",
@@ -378,6 +438,9 @@ def render_report(summary, input_files, report_date):
         "## Archetype Distribution",
         "",
         md_table(metrics["archetype_distribution"], "template_id", "count"),
+        "## Locked Template Distribution",
+        "",
+        md_table(metrics["locked_template_distribution"], "locked_template", "count"),
         "## Reward Term Distribution",
         "",
         reward_terms_table(metrics["reward_term_distribution"]),

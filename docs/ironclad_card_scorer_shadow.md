@@ -131,11 +131,16 @@ old_vs_scorer_agreement_rate
 scorer_disagreed_with_old_policy
 scorer_recommended_skip_rate
 old_policy_skip_rate
+avg_skip_score
+avg_best_card_score
 avg_confidence_gap
 score_nan_count
 score_inf_count
 archetype_distribution
+locked_template_distribution
 archetype_consistency
+template_locked_rate
+template_sequence_consistency
 avg_deck_size
 avg_deck_bloat_score
 reward_term_distribution
@@ -152,9 +157,17 @@ old_policy_action / old_policy_card
 scorer_action / scorer_card
 template_scores
 template_lock
+template_locked
+candidate_template
+locked_template
 confidence_gap
 scorer_disagreed_with_old_policy
 skip_score
+skip_score_breakdown
+skip_reasons
+best_card_score
+second_best_card_score
+max_archetype_fit
 options[].card_id / name / total_score / score_breakdown / reasons
 ```
 
@@ -166,6 +179,14 @@ template_selection:
   warmup_card_rewards: 3
   switch_margin: 1.0
   switch_patience: 2
+  min_consistency_target: 0.65
+skip:
+  soft_deck_size: 20
+  hard_deck_size: 24
+  low_best_score: 0.8
+  target_best_score: 1.0
+  low_archetype_fit: 0.3
+  low_confidence_gap: 0.2
 ```
 
 也就是说，前 3 次 card reward 允许自由判断构筑；之后锁定主模板。只有另一个模板连续 2 次超过当前模板且分差至少 1.0，才会切换。

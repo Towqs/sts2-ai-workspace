@@ -2029,10 +2029,12 @@ def locked_template_for_card_reward(state, session_id=""):
     lock = CARD_TEMPLATE_LOCKS.setdefault(key, {
         "seen": set(),
         "card_reward_count": 0,
+        "template_counts": {},
         "locked_template": "",
         "challenger_template": "",
         "challenger_count": 0,
     })
+    lock.setdefault("template_counts", {})
     warmup = max(safe_int(lock_cfg.get("warmup_card_rewards"), 3), 0)
     margin = safe_num(lock_cfg.get("switch_margin"), 1.0)
     patience = max(safe_int(lock_cfg.get("switch_patience"), 2), 1)
@@ -2041,8 +2043,12 @@ def locked_template_for_card_reward(state, session_id=""):
     if state_key not in lock["seen"]:
         lock["seen"].add(state_key)
         lock["card_reward_count"] += 1
+        lock["template_counts"][candidate] = safe_int(lock["template_counts"].get(candidate), 0) + 1
         if not lock["locked_template"] and lock["card_reward_count"] >= warmup:
-            lock["locked_template"] = candidate
+            lock["locked_template"] = max(
+                lock["template_counts"].items(),
+                key=lambda item: (safe_int(item[1], 0), safe_num(scores.get(item[0]), 0.0), item[0]),
+            )[0]
         elif lock["locked_template"]:
             locked = lock["locked_template"]
             candidate_score = safe_num(scores.get(candidate), 0.0)
@@ -2070,6 +2076,7 @@ def locked_template_for_card_reward(state, session_id=""):
         "switch_patience": patience,
         "card_reward_count": lock["card_reward_count"],
         "candidate_template": candidate,
+        "template_counts": dict(lock["template_counts"]),
         "locked_template": lock["locked_template"],
         "selected_template": selected,
         "challenger_template": lock["challenger_template"],
@@ -4432,6 +4439,14 @@ def append_card_scorer_shadow_log(session_id, state, actual_payload, macro_info,
     }
     old_option = options_by_label.get(old_label) or {}
     skip_option = options_by_label.get("skip_reward") or {}
+    skip_breakdown = skip_option.get("score_breakdown") if isinstance(skip_option.get("score_breakdown"), dict) else {}
+    skip_diagnostics = (
+        ((skip_option.get("metadata") or {}).get("skip_diagnostics"))
+        if isinstance(skip_option.get("metadata"), dict)
+        else None
+    )
+    if not isinstance(skip_diagnostics, dict):
+        skip_diagnostics = {}
     old_card = {
         "index": old_option.get("index", safe_int((actual_payload or {}).get("card_index", (actual_payload or {}).get("index")), -1)),
         "card_id": old_option.get("card_id") or "",
@@ -4488,6 +4503,12 @@ def append_card_scorer_shadow_log(session_id, state, actual_payload, macro_info,
         "scorer_disagreed_with_old_policy": bool(old_label and scorer_label and old_label != scorer_label),
         "confidence_gap": scorer.get("confidence_gap", 0.0),
         "skip_score": skip_option.get("score"),
+        "skip_score_breakdown": skip_breakdown,
+        "skip_reasons": skip_option.get("reasons") or [],
+        "skip_diagnostics": skip_diagnostics,
+        "best_card_score": skip_diagnostics.get("best_card_score"),
+        "second_best_card_score": skip_diagnostics.get("second_best_card_score"),
+        "max_archetype_fit": skip_diagnostics.get("max_archetype_fit"),
         "skip_recommended": selected.get("label") == "skip_reward",
         "skip_available": any(
             (option or {}).get("label") == "skip_reward"
@@ -4501,6 +4522,9 @@ def append_card_scorer_shadow_log(session_id, state, actual_payload, macro_info,
         "template_id": scorer.get("template_id"),
         "template_scores": template_scores,
         "template_lock": scorer.get("template_lock"),
+        "template_locked": bool((scorer.get("template_lock") or {}).get("locked")),
+        "candidate_template": (scorer.get("template_lock") or {}).get("candidate_template"),
+        "locked_template": (scorer.get("template_lock") or {}).get("locked_template"),
         "archetype_consistency": scorer.get("archetype_consistency"),
         "deck_size": deck_summary.get("deck_size"),
         "deck_summary": deck_summary,
