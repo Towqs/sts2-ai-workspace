@@ -536,6 +536,59 @@ class SelfPlayManager:
     def _recover_to_menu(self, reason):
         deadline = time.time() + 18
         while time.time() < deadline and not self._stop_event.is_set():
+            try:
+                state = self._game_get(timeout=4)
+                state_type = str(state.get("state_type") or "").lower()
+                if state_type in ("card_select", "hand_select"):
+                    screen = state.get("card_select") or state.get("hand_select") or {}
+                    actions = []
+                    if screen.get("can_confirm"):
+                        actions.append("confirm_selection")
+                    if screen.get("can_cancel"):
+                        actions.append("cancel_selection")
+                    for action in actions:
+                        try:
+                            self._set_status(
+                                last_message=f"正在清理选择界面：{reason} ({action})",
+                                current_state="recovering",
+                                current_state_type=state_type,
+                            )
+                            self._game_post({"action": action}, timeout=6)
+                            time.sleep(0.8)
+                            state = self._game_get(timeout=4)
+                            state_type = str(state.get("state_type") or "").lower()
+                            if state_type == "menu":
+                                return True
+                            if state_type not in ("card_select", "hand_select"):
+                                break
+                        except Exception:
+                            continue
+                elif state_type == "bundle_select":
+                    screen = state.get("bundle_select") or {}
+                    actions = []
+                    if screen.get("can_confirm"):
+                        actions.append("confirm_bundle_selection")
+                    if screen.get("can_cancel"):
+                        actions.append("cancel_bundle_selection")
+                    for action in actions:
+                        try:
+                            self._set_status(
+                                last_message=f"正在清理选择界面：{reason} ({action})",
+                                current_state="recovering",
+                                current_state_type=state_type,
+                            )
+                            self._game_post({"action": action}, timeout=6)
+                            time.sleep(0.8)
+                            state = self._game_get(timeout=4)
+                            state_type = str(state.get("state_type") or "").lower()
+                            if state_type == "menu":
+                                return True
+                            if state_type != "bundle_select":
+                                break
+                        except Exception:
+                            continue
+            except Exception:
+                pass
             for action in ("return_to_menu", "abandon_run"):
                 try:
                     self._set_status(last_message=f"正在恢复到主菜单：{reason} ({action})", current_state="recovering")
@@ -612,11 +665,16 @@ class SelfPlayManager:
                 menu_since = None
 
             if time.time() - started_at > config["self_play_max_run_minutes"] * 60:
-                self._recover_to_menu("run_timeout")
-                return self._latest_run(run_id)
+                if self._recover_to_menu("run_timeout"):
+                    return self._latest_run(run_id)
+                self._set_status(last_message=f"Run {run_id} timeout recovery did not reach menu; continuing monitor.", current_state="running")
+                started_at = time.time()
+                last_progress_ts = time.time()
             if time.time() - last_progress_ts > config["self_play_stall_seconds"]:
-                self._recover_to_menu("stalled")
-                return self._latest_run(run_id)
+                if self._recover_to_menu("stalled"):
+                    return self._latest_run(run_id)
+                self._set_status(last_message=f"Run {run_id} stalled but recovery did not reach menu; continuing monitor.", current_state="running")
+                last_progress_ts = time.time()
             time.sleep(1.0)
         return self._latest_run(run_id)
 
