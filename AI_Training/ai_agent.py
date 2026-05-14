@@ -2870,6 +2870,74 @@ def choose_hand_select_action(state):
     }
 
 
+def choose_bundle_select_action(state):
+    screen = state.get("bundle_select") or {}
+    if screen.get("preview_showing") and screen.get("can_confirm"):
+        return {"action": "confirm_bundle_selection"}, {
+            "top_actions": [{"action": "confirm_bundle_selection", "confidence": 100.0, "marker": "bundle_preview_ready"}],
+            "chosen_action": "confirm_bundle_selection",
+            "payload": {"action": "confirm_bundle_selection"},
+            "reason": "bundle_select_confirm_preview",
+        }
+
+    scored = []
+    for fallback_index, bundle in enumerate(screen.get("bundles") or []):
+        if not isinstance(bundle, dict):
+            continue
+        index = safe_int(bundle.get("index"), fallback_index)
+        cards = [card for card in (bundle.get("cards") or []) if isinstance(card, dict)]
+        card_scores = []
+        reasons = []
+        for card in cards:
+            score, card_reasons = score_card_select_for_operation(card, "choose", state)
+            card_scores.append(score)
+            if card_reasons:
+                reasons.append(f"{card.get('id') or card.get('name')}: {card_reasons[0]}")
+        if card_scores:
+            score = sum(card_scores) / len(card_scores) + max(card_scores) * 0.25
+        else:
+            score = -1.0
+            reasons.append("empty bundle")
+        scored.append({
+            "index": index,
+            "score": round(score, 3),
+            "card_count": len(cards),
+            "reasons": reasons[:3],
+        })
+
+    if not scored:
+        if screen.get("can_cancel"):
+            return {"action": "cancel_bundle_selection"}, {
+                "top_actions": [{"action": "cancel_bundle_selection", "confidence": 100.0, "marker": "no_bundles"}],
+                "chosen_action": "cancel_bundle_selection",
+                "payload": {"action": "cancel_bundle_selection"},
+                "reason": "bundle_select_no_bundles",
+            }
+        return None, {
+            "top_actions": [],
+            "chosen_action": None,
+            "payload": None,
+            "reason": "bundle_select_no_bundles",
+        }
+
+    best = max(scored, key=lambda item: item["score"])
+    payload = {"action": "select_bundle", "index": best["index"]}
+    top_actions = [
+        {
+            "action": f"select_bundle:index_{item['index']}",
+            "confidence": round(max(item["score"], 0.0) * 20, 2),
+            "marker": f"cards={item['card_count']}; score={item['score']:+.2f}; {' / '.join(item['reasons']) or '-'}",
+        }
+        for item in sorted(scored, key=lambda item: item["score"], reverse=True)[:6]
+    ]
+    return payload, {
+        "top_actions": top_actions,
+        "chosen_action": f"select_bundle:index_{best['index']}",
+        "payload": payload,
+        "reason": "bundle_select_choose: " + (" / ".join(best["reasons"]) or "highest bundle value"),
+    }
+
+
 def shop_price(item):
     return safe_num(item.get("price") or item.get("cost"), 9999.0)
 
@@ -3812,6 +3880,25 @@ def macro_state_signature(state):
             (c.get("index"), c.get("id"), c.get("name"))
             for c in (hand_select.get("cards") or [])
         ]
+    elif state_type == "bundle_select":
+        bundle_select = state.get("bundle_select") or {}
+        payload["screen_type"] = bundle_select.get("screen_type")
+        payload["prompt"] = bundle_select.get("prompt")
+        payload["can_confirm"] = bundle_select.get("can_confirm")
+        payload["can_cancel"] = bundle_select.get("can_cancel")
+        payload["preview_showing"] = bundle_select.get("preview_showing")
+        payload["bundles"] = [
+            (
+                b.get("index"),
+                [
+                    (c.get("index"), c.get("id"), c.get("name"))
+                    for c in (b.get("cards") or [])
+                    if isinstance(c, dict)
+                ],
+            )
+            for b in (bundle_select.get("bundles") or [])
+            if isinstance(b, dict)
+        ]
     elif state_type == "event":
         payload["options"] = [
             (o.get("index"), o.get("title"), o.get("is_locked"), o.get("is_proceed"), o.get("was_chosen"))
@@ -3860,6 +3947,8 @@ def choose_macro_action(macro_agent, state, allow_shop=False, card_baseline_weig
         return choose_card_select_action(state)
     if state_type == "hand_select":
         return choose_hand_select_action(state)
+    if state_type == "bundle_select":
+        return choose_bundle_select_action(state)
     if state_type == "event":
         event_payload, event_info = choose_event_option_rule_action(state, exploration=exploration)
         if event_payload:
@@ -5004,7 +5093,7 @@ def run_agent():
                 agent_sleep(4.0, control)
                 continue
 
-            if control.get("macro_enabled", False) and state_type in ("map", "rewards", "card_reward", "card_select", "hand_select", "event", "crystal_sphere", "rest_site", "shop", "fake_merchant", "treasure"):
+            if control.get("macro_enabled", False) and state_type in ("map", "rewards", "card_reward", "card_select", "hand_select", "bundle_select", "event", "crystal_sphere", "rest_site", "shop", "fake_merchant", "treasure"):
                 allow_shop = bool(control.get("macro_shop_enabled", False) or constraint_mode in ("explore", "free"))
                 card_baseline_weight = safe_num(control.get("macro_card_reward_weight"), 0.35)
                 state["_ai_session_id"] = session_id
@@ -5109,7 +5198,7 @@ def run_agent():
                     "exploration": exploration,
                 })
                 now_ts = time.time()
-                macro_retry_after = 1.0 if state_type in ("rewards", "treasure", "card_reward") else 2.0 if state_type in ("rest_site", "event", "card_select", "hand_select") else 6.0
+                macro_retry_after = 1.0 if state_type in ("rewards", "treasure", "card_reward") else 2.0 if state_type in ("rest_site", "event", "card_select", "hand_select", "bundle_select") else 6.0
                 should_retry_macro = bool(
                     payload
                     and decision_key == last_macro_decision_key
