@@ -1669,14 +1669,38 @@ def delete_model_package(model_id):
     model_id = safe_model_id(model_id)
     if not model_id:
         return {"status": "error", "error": "invalid model_id"}
-    active = safe_model_id(read_control().get("active_model_id"))
-    if model_id == active:
-        return {"status": "error", "error": "无法删除当前启用的模型"}
     root = MODEL_ZOO_DIR / model_id
     if not root.exists() or not root.is_dir():
         return {"status": "error", "error": "未找到模型包"}
-    shutil.rmtree(root, ignore_errors=True)
-    return {"status": "ok"}
+
+    control = read_control()
+    active = safe_model_id(control.get("active_model_id"))
+    active_reset = False
+    if model_id == active:
+        control["active_model_id"] = "local"
+        write_json(CONTROL_PATH, control)
+        active_reset = True
+
+    try:
+        shutil.rmtree(root)
+    except Exception as exc:
+        if active_reset:
+            control["active_model_id"] = model_id
+            write_json(CONTROL_PATH, control)
+        return {"status": "error", "error": f"删除模型包失败: {exc}"}
+
+    if root.exists():
+        if active_reset:
+            control["active_model_id"] = model_id
+            write_json(CONTROL_PATH, control)
+        return {"status": "error", "error": "删除模型包失败: 目录仍然存在"}
+
+    return {
+        "status": "ok",
+        "deleted_model_id": model_id,
+        "active_reset": active_reset,
+        "active_model_id": "local" if active_reset else active,
+    }
 
 
 def infer_model_id_from_manifest(manifest, fallback=""):
@@ -6216,7 +6240,7 @@ function renderModelHealthV2(models, aiProcess, control, runtime, monsterProfile
         <button onclick="renameModelPackage(${jsString(pkg.id)})">保存名称</button>
         <button onclick="pinModelPackage(${jsString(pkg.id)})" ${isPinned ? "disabled" : ""}>永久保留</button>
         <button onclick="activateModelById(${jsString(pkg.id)})" ${isActive ? "disabled" : ""}>切换启用</button>
-        <button class="off" onclick="deleteModelPackage(${jsString(pkg.id)})" ${isActive ? "disabled" : ""}>删除</button>
+        <button class="off" onclick="deleteModelPackage(${jsString(pkg.id)}, ${isActive ? "true" : "false"})">删除</button>
       </div>
     </div>`;
   }).join("");
@@ -6749,13 +6773,18 @@ async function importModelPackage(){
   }
   refresh();
 }
-async function deleteModelPackage(model_id){
-  if (!confirm(`确定要彻底删除模型包 ${model_id} 吗？此操作不可恢复。`)) return;
+async function deleteModelPackage(model_id, isActive=false){
+  const activeNote = isActive ? "\n\n这是当前启用的模型包。删除后会先切回本地当前模型，已经加载到 ProcessedParams 的模型文件不会被删除。" : "";
+  if (!confirm(`确定要彻底删除模型包 ${model_id} 吗？此操作不可恢复。${activeNote}`)) return;
   const resultEl = document.getElementById("modelSwitchResult");
   if (resultEl) resultEl.textContent = "正在删除...";
   const result = await api("/api/model/delete", {model_id});
-  if (resultEl) resultEl.textContent = result.status === "ok" ? "模型包已删除。" : (result.error || "删除失败");
-  refresh();
+  if (result.status === "ok") {
+    if (resultEl) resultEl.textContent = result.active_reset ? "模型包已删除，当前启用已切回本地当前模型。" : "模型包已删除。";
+  } else if (resultEl) {
+    resultEl.textContent = result.error || "删除失败";
+  }
+  await refresh();
 }
 async function activateModelById(model_id){
   const resultEl = document.getElementById("modelSwitchResult");
