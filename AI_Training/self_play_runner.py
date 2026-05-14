@@ -186,6 +186,8 @@ def default_self_play_state():
         "current_state_type": "",
         "completed_runs": 0,
         "admitted_runs": 0,
+        "history_completed_runs": 0,
+        "history_admitted_runs": 0,
         "pending_training_runs": 0,
         "target_runs": 0,
         "train_every_admitted_runs": 0,
@@ -281,6 +283,8 @@ class SelfPlayManager:
             "current_state_type": self._status.get("current_state_type") or "",
             "completed_runs": int(self._status.get("completed_runs") or 0),
             "admitted_runs": int(self._status.get("admitted_runs") or 0),
+            "history_completed_runs": int(self._status.get("history_completed_runs") or 0),
+            "history_admitted_runs": int(self._status.get("history_admitted_runs") or 0),
             "pending_training_runs": int(self._status.get("next_training_in") or 0),
             "target_runs": int(self._status.get("target_runs") or 0),
             "train_every_admitted_runs": int((self._status.get("config") or {}).get("self_play_train_every_admitted_runs") or 0),
@@ -305,6 +309,8 @@ class SelfPlayManager:
                 return {"status": "busy", "message": "自训练已经在运行中。", "self_play": deepcopy(self._status)}
             config = merged_config(overrides)
             history = self_play_history_summary(config)
+            history_completed = int(history.get("completed_runs") or 0)
+            history_admitted = int(history.get("admitted_runs") or 0)
             self._stop_event.clear()
             self._status = {
                 "running": True,
@@ -315,8 +321,10 @@ class SelfPlayManager:
                 "current_run_id": "",
                 "current_seed": normalize_seed(config.get("self_play_seed")),
                 "current_floor": 0,
-                "completed_runs": int(history.get("completed_runs") or 0),
-                "admitted_runs": int(history.get("admitted_runs") or 0),
+                "completed_runs": 0,
+                "admitted_runs": 0,
+                "history_completed_runs": history_completed,
+                "history_admitted_runs": history_admitted,
                 "target_runs": int(config["self_play_target_runs"]),
                 "recent_scores": deepcopy(history.get("recent_scores") or []),
                 "last_score": deepcopy(history.get("last_score")),
@@ -694,8 +702,10 @@ class SelfPlayManager:
             self._wait_for_ai()
             existing_run_ids = self._existing_run_ids()
             history = self_play_history_summary(config)
-            admitted_runs = int(history.get("admitted_runs") or 0)
-            completed_runs = int(history.get("completed_runs") or 0)
+            history_admitted_runs = int(history.get("admitted_runs") or 0)
+            history_completed_runs = int(history.get("completed_runs") or 0)
+            admitted_runs = 0
+            completed_runs = 0
             recent_scores = list(history.get("recent_scores") or [])
             target = int(config["self_play_target_runs"])
             use_ppo = config.get("policy_mode") in ("ppo_experiment", "ppo_best")
@@ -735,9 +745,14 @@ class SelfPlayManager:
                 self._set_status(
                     completed_runs=completed_runs,
                     admitted_runs=admitted_runs,
+                    history_completed_runs=history_completed_runs + completed_runs,
+                    history_admitted_runs=history_admitted_runs + admitted_runs,
                     last_score=score,
                     recent_scores=recent_scores,
-                    next_training_in=next_training_in(completed_runs if use_ppo else admitted_runs, training_interval),
+                    next_training_in=next_training_in(
+                        (history_completed_runs + completed_runs) if use_ppo else (history_admitted_runs + admitted_runs),
+                        training_interval,
+                    ),
                     last_message=f"Run {run_id} 结束，score={score.get('score')}，admitted={score.get('admitted')}",
                 )
                 if self._is_clear_score(score):
@@ -772,9 +787,9 @@ class SelfPlayManager:
                         last_message=f"Clear reached by {run_id}; model snapshots saved.",
                     )
                     break
-                if use_ppo and completed_runs > 0 and completed_runs % training_interval == 0:
+                if use_ppo and completed_runs > 0 and (history_completed_runs + completed_runs) % training_interval == 0:
                     self._trigger_ppo_training()
-                elif not use_ppo and score.get("admitted") and admitted_runs % training_interval == 0:
+                elif not use_ppo and score.get("admitted") and (history_admitted_runs + admitted_runs) % training_interval == 0:
                     self._trigger_training()
             self._set_status(
                 running=False,

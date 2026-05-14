@@ -839,6 +839,8 @@ def default_self_play_state():
         "current_state_type": "",
         "completed_runs": 0,
         "admitted_runs": 0,
+        "history_completed_runs": 0,
+        "history_admitted_runs": 0,
         "pending_training_runs": 0,
         "target_runs": 0,
         "train_every_admitted_runs": 0,
@@ -942,12 +944,18 @@ def self_play_status_payload():
     history = self_play_history_summary(control)
     state_seed = _normalize_seed(state.get("current_seed") or _effective_self_play_seed(control))
     control_seed = _effective_self_play_seed(control)
-    if state_seed == control_seed and _safe_int(history.get("completed_runs")) > _safe_int(state.get("completed_runs")):
-        state["completed_runs"] = int(history.get("completed_runs") or 0)
-        state["admitted_runs"] = int(history.get("admitted_runs") or 0)
-        state["pending_training_runs"] = int(history.get("pending_training_runs") or 0)
+    if state_seed == control_seed:
+        state["history_completed_runs"] = int(history.get("completed_runs") or 0)
+        state["history_admitted_runs"] = int(history.get("admitted_runs") or 0)
+    if (
+        state_seed == control_seed
+        and not state.get("started_at")
+        and _safe_int(history.get("completed_runs")) > _safe_int(state.get("completed_runs"))
+    ):
         state["recent_scores"] = history.get("recent_scores") or []
         state["last_score"] = history.get("last_score")
+    if state_seed == control_seed and not state.get("running") and not state.get("started_at"):
+        state["pending_training_runs"] = int(history.get("pending_training_runs") or 0)
     if not pid and state.get("running"):
         state["running"] = False
         if not state.get("finished_at"):
@@ -1112,8 +1120,10 @@ def start_self_play():
         "started_at": datetime.now().isoformat(timespec="seconds"),
         "last_updated_at": datetime.now().isoformat(timespec="seconds"),
         "current_seed": _effective_self_play_seed(control),
-        "completed_runs": int(history.get("completed_runs") or 0),
-        "admitted_runs": int(history.get("admitted_runs") or 0),
+        "completed_runs": 0,
+        "admitted_runs": 0,
+        "history_completed_runs": int(history.get("completed_runs") or 0),
+        "history_admitted_runs": int(history.get("admitted_runs") or 0),
         "pending_training_runs": int(history.get("pending_training_runs") or 0),
         "target_runs": int(control.get("self_play_target_runs", DEFAULT_CONTROL["self_play_target_runs"])),
         "train_every_admitted_runs": int(control.get("self_play_train_every_admitted_runs", DEFAULT_CONTROL["self_play_train_every_admitted_runs"])),
