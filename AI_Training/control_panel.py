@@ -4640,6 +4640,11 @@ function jsString(value) {
 function escapeAttr(value) {
   return escapeHtml(value).replace(/`/g, "&#96;");
 }
+function cssEscape(value) {
+  const text = String(value ?? "");
+  if (window.CSS && typeof window.CSS.escape === "function") return window.CSS.escape(text);
+  return text.replace(/["\\]/g, "\\$&");
+}
 function phaseInfo(game, activeRun) {
   if (!game.online) return {label:"未连接", cls:"off", detail:`游戏 API 离线：${game.error || "无响应"}`};
   const raw = String(game.state_type || "unknown");
@@ -5450,6 +5455,8 @@ let llmProfilesCache = [];
 let refreshInFlight = false;
 let refreshPending = false;
 let forceModelHealthRefreshUntil = 0;
+let pendingModelDeleteId = "";
+let pendingModelDeleteUntil = 0;
 function markLLMDirty() {
   llmFormDirty = true;
 }
@@ -6235,7 +6242,7 @@ function renderModelHealthV2(models, aiProcess, control, runtime, monsterProfile
     const isActive = pkg.id === activeModelId;
     const rowId = `modelLabel_${pkg.id}`;
     const createdDate = (pkg.created_at || "").replace("T", " ");
-    return `<div class="model-pkg-card ${isActive ? 'is-active' : ''}">
+    return `<div class="model-pkg-card ${isActive ? 'is-active' : ''}" data-model-id="${escapeAttr(pkg.id)}">
       <div class="model-pkg-card-head">
         <span class="pkg-label">${escapeHtml(pkg.label || pkg.id)}</span>
         ${isActive ? '<span class="pill on">当前启用</span>' : ''}
@@ -6258,10 +6265,10 @@ function renderModelHealthV2(models, aiProcess, control, runtime, monsterProfile
       </div>
       <div class="model-pkg-card-actions">
         <input id="${escapeAttr(rowId)}" type="text" value="${escapeAttr(pkg.label || pkg.id)}" onfocus="this.dataset.editing='1'" onblur="this.dataset.editing=''">
-        <button onclick="renameModelPackage(${jsString(pkg.id)})">保存名称</button>
-        <button onclick="pinModelPackage(${jsString(pkg.id)})" ${isPinned ? "disabled" : ""}>永久保留</button>
-        <button onclick="activateModelById(${jsString(pkg.id)})" ${isActive ? "disabled" : ""}>切换启用</button>
-        <button class="off" onclick="deleteModelPackage(${jsString(pkg.id)}, ${isActive ? "true" : "false"})">删除</button>
+        <button type="button" onclick="renameModelPackage(${jsString(pkg.id)})">保存名称</button>
+        <button type="button" onclick="pinModelPackage(${jsString(pkg.id)})" ${isPinned ? "disabled" : ""}>永久保留</button>
+        <button type="button" onclick="activateModelById(${jsString(pkg.id)})" ${isActive ? "disabled" : ""}>切换启用</button>
+        <button type="button" class="off" data-delete-model-id="${escapeAttr(pkg.id)}" onclick="deleteModelPackage(${jsString(pkg.id)}, ${isActive ? "true" : "false"}, this)">删除</button>
       </div>
     </div>`;
   }).join("");
@@ -6794,21 +6801,50 @@ async function importModelPackage(){
   }
   refresh();
 }
-async function deleteModelPackage(model_id, isActive=false){
-  const activeNote = isActive ? "\n\n这是当前启用的模型包。删除后会先切回本地当前模型，已经加载到 ProcessedParams 的模型文件不会被删除。" : "";
-  if (!confirm(`确定要彻底删除模型包 ${model_id} 吗？此操作不可恢复。${activeNote}`)) return;
+async function deleteModelPackage(model_id, isActive=false, button=null){
   const resultEl = document.getElementById("modelSwitchResult");
-  if (resultEl) resultEl.textContent = "正在删除...";
+  const now = Date.now();
+  if (pendingModelDeleteId !== model_id || now > pendingModelDeleteUntil) {
+    pendingModelDeleteId = model_id;
+    pendingModelDeleteUntil = now + 8000;
+    if (button) {
+      button.textContent = "再点确认删除";
+      button.dataset.confirming = "1";
+    }
+    if (resultEl) {
+      resultEl.textContent = isActive
+        ? `再次点击删除将彻底删除 ${model_id}，并先切回本地当前模型。`
+        : `再次点击删除将彻底删除 ${model_id}。`;
+    }
+    return;
+  }
   forceModelHealthRefreshUntil = Date.now() + 3000;
+  pendingModelDeleteId = "";
+  pendingModelDeleteUntil = 0;
+  if (button) {
+    button.disabled = true;
+    button.textContent = "正在删除...";
+  }
+  if (resultEl) resultEl.textContent = "正在删除...";
   try {
     const result = await api("/api/model/delete", {model_id});
     if (result.status === "ok") {
+      const card = document.querySelector(`.model-pkg-card[data-model-id="${cssEscape(model_id)}"]`);
+      if (card) card.remove();
       if (resultEl) resultEl.textContent = result.active_reset ? "模型包已删除，当前启用已切回本地当前模型。" : "模型包已删除。";
     } else if (resultEl) {
       resultEl.textContent = result.error || "删除失败";
+      if (button) {
+        button.disabled = false;
+        button.textContent = "删除";
+      }
     }
   } catch (err) {
     if (resultEl) resultEl.textContent = `删除请求失败：${err.message || err}`;
+    if (button) {
+      button.disabled = false;
+      button.textContent = "删除";
+    }
   }
   await refresh();
 }
