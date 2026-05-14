@@ -6139,8 +6139,8 @@ function renderModelHealth(models, aiProcess, control, runtime, monsterProfiles)
         <span class="fine">${formatBytes(pkg.size || 0)}</span>
       </td>
       <td>
-        <button onclick="renameModelPackage(${jsString(pkg.id)})">保存名称</button>
-        <button onclick="pinModelPackage(${jsString(pkg.id)})" ${isPinned ? "disabled" : ""}>永久保留</button>
+        <button onclick='renameModelPackage(${jsString(pkg.id)})'>保存名称</button>
+        <button onclick='pinModelPackage(${jsString(pkg.id)})' ${isPinned ? "disabled" : ""}>永久保留</button>
       </td>
     </tr>`;
   }).join("");
@@ -6265,10 +6265,10 @@ function renderModelHealthV2(models, aiProcess, control, runtime, monsterProfile
       </div>
       <div class="model-pkg-card-actions">
         <input id="${escapeAttr(rowId)}" type="text" value="${escapeAttr(pkg.label || pkg.id)}" onfocus="this.dataset.editing='1'" onblur="this.dataset.editing=''">
-        <button type="button" onclick="renameModelPackage(${jsString(pkg.id)})">保存名称</button>
-        <button type="button" onclick="pinModelPackage(${jsString(pkg.id)})" ${isPinned ? "disabled" : ""}>永久保留</button>
-        <button type="button" onclick="activateModelById(${jsString(pkg.id)})" ${isActive ? "disabled" : ""}>切换启用</button>
-        <button type="button" class="off" data-delete-model-id="${escapeAttr(pkg.id)}" onclick="deleteModelPackage(${jsString(pkg.id)}, ${isActive ? "true" : "false"}, this)">删除</button>
+        <button type="button" onclick='renameModelPackage(${jsString(pkg.id)})'>保存名称</button>
+        <button type="button" onclick='pinModelPackage(${jsString(pkg.id)})' ${isPinned ? "disabled" : ""}>永久保留</button>
+        <button type="button" onclick='activateModelById(${jsString(pkg.id)})' ${isActive ? "disabled" : ""}>切换启用</button>
+        <button type="button" class="off" data-delete-model-id="${escapeAttr(pkg.id)}" onclick='deleteModelPackage(${jsString(pkg.id)}, ${isActive ? "true" : "false"}, this)'>删除</button>
       </div>
     </div>`;
   }).join("");
