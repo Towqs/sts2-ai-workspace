@@ -3,6 +3,12 @@ default_template: strength_multihit
 option_card_scorer:
   mode: shadow
 
+active_canary:
+  only_when_confidence_gap_gte: 1.0
+  fallback_to_old_when_gap_lt: 0.3
+  allow_skip_when_deck_size_gte: 22
+  max_card_index: 2
+
 template_selection:
   mode: locked_after_warmup
   warmup_card_rewards: 3
@@ -27,6 +33,8 @@ templates:
 skip:
   soft_deck_size: 20
   hard_deck_size: 24
+  very_large_deck_size: 28
+  huge_deck_size: 32
   low_best_score: 0.8
   target_best_score: 1.0
   low_archetype_fit: 0.3

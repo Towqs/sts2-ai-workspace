@@ -2126,7 +2126,9 @@ def card_scorer_info_payload(mode, result, error=""):
 
 
 def active_card_scorer_choice(state, card_baseline_weight=1.0):
-    mode, result, error = build_shadow_card_result(state, mode="active")
+    requested_mode = option_card_scorer_mode()
+    mode = "active_canary" if requested_mode == "active_canary" else "active"
+    mode, result, error = build_shadow_card_result(state, mode=mode)
     if not result or not result.selected:
         return None, {
             "top_actions": [],
@@ -2142,20 +2144,52 @@ def active_card_scorer_choice(state, card_baseline_weight=1.0):
             "card_scorer": card_scorer_info_payload(mode, result, error),
         }
     selected = result.selected
+    fallback_reason = ""
+    if mode == "active_canary":
+        entries, profile = card_reward_baseline_entries(state)
+        entries.sort(key=lambda item: item["score"], reverse=True)
+        old = entries[0] if entries else None
+        canary_cfg = (load_template_config().get("active_canary") or {})
+        min_gap = safe_num(canary_cfg.get("only_when_confidence_gap_gte"), 1.0)
+        fallback_gap = safe_num(canary_cfg.get("fallback_to_old_when_gap_lt"), 0.3)
+        allow_skip_deck = safe_int(canary_cfg.get("allow_skip_when_deck_size_gte"), 22)
+        max_card_index = safe_int(canary_cfg.get("max_card_index"), 2)
+        deck_size = safe_int((result.deck_summary or {}).get("deck_size"), 0)
+        selected_index = safe_int(getattr(selected, "index", -1), -1)
+        if old:
+            if result.confidence_gap < fallback_gap:
+                fallback_reason = f"canary_low_gap<{fallback_gap:g}"
+            elif result.confidence_gap < min_gap:
+                fallback_reason = f"canary_gap_below_takeover<{min_gap:g}"
+            elif selected.label == "skip_reward" and deck_size < allow_skip_deck:
+                fallback_reason = f"canary_skip_deck<{allow_skip_deck}"
+            elif selected.label.startswith("choose_card:index_") and selected_index > max_card_index:
+                fallback_reason = f"canary_extra_card_index>{max_card_index}"
+            if fallback_reason:
+                selected = type(result.selected)(
+                    label=old["label"],
+                    payload=old["payload"],
+                    kind="card_reward",
+                    score=old["score"],
+                    reasons=list(old.get("reasons") or []) + [fallback_reason],
+                    metadata={"card": old.get("card") or {}, "score_breakdown": {}, "canary_fallback": fallback_reason},
+                    index=safe_int((old.get("payload") or {}).get("card_index"), -1),
+                )
     top_actions = card_result_top_actions(result)
     return selected.payload, {
         "top_actions": top_actions,
         "chosen_action": selected.label,
         "payload": selected.payload,
-        "reason": "card_scorer_active: " + (" / ".join(selected.reasons) or "highest score"),
+        "reason": f"card_scorer_{mode}: " + (" / ".join(selected.reasons) or "highest score"),
         "deck_profile": result.deck_summary,
         "reward_baseline": {
-            "mode": "card_scorer_active",
+            "mode": f"card_scorer_{mode}",
             "weight": card_baseline_weight,
             "chosen_score": round(float(selected.score), 3),
             "chosen_reason": selected.reasons,
             "template_id": result.template_id,
             "archetype_consistency": result.archetype_consistency,
+            "canary_fallback_reason": fallback_reason,
         },
         "card_scorer": card_scorer_info_payload(mode, result, error),
         "archetype_consistency": result.archetype_consistency,
@@ -2299,7 +2333,7 @@ def card_reward_baseline_entries(state):
 
 def choose_card_reward_baseline_action(state, card_baseline_weight=1.0):
     scorer_mode = option_card_scorer_mode()
-    if scorer_mode == "active":
+    if scorer_mode in ("active", "active_canary"):
         return active_card_scorer_choice(state, card_baseline_weight=card_baseline_weight)
     shadow_mode, shadow_result, shadow_error = build_shadow_card_result(state, mode=scorer_mode)
     shadow_info = card_scorer_info_payload(shadow_mode, shadow_result, shadow_error)
@@ -3218,7 +3252,7 @@ def choose_shop_rule_action(state, state_type, exploration=None):
 
 def choose_card_reward_mixed_action(macro_agent, state, outputs, probs, card_baseline_weight, exploration=None):
     scorer_mode = option_card_scorer_mode()
-    if scorer_mode == "active":
+    if scorer_mode in ("active", "active_canary"):
         return choose_card_reward_baseline_action(state, card_baseline_weight)
     shadow_mode, shadow_result, shadow_error = build_shadow_card_result(state, mode=scorer_mode)
     shadow_info = card_scorer_info_payload(shadow_mode, shadow_result, shadow_error)
@@ -4508,6 +4542,13 @@ def score_distribution(values):
     }
 
 
+def card_label_index(label):
+    text = str(label or "")
+    if not text.startswith("choose_card:index_"):
+        return -1
+    return safe_int(text.rsplit("_", 1)[-1], -1)
+
+
 def append_card_scorer_shadow_log(session_id, state, actual_payload, macro_info, behavior_policy, model_version=""):
     scorer = (macro_info or {}).get("card_scorer")
     if not isinstance(scorer, dict) or scorer.get("mode") == "off":
@@ -4520,13 +4561,37 @@ def append_card_scorer_shadow_log(session_id, state, actual_payload, macro_info,
             old_label = "skip_reward"
         elif (actual_payload or {}).get("action") == "select_card_reward":
             old_label = f"choose_card:index_{safe_int((actual_payload or {}).get('card_index', (actual_payload or {}).get('index')), -1)}"
-    scorer_label = selected.get("label")
+    raw_scorer_label = selected.get("label")
+    scorer_label = raw_scorer_label
     options_by_label = {
         option.get("label"): option
         for option in options
         if isinstance(option, dict)
     }
     old_option = options_by_label.get(old_label) or {}
+    effective_selected = selected
+    effective_fallback_reason = ""
+    raw_scorer_card = {
+        "index": selected.get("index", -1),
+        "card_id": selected.get("card_id") or "",
+        "name": selected.get("name") or "",
+        "type": selected.get("card_type") or "",
+        "cost": selected.get("cost", 0),
+    }
+    confidence_gap_value = safe_num(scorer.get("confidence_gap"), 0.0)
+    if old_label and raw_scorer_label and old_label != raw_scorer_label and old_option:
+        raw_index = card_label_index(raw_scorer_label)
+        if confidence_gap_value < 0.15:
+            effective_fallback_reason = "shadow_low_confidence_fallback"
+        elif raw_index > 2:
+            effective_fallback_reason = "shadow_extra_card_index_fallback"
+        if effective_fallback_reason:
+            scorer_label = old_label
+            effective_selected = dict(old_option)
+            effective_selected.setdefault("label", old_label)
+            effective_selected.setdefault("payload", old_option.get("payload"))
+            effective_selected["raw_scorer_action"] = raw_scorer_label
+            effective_selected["fallback_reason"] = effective_fallback_reason
     skip_option = options_by_label.get("skip_reward") or {}
     skip_breakdown = skip_option.get("score_breakdown") if isinstance(skip_option.get("score_breakdown"), dict) else {}
     skip_diagnostics = (
@@ -4544,11 +4609,11 @@ def append_card_scorer_shadow_log(session_id, state, actual_payload, macro_info,
         "cost": old_option.get("cost", 0),
     }
     scorer_card = {
-        "index": selected.get("index", -1),
-        "card_id": selected.get("card_id") or "",
-        "name": selected.get("name") or "",
-        "type": selected.get("card_type") or "",
-        "cost": selected.get("cost", 0),
+        "index": effective_selected.get("index", -1),
+        "card_id": effective_selected.get("card_id") or "",
+        "name": effective_selected.get("name") or "",
+        "type": effective_selected.get("card_type") or "",
+        "cost": effective_selected.get("cost", 0),
     }
     run = (state or {}).get("run") or {}
     scores = [
@@ -4585,12 +4650,17 @@ def append_card_scorer_shadow_log(session_id, state, actual_payload, macro_info,
         "legacy_chosen_action": old_label,
         "old_policy_action": old_label,
         "old_policy_card": old_card,
+        "raw_scorer_action": raw_scorer_label,
+        "raw_scorer_card": raw_scorer_card,
+        "effective_fallback_reason": effective_fallback_reason,
+        "low_confidence_fallback": effective_fallback_reason == "shadow_low_confidence_fallback",
+        "extra_card_index_fallback": effective_fallback_reason == "shadow_extra_card_index_fallback",
         "recommended_action": scorer_label,
         "scorer_action": scorer_label,
         "scorer_card": scorer_card,
-        "recommended_payload": selected.get("payload"),
+        "recommended_payload": effective_selected.get("payload"),
         "scorer_disagreed_with_old_policy": bool(old_label and scorer_label and old_label != scorer_label),
-        "confidence_gap": scorer.get("confidence_gap", 0.0),
+        "confidence_gap": confidence_gap_value,
         "skip_score": skip_option.get("score"),
         "skip_score_breakdown": skip_breakdown,
         "skip_reasons": skip_option.get("reasons") or [],
@@ -4598,7 +4668,7 @@ def append_card_scorer_shadow_log(session_id, state, actual_payload, macro_info,
         "best_card_score": skip_diagnostics.get("best_card_score"),
         "second_best_card_score": skip_diagnostics.get("second_best_card_score"),
         "max_archetype_fit": skip_diagnostics.get("max_archetype_fit"),
-        "skip_recommended": selected.get("label") == "skip_reward",
+        "skip_recommended": scorer_label == "skip_reward",
         "skip_available": any(
             (option or {}).get("label") == "skip_reward"
             for option in options
@@ -4620,7 +4690,8 @@ def append_card_scorer_shadow_log(session_id, state, actual_payload, macro_info,
         "score_distribution": score_distribution(scores),
         "reward_terms": {},
         "reward_term_distribution": {},
-        "selected": selected,
+        "raw_selected": selected,
+        "selected": effective_selected,
         "options": options,
     }
     try:

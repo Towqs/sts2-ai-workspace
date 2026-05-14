@@ -11,6 +11,7 @@ from options.cards import (
     build_card_reward_options,
     enabled_templates,
     load_template_config,
+    normalize_card_scorer_mode,
     score_card,
 )
 
@@ -32,6 +33,7 @@ class CardScorerTests(unittest.TestCase):
         self.assertNotIn("self_damage_rupture", enabled)
         self.assertFalse(config["templates"]["self_damage_rupture"]["enabled"])
         self.assertEqual(config["template_selection"]["min_consistency_target"], 0.65)
+        self.assertEqual(normalize_card_scorer_mode("active_canary"), "active_canary")
 
     def test_card_reward_options_include_cards_and_skip(self):
         state = {
@@ -78,6 +80,42 @@ class CardScorerTests(unittest.TestCase):
         skip = next(option for option in result.to_dict()["options"] if option["label"] == "skip_reward")
         self.assertIn("skip_diagnostics", skip["metadata"])
         self.assertLess(skip["metadata"]["skip_diagnostics"]["best_card_score"], 0.8)
+
+    def test_skip_competes_with_self_damage_card_in_huge_deck(self):
+        state = {
+            "run": {"act": 2, "floor": 29},
+            "player": {"deck": make_large_deck(32), "deck_size": 32, "hp": 42, "max_hp": 80},
+            "card_reward": {
+                "can_skip": True,
+                "cards": [
+                    {"index": 0, "id": "RUPTURE", "name": "Rupture", "type": "Power", "description": "Whenever you lose HP, gain Strength.", "rarity": "Uncommon", "cost": 1},
+                    {"index": 1, "id": "JUGGLING", "type": "Power", "rarity": "Uncommon", "cost": 1},
+                    {"index": 2, "id": "STAMPEDE", "type": "Power", "rarity": "Uncommon", "cost": 2},
+                ],
+            },
+        }
+        result = build_card_reward_options(state, mode="shadow", template_id="strength_multihit")
+        labels = [option.label for option in result.options[:2]]
+        self.assertIn("skip_reward", labels)
+
+    def test_body_slam_needs_block_support(self):
+        state = {
+            "run": {"act": 1, "floor": 4},
+            "player": {
+                "deck": [
+                    {"id": "STRIKE", "type": "Attack", "cost": 1},
+                    {"id": "STRIKE", "type": "Attack", "cost": 1},
+                    {"id": "BASH", "type": "Attack", "cost": 2},
+                ],
+                "deck_size": 3,
+            },
+        }
+        summary = build_deck_summary(state)
+        body_slam = {"id": "BODY_SLAM", "name": "Body Slam", "type": "Attack", "description": "Deal damage equal to your Block.", "cost": 1}
+        twin = {"id": "TWIN_STRIKE", "type": "Attack", "description": "Deal damage twice.", "cost": 1}
+        body_score = score_card(state, summary, body_slam, template_id="barricade_block")["score"]
+        twin_score = score_card(state, summary, twin, template_id="barricade_block")["score"]
+        self.assertLessEqual(body_score, twin_score + 0.5)
 
     def test_multihit_scores_higher_in_strength_template(self):
         state = {

@@ -16,6 +16,12 @@ CARD_SCORER_VERSION = "ironclad_card_scorer_v1"
 DEFAULT_TEMPLATE_CONFIG = {
     "default_template": "strength_multihit",
     "option_card_scorer": {"mode": "shadow"},
+    "active_canary": {
+        "only_when_confidence_gap_gte": 1.0,
+        "fallback_to_old_when_gap_lt": 0.3,
+        "allow_skip_when_deck_size_gte": 22,
+        "max_card_index": 2,
+    },
     "template_selection": {
         "mode": "locked_after_warmup",
         "warmup_card_rewards": 3,
@@ -44,6 +50,8 @@ DEFAULT_TEMPLATE_CONFIG = {
     "skip": {
         "soft_deck_size": 20,
         "hard_deck_size": 24,
+        "very_large_deck_size": 28,
+        "huge_deck_size": 32,
         "low_best_score": 0.8,
         "target_best_score": 1.0,
         "low_archetype_fit": 0.3,
@@ -116,6 +124,9 @@ def _simple_yaml(path):
         if section == "option_card_scorer" and indent == 2:
             data.setdefault(section, {})[key] = _parse_scalar(value)
             continue
+        if section == "active_canary" and indent == 2:
+            data.setdefault(section, {})[key] = _parse_scalar(value)
+            continue
         if section == "skip" and indent == 2:
             data.setdefault(section, {})[key] = _parse_scalar(value)
             continue
@@ -162,7 +173,7 @@ def normalize_card_scorer_mode(value):
     if isinstance(value, dict):
         value = value.get("mode")
     text = str(value or "shadow").strip().lower()
-    return text if text in ("off", "shadow", "active") else "shadow"
+    return text if text in ("off", "shadow", "active", "active_canary") else "shadow"
 
 
 def enabled_templates(config=None):
@@ -267,6 +278,10 @@ def score_card(state, deck_summary, card, template_id=None, config=None):
     tags = classify_card(card)
     ctx = _run_context(state)
     deck_size = max(_safe_int(deck_summary.get("deck_size"), 0), 0)
+    block_density = _safe_float(deck_summary.get("block_density"), 0.0)
+    block_payoffs = _safe_int(deck_summary.get("block_payoffs"), 0)
+    card_id = str(tags.get("card_id") or "")
+    self_damage_enabled = bool(((config.get("templates") or {}).get("self_damage_rupture") or {}).get("enabled", False))
     score = 0.0
     reasons = []
     breakdown = {
@@ -325,6 +340,20 @@ def score_card(state, deck_summary, card, template_id=None, config=None):
         if tags["self_damage"]:
             score = _add_score(score, reasons, breakdown, "archetype_fit", 1.0, "self-damage package disabled by default")
 
+    if card_id == "BODY_SLAM" and template_id == "barricade_block":
+        has_body_slam_support = block_payoffs > 0 or block_density >= 0.35 or (
+            block_density >= 0.22 and deck_summary.get("damage_density", 0.0) < 0.32
+        )
+        if not has_body_slam_support:
+            score = _add_score(score, reasons, breakdown, "archetype_fit", -1.8, "body slam lacks block support")
+        elif block_payoffs <= 0 and block_density < 0.35:
+            score = _add_score(score, reasons, breakdown, "archetype_fit", -0.35, "body slam speculative")
+
+    if tags["self_damage"] and template_id != "self_damage_rupture" and not self_damage_enabled:
+        score = _add_score(score, reasons, breakdown, "archetype_fit", -0.7, "self-damage template disabled")
+        if ctx["hp_ratio"] < 0.55:
+            score = _add_score(score, reasons, breakdown, "archetype_fit", -0.5, "low hp self-damage risk")
+
     rarity = str((card or {}).get("rarity") or "").lower()
     if "rare" in rarity:
         score = _add_score(score, reasons, breakdown, "rarity_bonus", 0.25, "rare card")
@@ -337,8 +366,10 @@ def score_card(state, deck_summary, card, template_id=None, config=None):
         score = _add_score(score, reasons, breakdown, "cost_penalty", -0.25, "high cost")
     if deck_size >= 24 and not tags["premium"] and score < 1.2:
         score = _add_score(score, reasons, breakdown, "deck_bloat_penalty", -0.7, "deck bloat pressure")
-    if deck_size >= 30 and not tags["premium"]:
-        score = _add_score(score, reasons, breakdown, "deck_bloat_penalty", -0.5, "large deck")
+    if deck_size >= 28 and not tags["premium"] and score < 2.2:
+        score = _add_score(score, reasons, breakdown, "deck_bloat_penalty", -0.4, "deck 28+ bloat pressure")
+    if deck_size >= 32 and not tags["premium"] and score < 3.0:
+        score = _add_score(score, reasons, breakdown, "deck_bloat_penalty", -0.8, "deck 32+ severe bloat")
 
     return {
         "score": round(float(score), 4),
@@ -406,6 +437,8 @@ def score_skip(state, deck_summary, card_scores, template_id=None, config=None):
     }
     soft_size = _safe_int(skip_cfg.get("soft_deck_size"), 20)
     hard_size = _safe_int(skip_cfg.get("hard_deck_size"), 24)
+    very_large_size = _safe_int(skip_cfg.get("very_large_deck_size"), 28)
+    huge_size = _safe_int(skip_cfg.get("huge_deck_size"), 32)
     low_best = _safe_float(skip_cfg.get("low_best_score"), 0.8)
     target_best = _safe_float(skip_cfg.get("target_best_score"), 1.0)
     low_fit_threshold = _safe_float(skip_cfg.get("low_archetype_fit"), 0.3)
@@ -423,6 +456,14 @@ def score_skip(state, deck_summary, card_scores, template_id=None, config=None):
         score += 0.8
         _add_component(breakdown, "deck_bloat_bonus", 0.8)
         reasons.append("deck 24+ bloat pressure")
+    if deck_size >= very_large_size:
+        score += 0.8
+        _add_component(breakdown, "deck_bloat_bonus", 0.8)
+        reasons.append("deck 28+ strong bloat pressure")
+    if deck_size >= huge_size:
+        score += 1.2
+        _add_component(breakdown, "deck_bloat_bonus", 1.2)
+        reasons.append("deck 32+ severe bloat pressure")
     elif deck_size >= soft_size:
         score += 0.25
         _add_component(breakdown, "deck_bloat_bonus", 0.25)

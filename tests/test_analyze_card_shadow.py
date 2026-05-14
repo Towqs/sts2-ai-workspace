@@ -30,7 +30,7 @@ class AnalyzeCardShadowTests(unittest.TestCase):
             log_path.write_text(
                 "\n".join([
                     '{"type":"card_scorer_shadow","run_id":"r1","floor":3,"legacy_chosen_action":"choose_card:index_0","recommended_action":"choose_card:index_0","legal_option_count":4,"template_id":"strength_multihit","template_locked":true,"locked_template":"strength_multihit","skip_score":-1.0,"best_card_score":2.0,"archetype_consistency":{"consistency":0.8},"deck_summary":{"deck_size":12,"bloat_score":0.0},"reward_terms":{"deck_fit":0.4},"options":[{"label":"choose_card:index_0","score":2.0},{"label":"choose_card:index_1","score":1.2},{"label":"skip_reward","score":-1.0}],"selected":{"label":"choose_card:index_0","score":2.0}}',
-                    '{"type":"card_scorer_shadow","run_id":"r1","floor":5,"legacy_chosen_action":"choose_card:index_1","recommended_action":"skip_reward","legal_option_count":4,"template_id":"strength_multihit","template_locked":true,"locked_template":"strength_multihit","skip_score":2.5,"best_card_score":0.1,"archetype_consistency":{"consistency":0.6},"deck_summary":{"deck_size":31,"bloat_score":0.5},"reward_terms":{"deck_fit":0.8,"bad":"Infinity"},"options":[{"label":"skip_reward","score":2.5},{"label":"choose_card:index_1","score":0.1},{"label":"choose_card:index_2","score":"NaN"},{"label":"choose_card:index_0","score":"Infinity"}],"selected":{"label":"skip_reward","score":2.5}}',
+                    '{"type":"card_scorer_shadow","run_id":"r1","floor":5,"legacy_chosen_action":"choose_card:index_1","recommended_action":"skip_reward","raw_scorer_action":"choose_card:index_3","extra_card_index_fallback":true,"legal_option_count":4,"template_id":"strength_multihit","template_locked":true,"locked_template":"strength_multihit","skip_score":2.5,"best_card_score":0.1,"archetype_consistency":{"consistency":0.6},"deck_summary":{"deck_size":31,"bloat_score":0.5},"reward_terms":{"deck_fit":0.8,"bad":"Infinity"},"options":[{"label":"skip_reward","score":2.5},{"label":"choose_card:index_1","score":0.1},{"label":"choose_card:index_2","score":"NaN"},{"label":"choose_card:index_0","score":"Infinity"}],"selected":{"label":"skip_reward","score":2.5}}',
                 ]),
                 encoding="utf-8",
             )
@@ -45,6 +45,9 @@ class AnalyzeCardShadowTests(unittest.TestCase):
             self.assertEqual(metrics["score_inf_count"], 1)
             self.assertEqual(metrics["reward_term_inf_count"], 1)
             self.assertEqual(metrics["reward_term_distribution"]["deck_fit"]["count"], 2)
+            self.assertEqual(metrics["effective_fallback_count"], 1)
+            self.assertEqual(metrics["extra_card_index_fallback_count"], 1)
+            self.assertEqual(summary["raw_scorer_distribution"]["choose_card:index_3"], 1)
             self.assertTrue(math.isclose(metrics["template_locked_rate"], 1.0))
             self.assertTrue(math.isclose(metrics["template_sequence_consistency"], 1.0))
             self.assertEqual(metrics["locked_template_distribution"]["strength_multihit"], 2)

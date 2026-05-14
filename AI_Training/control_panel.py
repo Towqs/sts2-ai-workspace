@@ -321,7 +321,7 @@ def update_control(patch):
             elif key == "option_card_scorer":
                 setting = patch[key] if isinstance(patch[key], dict) else {"mode": patch[key]}
                 mode = str(setting.get("mode") or "shadow").strip().lower()
-                data[key] = {"mode": mode if mode in ("off", "shadow", "active") else "shadow"}
+                data[key] = {"mode": mode if mode in ("off", "shadow", "active", "active_canary") else "shadow"}
             elif key == "active_model_id":
                 data[key] = str(patch[key] or "local")
             elif key == "macro_card_reward_weight":

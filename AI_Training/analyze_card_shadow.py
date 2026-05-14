@@ -136,6 +136,7 @@ def summarize_records(records):
     run_ids = {str(r.get("run_id") or "") for r in valid if r.get("run_id")}
     old_counts = Counter()
     scorer_counts = Counter()
+    raw_scorer_counts = Counter()
     archetype_counts = Counter()
     locked_template_counts = Counter()
     run_template_counts = {}
@@ -159,6 +160,9 @@ def summarize_records(records):
     old_skip_count = 0
     template_locked_count = 0
     candidate_count_anomalies = 0
+    effective_fallback_count = 0
+    low_confidence_fallback_count = 0
+    extra_card_index_fallback_count = 0
 
     for record in valid:
         options = record.get("options") if isinstance(record.get("options"), list) else []
@@ -170,8 +174,16 @@ def summarize_records(records):
         old_label = old_policy_label(record)
         selected = record.get("selected") if isinstance(record.get("selected"), dict) else {}
         scorer_label = str(record.get("recommended_action") or selected.get("label") or "").strip() or "unknown"
+        raw_scorer_label = str(record.get("raw_scorer_action") or scorer_label).strip() or "unknown"
         old_counts[old_label] += 1
         scorer_counts[scorer_label] += 1
+        raw_scorer_counts[raw_scorer_label] += 1
+        if record.get("low_confidence_fallback"):
+            low_confidence_fallback_count += 1
+            effective_fallback_count += 1
+        if record.get("extra_card_index_fallback"):
+            extra_card_index_fallback_count += 1
+            effective_fallback_count += 1
         if old_label == scorer_label:
             agreement_count += 1
         if scorer_label == "skip_reward" or bool(record.get("skip_recommended")):
@@ -285,6 +297,9 @@ def summarize_records(records):
         "run_count": len(run_ids),
         "avg_candidate_count": round4(mean(candidate_counts)),
         "candidate_count_anomalies": candidate_count_anomalies,
+        "effective_fallback_count": effective_fallback_count,
+        "low_confidence_fallback_count": low_confidence_fallback_count,
+        "extra_card_index_fallback_count": extra_card_index_fallback_count,
         "old_vs_scorer_agreement_rate": round4(agreement_rate),
         "scorer_disagreed_with_old_policy": disagreement_count,
         "scorer_disagreed_with_old_policy_rate": round4(1.0 - agreement_rate if total else 0.0),
@@ -314,6 +329,7 @@ def summarize_records(records):
         "metrics": metrics,
         "old_policy_distribution": dict(old_counts.most_common()),
         "scorer_distribution": dict(scorer_counts.most_common()),
+        "raw_scorer_distribution": dict(raw_scorer_counts.most_common()),
         "disagreement_examples": sorted(disagreement_examples, key=lambda x: x["gap"], reverse=True)[:10],
         "high_confidence_examples": sorted(high_confidence_examples, key=lambda x: x["gap"], reverse=True)[:10],
         "low_confidence_examples": sorted(low_confidence_examples, key=lambda x: x["gap"])[:10],
@@ -412,6 +428,9 @@ def render_report(summary, input_files, report_date):
         f"- Avg skip score: {metrics['avg_skip_score']}",
         f"- Avg best card score: {metrics['avg_best_card_score']}",
         f"- Avg confidence gap: {metrics['avg_confidence_gap']}",
+        f"- Effective fallback count: {metrics['effective_fallback_count']}",
+        f"- Low-confidence fallback count: {metrics['low_confidence_fallback_count']}",
+        f"- Extra-card-index fallback count: {metrics['extra_card_index_fallback_count']}",
         f"- Score NaN / inf: {metrics['score_nan_count']} / {metrics['score_inf_count']}",
         f"- Reward term NaN / inf: {metrics['reward_term_nan_count']} / {metrics['reward_term_inf_count']}",
         f"- Avg deck size: {metrics['avg_deck_size']}",
@@ -435,6 +454,9 @@ def render_report(summary, input_files, report_date):
         "## Scorer Recommendation Distribution",
         "",
         md_table(summary["scorer_distribution"], "scorer_action", "count"),
+        "## Raw Scorer Distribution",
+        "",
+        md_table(summary["raw_scorer_distribution"], "raw_scorer_action", "count"),
         "## Archetype Distribution",
         "",
         md_table(metrics["archetype_distribution"], "template_id", "count"),

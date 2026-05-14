@@ -281,3 +281,39 @@ legal_option_count
 | `score_distribution` | 不应出现 NaN / inf 或异常极值 |
 
 如果 shadow 日志显示推荐动作稳定、skip 逻辑合理、卡组没有被错误模板带偏，再考虑把 `mode` 从 `shadow` 改成 `active`。
+ 
+## Phase 1.5-B Refinements
+
+Phase 1.5-B keeps the default mode as `shadow`, but tightens the scorer before any active rollout:
+
+```yaml
+option_card_scorer:
+  mode: shadow
+
+active_canary:
+  only_when_confidence_gap_gte: 1.0
+  fallback_to_old_when_gap_lt: 0.3
+  allow_skip_when_deck_size_gte: 22
+  max_card_index: 2
+```
+
+Changes in this phase:
+
+- Low-confidence scorer disagreements fall back to the old policy in the effective shadow recommendation, while `raw_scorer_action` is still recorded.
+- Extra card reward indexes such as `choose_card:index_3` are treated as raw scorer candidates but fall back in the effective canary recommendation until reviewed.
+- `BODY_SLAM` / `全身撞击` receives a penalty when the current deck lacks block support, preventing premature commitment to `barricade_block`.
+- Deck sizes at 28+ and 32+ increase skip pressure and non-core card bloat penalties.
+- Self-damage cards are penalized while `self_damage_rupture` remains disabled.
+
+Next shadow validation targets:
+
+```text
+events >= 150
+NaN / inf = 0
+effective choose_card:index_3 = 0
+scorer_skip_rate = 8% - 18%
+template_sequence_consistency >= 0.78
+agreement rate >= 35%
+low-confidence fallback count > 0 when ties appear
+deck 28+ skip pressure visible in examples
+```
