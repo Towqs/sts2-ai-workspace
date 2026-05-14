@@ -825,36 +825,28 @@ class SelfPlayManager:
                             last_message=f"Act1 clear reached by {run_id}; PPO checkpoint updated, continuing self-play.",
                         )
                         continue
-                    self._save_model_snapshot(
-                        f"Clear policy {run_id}",
-                        "Policy artifacts that produced a clear/probable-clear self-play run.",
-                        activate=False,
-                    )
                     if score.get("admitted") and admitted_runs % training_interval != 0:
                         self._trigger_training()
-                    self._save_model_snapshot(
-                        f"Post-clear trained model {run_id}",
-                        "Model artifacts after training on the clear/probable-clear self-play run.",
-                        activate=True,
-                    )
                     self._set_status(
-                        running=False,
+                        running=True,
                         training_running=False,
-                        finished=datetime.now().isoformat(timespec="seconds"),
-                        current_state="finished",
-                        last_message=f"Clear reached by {run_id}; model snapshots saved.",
+                        finished=None,
+                        current_state="running",
+                        current_run_id="",
+                        last_message=f"Clear reached by {run_id}; continuing self-play without model snapshot.",
                     )
-                    break
+                    continue
                 if use_ppo and completed_runs > 0 and (history_completed_runs + completed_runs) % training_interval == 0:
                     self._trigger_ppo_training()
                 elif not use_ppo and score.get("admitted") and (history_admitted_runs + admitted_runs) % training_interval == 0:
                     self._trigger_training()
+            stopped = self._stop_event.is_set()
             self._set_status(
                 running=False,
                 training_running=False,
                 finished=datetime.now().isoformat(timespec="seconds"),
-                current_state="finished",
-                last_message="自训练循环已完成。",
+                current_state="stopped" if stopped else "finished",
+                last_message="自训练循环已停止。" if stopped else "自训练循环已完成。",
             )
         except Exception as exc:
             self._set_status(
