@@ -5431,6 +5431,7 @@ let llmFormDirty = false;
 let llmProfilesCache = [];
 let refreshInFlight = false;
 let refreshPending = false;
+let forceModelHealthRefreshUntil = 0;
 function markLLMDirty() {
   llmFormDirty = true;
 }
@@ -6054,7 +6055,8 @@ function renderCurrentData(data) {
 }
 function renderModelHealth(models, aiProcess, control, runtime, monsterProfiles) {
   const modelHealthDiv = document.getElementById("modelHealth");
-  if (modelHealthDiv && (modelHealthDiv.contains(document.activeElement) || modelHealthDiv.matches(':hover') || modelHealthDiv.querySelector('input:focus, select:focus, [data-editing="1"]'))) {
+  const forceRefresh = Date.now() < forceModelHealthRefreshUntil;
+  if (!forceRefresh && modelHealthDiv && (modelHealthDiv.contains(document.activeElement) || modelHealthDiv.matches(':hover') || modelHealthDiv.querySelector('input:focus, select:focus, [data-editing="1"]'))) {
     return;
   }
   const combat = models.combat || {};
@@ -6162,7 +6164,8 @@ function renderModelHealth(models, aiProcess, control, runtime, monsterProfiles)
 }
 function renderModelHealthV2(models, aiProcess, control, runtime, monsterProfiles) {
   const modelHealthDiv = document.getElementById("modelHealth");
-  if (modelHealthDiv && (modelHealthDiv.contains(document.activeElement) || modelHealthDiv.matches(':hover') || modelHealthDiv.querySelector('input:focus, select:focus, [data-editing="1"]'))) {
+  const forceRefresh = Date.now() < forceModelHealthRefreshUntil;
+  if (!forceRefresh && modelHealthDiv && (modelHealthDiv.contains(document.activeElement) || modelHealthDiv.matches(':hover') || modelHealthDiv.querySelector('input:focus, select:focus, [data-editing="1"]'))) {
     return;
   }
   const combat = models.combat || {};
@@ -6778,11 +6781,16 @@ async function deleteModelPackage(model_id, isActive=false){
   if (!confirm(`确定要彻底删除模型包 ${model_id} 吗？此操作不可恢复。${activeNote}`)) return;
   const resultEl = document.getElementById("modelSwitchResult");
   if (resultEl) resultEl.textContent = "正在删除...";
-  const result = await api("/api/model/delete", {model_id});
-  if (result.status === "ok") {
-    if (resultEl) resultEl.textContent = result.active_reset ? "模型包已删除，当前启用已切回本地当前模型。" : "模型包已删除。";
-  } else if (resultEl) {
-    resultEl.textContent = result.error || "删除失败";
+  forceModelHealthRefreshUntil = Date.now() + 3000;
+  try {
+    const result = await api("/api/model/delete", {model_id});
+    if (result.status === "ok") {
+      if (resultEl) resultEl.textContent = result.active_reset ? "模型包已删除，当前启用已切回本地当前模型。" : "模型包已删除。";
+    } else if (resultEl) {
+      resultEl.textContent = result.error || "删除失败";
+    }
+  } catch (err) {
+    if (resultEl) resultEl.textContent = `删除请求失败：${err.message || err}`;
   }
   await refresh();
 }
