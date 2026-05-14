@@ -6803,19 +6803,10 @@ async function importModelPackage(){
 }
 async function deleteModelPackage(model_id, isActive=false, button=null){
   const resultEl = document.getElementById("modelSwitchResult");
-  const now = Date.now();
-  if (pendingModelDeleteId !== model_id || now > pendingModelDeleteUntil) {
-    pendingModelDeleteId = model_id;
-    pendingModelDeleteUntil = now + 8000;
-    if (button) {
-      button.textContent = "再点确认删除";
-      button.dataset.confirming = "1";
-    }
-    if (resultEl) {
-      resultEl.textContent = isActive
-        ? `再次点击删除将彻底删除 ${model_id}，并先切回本地当前模型。`
-        : `再次点击删除将彻底删除 ${model_id}。`;
-    }
+  const message = isActive
+    ? `确定要彻底删除 ${model_id}？当前启用模型会先切回本地当前模型。`
+    : `确定要彻底删除 ${model_id}？`;
+  if (!window.confirm(message)) {
     return;
   }
   forceModelHealthRefreshUntil = Date.now() + 3000;
