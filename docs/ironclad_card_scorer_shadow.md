@@ -294,6 +294,8 @@ active_canary:
   only_when_confidence_gap_gte: 1.0
   fallback_to_old_when_gap_lt: 0.3
   allow_skip_when_deck_size_gte: 22
+  allow_skip_when_best_card_score_lte: 0.5
+  max_active_ratio_per_run: 0.35
   max_card_index: 2
 ```
 
@@ -304,6 +306,14 @@ Changes in this phase:
 - `BODY_SLAM` / `全身撞击` receives a penalty when the current deck lacks block support, preventing premature commitment to `barricade_block`.
 - Deck sizes at 28+ and 32+ increase skip pressure and non-core card bloat penalties.
 - Self-damage cards are penalized while `self_damage_rupture` remains disabled.
+- Fresh rows record `scorer_logic_version`, `template_logic_version`, and `skip_logic_version`, so legacy rows can be excluded from promotion reports.
+- `active_canary` stays limited to card reward decisions and caps scorer-controlled picks to 35% per run.
+
+Use `--new-logic-only` for the promotion report:
+
+```powershell
+.\.venv\Scripts\python.exe .\AI_Training\analyze_card_shadow.py --date 2026-05-14 --new-logic-only --report
+```
 
 Next shadow validation targets:
 

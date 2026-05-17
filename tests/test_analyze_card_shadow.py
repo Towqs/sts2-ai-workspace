@@ -20,6 +20,7 @@ class Args:
         self.report = kwargs.get("report", "")
         self.report_dir = kwargs.get("report_dir", "")
         self.since_ms = kwargs.get("since_ms", 0)
+        self.new_logic_only = kwargs.get("new_logic_only", False)
 
 
 class AnalyzeCardShadowTests(unittest.TestCase):
@@ -70,6 +71,24 @@ class AnalyzeCardShadowTests(unittest.TestCase):
             self.assertEqual(metrics["total_card_reward_events"], 1)
             self.assertEqual(metrics["run_count"], 1)
             self.assertEqual(metrics["scorer_disagreed_with_old_policy"], 1)
+
+    def test_new_logic_only_filters_legacy_records(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            log_path = tmp_path / "card_scorer_2026-05-13.jsonl"
+            log_path.write_text(
+                "\n".join([
+                    '{"type":"card_scorer_shadow","run_id":"legacy","legacy_chosen_action":"choose_card:index_0","recommended_action":"choose_card:index_0","legal_option_count":4,"options":[{"label":"choose_card:index_0","score":1.0},{"label":"skip_reward","score":0.0}]}',
+                    '{"type":"card_scorer_shadow","run_id":"new","scorer_logic_version":"ironclad_card_scorer_logic_v1_5b","template_logic_version":"ironclad_template_lock_v1","skip_logic_version":"ironclad_skip_logic_v1_5b","legacy_chosen_action":"choose_card:index_0","recommended_action":"skip_reward","legal_option_count":4,"options":[{"label":"choose_card:index_0","score":0.0},{"label":"skip_reward","score":1.0}]}',
+                ]),
+                encoding="utf-8",
+            )
+            summary = analyze(Args(files=[str(log_path)], new_logic_only=True))
+            metrics = summary["metrics"]
+            self.assertEqual(metrics["report_scope"], "new_logic_only")
+            self.assertEqual(metrics["total_card_reward_events"], 1)
+            self.assertEqual(metrics["run_count"], 1)
+            self.assertEqual(metrics["scorer_logic_versions"]["ironclad_card_scorer_logic_v1_5b"], 1)
 
 
 if __name__ == "__main__":

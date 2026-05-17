@@ -33,6 +33,8 @@ class CardScorerTests(unittest.TestCase):
         self.assertNotIn("self_damage_rupture", enabled)
         self.assertFalse(config["templates"]["self_damage_rupture"]["enabled"])
         self.assertEqual(config["template_selection"]["min_consistency_target"], 0.65)
+        self.assertEqual(config["active_canary"]["max_active_ratio_per_run"], 0.35)
+        self.assertEqual(config["active_canary"]["allow_skip_when_best_card_score_lte"], 0.5)
         self.assertEqual(normalize_card_scorer_mode("active_canary"), "active_canary")
 
     def test_card_reward_options_include_cards_and_skip(self):

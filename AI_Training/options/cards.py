@@ -11,6 +11,9 @@ from state_encoder import STATE_FEATURES_VERSION
 
 CARD_OPTION_FEATURES_VERSION = "card_option_features_v1"
 CARD_SCORER_VERSION = "ironclad_card_scorer_v1"
+SCORER_LOGIC_VERSION = "ironclad_card_scorer_logic_v1_5b"
+TEMPLATE_LOGIC_VERSION = "ironclad_template_lock_v1"
+SKIP_LOGIC_VERSION = "ironclad_skip_logic_v1_5b"
 
 
 DEFAULT_TEMPLATE_CONFIG = {
@@ -20,6 +23,8 @@ DEFAULT_TEMPLATE_CONFIG = {
         "only_when_confidence_gap_gte": 1.0,
         "fallback_to_old_when_gap_lt": 0.3,
         "allow_skip_when_deck_size_gte": 22,
+        "allow_skip_when_best_card_score_lte": 0.5,
+        "max_active_ratio_per_run": 0.35,
         "max_card_index": 2,
     },
     "template_selection": {

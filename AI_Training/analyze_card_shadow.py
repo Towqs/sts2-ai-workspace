@@ -10,6 +10,9 @@ from pathlib import Path
 WORKSPACE_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_LOG_DIR = WORKSPACE_DIR / "RL_Datasets" / "OptionShadow"
 DEFAULT_REPORT_DIR = DEFAULT_LOG_DIR / "reports"
+CURRENT_SCORER_LOGIC_VERSION = "ironclad_card_scorer_logic_v1_5b"
+CURRENT_TEMPLATE_LOGIC_VERSION = "ironclad_template_lock_v1"
+CURRENT_SKIP_LOGIC_VERSION = "ironclad_skip_logic_v1_5b"
 
 
 def safe_float(value):
@@ -130,7 +133,7 @@ def resolve_input_files(args):
     return [log_dir / f"card_scorer_{date}.jsonl"]
 
 
-def summarize_records(records):
+def summarize_records(records, scope=None):
     valid = [r for r in records if r.get("type") == "card_scorer_shadow"]
     errors = [r for r in records if r.get("_error")]
     run_ids = {str(r.get("run_id") or "") for r in valid if r.get("run_id")}
@@ -293,6 +296,7 @@ def summarize_records(records):
         if count_total:
             run_consistencies.append(max(counts.values()) / count_total)
     metrics = {
+        "report_scope": scope or "all_records",
         "total_card_reward_events": total,
         "run_count": len(run_ids),
         "avg_candidate_count": round4(mean(candidate_counts)),
@@ -324,6 +328,9 @@ def summarize_records(records):
         "avg_deck_size": round4(mean(deck_sizes)),
         "avg_deck_bloat_score": round4(mean(bloat_scores)),
         "json_decode_errors": len(errors),
+        "scorer_logic_versions": dict(Counter(str(r.get("scorer_logic_version") or "legacy") for r in valid)),
+        "template_logic_versions": dict(Counter(str(r.get("template_logic_version") or "legacy") for r in valid)),
+        "skip_logic_versions": dict(Counter(str(r.get("skip_logic_version") or "legacy") for r in valid)),
     }
     return {
         "metrics": metrics,
@@ -419,6 +426,7 @@ def render_report(summary, input_files, report_date):
         "## Summary",
         "",
         f"- Runs: {metrics['run_count']}",
+        f"- Report scope: {metrics['report_scope']}",
         f"- Card reward events: {metrics['total_card_reward_events']}",
         f"- Avg candidate count: {metrics['avg_candidate_count']}",
         f"- Agreement rate: {pct(metrics['old_vs_scorer_agreement_rate'])}%",
@@ -438,6 +446,9 @@ def render_report(summary, input_files, report_date):
         f"- Archetype consistency: {metrics['archetype_consistency']}",
         f"- Template lock rate: {pct(metrics['template_locked_rate'])}%",
         f"- Template sequence consistency: {metrics['template_sequence_consistency']}",
+        f"- Scorer logic versions: {json.dumps(metrics['scorer_logic_versions'], ensure_ascii=False, sort_keys=True)}",
+        f"- Template logic versions: {json.dumps(metrics['template_logic_versions'], ensure_ascii=False, sort_keys=True)}",
+        f"- Skip logic versions: {json.dumps(metrics['skip_logic_versions'], ensure_ascii=False, sort_keys=True)}",
         "",
         "## Input Files",
         "",
@@ -499,7 +510,20 @@ def analyze(args):
                 if timestamp is None or timestamp < since_ms:
                     continue
             records.append(record)
-    summary = summarize_records(records)
+    report_scope = "all_records"
+    if getattr(args, "new_logic_only", False):
+        report_scope = "new_logic_only"
+        records = [
+            record
+            for record in records
+            if record.get("_error")
+            or (
+                record.get("scorer_logic_version") == CURRENT_SCORER_LOGIC_VERSION
+                and record.get("template_logic_version") == CURRENT_TEMPLATE_LOGIC_VERSION
+                and record.get("skip_logic_version") == CURRENT_SKIP_LOGIC_VERSION
+            )
+        ]
+    summary = summarize_records(records, scope=report_scope)
     report_date = args.date or datetime.now().strftime("%Y-%m-%d")
     if args.report:
         report_dir = Path(args.report_dir)
@@ -519,6 +543,7 @@ def main():
     parser.add_argument("--report", nargs="?", const="auto", default="", help="Write Markdown report. Pass a path or omit value for auto path.")
     parser.add_argument("--report-dir", default=str(DEFAULT_REPORT_DIR))
     parser.add_argument("--since-ms", type=float, default=0.0, help="Only include shadow records with timestamp >= this epoch millisecond value.")
+    parser.add_argument("--new-logic-only", action="store_true", help="Only include records from the current scorer/template/skip logic versions.")
     args = parser.parse_args()
     summary = analyze(args)
     print(json.dumps(summary["metrics"], ensure_ascii=False, indent=2, sort_keys=True))

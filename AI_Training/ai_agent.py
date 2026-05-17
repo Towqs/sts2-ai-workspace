@@ -30,6 +30,9 @@ from options.base import OPTION_FEATURES_VERSION, OPTION_SCHEMA_VERSION
 from options.cards import (
     CARD_OPTION_FEATURES_VERSION,
     CARD_SCORER_VERSION,
+    SCORER_LOGIC_VERSION,
+    SKIP_LOGIC_VERSION,
+    TEMPLATE_LOGIC_VERSION,
     archetype_consistency,
     build_card_reward_options,
     card_result_log_payload,
@@ -50,6 +53,7 @@ AI_LOG_DIR = os.path.join(WORKSPACE_DIR, "RL_Datasets", "AI_Combat")
 PPO_LOG_DIR = os.path.join(WORKSPACE_DIR, "RL_Datasets", "PPO")
 OPTION_SHADOW_LOG_DIR = os.path.join(WORKSPACE_DIR, "RL_Datasets", "OptionShadow")
 CARD_TEMPLATE_LOCKS = {}
+CARD_CANARY_COUNTS = {}
 
 DEFAULT_CONTROL = {
     "ai_enabled": True,
@@ -2153,18 +2157,31 @@ def active_card_scorer_choice(state, card_baseline_weight=1.0):
         min_gap = safe_num(canary_cfg.get("only_when_confidence_gap_gte"), 1.0)
         fallback_gap = safe_num(canary_cfg.get("fallback_to_old_when_gap_lt"), 0.3)
         allow_skip_deck = safe_int(canary_cfg.get("allow_skip_when_deck_size_gte"), 22)
+        allow_skip_best = safe_num(canary_cfg.get("allow_skip_when_best_card_score_lte"), 0.5)
+        max_active_ratio = max(0.0, min(safe_num(canary_cfg.get("max_active_ratio_per_run"), 0.35), 1.0))
         max_card_index = safe_int(canary_cfg.get("max_card_index"), 2)
         deck_size = safe_int((result.deck_summary or {}).get("deck_size"), 0)
         selected_index = safe_int(getattr(selected, "index", -1), -1)
+        canary_key = str((state or {}).get("_ai_session_id") or "global")
+        canary_counts = CARD_CANARY_COUNTS.setdefault(canary_key, {"seen": 0, "active": 0})
+        canary_counts["seen"] = safe_int(canary_counts.get("seen"), 0) + 1
+        allowed_active = max(1, int(math.floor(canary_counts["seen"] * max_active_ratio)))
         if old:
             if result.confidence_gap < fallback_gap:
                 fallback_reason = f"canary_low_gap<{fallback_gap:g}"
             elif result.confidence_gap < min_gap:
                 fallback_reason = f"canary_gap_below_takeover<{min_gap:g}"
-            elif selected.label == "skip_reward" and deck_size < allow_skip_deck:
-                fallback_reason = f"canary_skip_deck<{allow_skip_deck}"
+            elif selected.label == "skip_reward" and deck_size < allow_skip_deck and safe_num(
+                ((next((option for option in result.options if option.label == "skip_reward"), None) or selected).metadata or {})
+                .get("skip_diagnostics", {})
+                .get("best_card_score"),
+                0.0,
+            ) > allow_skip_best:
+                fallback_reason = f"canary_skip_guard(deck<{allow_skip_deck},best>{allow_skip_best:g})"
             elif selected.label.startswith("choose_card:index_") and selected_index > max_card_index:
                 fallback_reason = f"canary_extra_card_index>{max_card_index}"
+            elif safe_int(canary_counts.get("active"), 0) >= allowed_active:
+                fallback_reason = f"canary_active_ratio_limit({allowed_active}/{canary_counts['seen']})"
             if fallback_reason:
                 selected = type(result.selected)(
                     label=old["label"],
@@ -2175,6 +2192,8 @@ def active_card_scorer_choice(state, card_baseline_weight=1.0):
                     metadata={"card": old.get("card") or {}, "score_breakdown": {}, "canary_fallback": fallback_reason},
                     index=safe_int((old.get("payload") or {}).get("card_index"), -1),
                 )
+            else:
+                canary_counts["active"] = safe_int(canary_counts.get("active"), 0) + 1
     top_actions = card_result_top_actions(result)
     return selected.payload, {
         "top_actions": top_actions,
@@ -4639,6 +4658,9 @@ def append_card_scorer_shadow_log(session_id, state, actual_payload, macro_info,
         "policy_version": str(model_version or behavior_policy or ""),
         "behavior_policy": behavior_policy,
         "reward_schema": "ironclad_shadow_v1",
+        "scorer_logic_version": SCORER_LOGIC_VERSION,
+        "template_logic_version": TEMPLATE_LOGIC_VERSION,
+        "skip_logic_version": SKIP_LOGIC_VERSION,
         "actual_payload": actual_payload,
         "actual_action": (actual_payload or {}).get("action"),
         "action_index": safe_int((actual_payload or {}).get("card_index", (actual_payload or {}).get("index")), -1),

@@ -7,6 +7,8 @@ active_canary:
   only_when_confidence_gap_gte: 1.0
   fallback_to_old_when_gap_lt: 0.3
   allow_skip_when_deck_size_gte: 22
+  allow_skip_when_best_card_score_lte: 0.5
+  max_active_ratio_per_run: 0.35
   max_card_index: 2
 
 template_selection:
