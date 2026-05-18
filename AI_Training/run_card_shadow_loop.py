@@ -78,7 +78,7 @@ def configure_panel(panel_url, args):
         "self_play_stall_seconds": args.stall_seconds,
         "exploration_enabled": not bool(args.deterministic_eval),
         "exploration_mode": "aggressive",
-        "self_play_constraint_mode": args.constraint_mode,
+        "self_play_constraint_mode": "guarded" if args.deterministic_eval else args.constraint_mode,
         "combat_exploration_epsilon": args.combat_epsilon,
         "macro_exploration_epsilon": args.macro_epsilon,
         "exploration_top_k": args.exploration_top_k,

@@ -393,7 +393,7 @@ For deterministic evaluation runs, enable:
   --deterministic-eval
 ```
 
-`evaluation_deterministic` disables exploration sampling, zeros combat/macro epsilon, seeds Python/NumPy/Torch once per run, and uses stable tie-breaks for ranked combat/map choices. A deterministic self-check should compare the same baseline configuration against itself before testing `active_canary_noop`.
+`evaluation_deterministic` disables exploration sampling, zeros combat/macro epsilon, forces guarded macro routing, seeds Python/NumPy/Torch once per run, and uses stable tie-breaks for ranked combat/map choices. A deterministic self-check should compare the same baseline configuration against itself before testing `active_canary_noop`.
 
 Next shadow validation targets:
 

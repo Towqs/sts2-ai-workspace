@@ -43,6 +43,7 @@ def configure(seed, mode, canary_overrides=None, deterministic_eval=False):
         "combat_exploration_epsilon": 0.0 if deterministic_eval else 0.35,
         "macro_exploration_epsilon": 0.0 if deterministic_eval else 0.25,
         "exploration_temperature": 0.1 if deterministic_eval else 1.35,
+        "self_play_constraint_mode": "guarded" if deterministic_eval else "explore",
     })
 
 
