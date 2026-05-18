@@ -47,6 +47,7 @@ DEFAULT_CONFIG = {
     "macro_exploration_epsilon": 0.25,
     "exploration_top_k": 5,
     "exploration_temperature": 1.35,
+    "evaluation_deterministic": False,
 }
 
 
@@ -161,6 +162,7 @@ def merged_config(overrides=None):
         "macro_exploration_epsilon": clamp_float(data.get("macro_exploration_epsilon"), 0.25, 0.0, 1.0),
         "exploration_top_k": clamp_int(data.get("exploration_top_k"), 5, 1, 12),
         "exploration_temperature": clamp_float(data.get("exploration_temperature"), 1.35, 0.1, 5.0),
+        "evaluation_deterministic": bool(data.get("evaluation_deterministic", False)),
     }
 
 
@@ -399,6 +401,7 @@ class SelfPlayManager:
             "macro_exploration_epsilon": float(config["macro_exploration_epsilon"]),
             "exploration_top_k": int(config["exploration_top_k"]),
             "exploration_temperature": float(config["exploration_temperature"]),
+            "evaluation_deterministic": bool(config["evaluation_deterministic"]),
             "self_play_character": config["self_play_character"],
             "self_play_ascension": int(config["self_play_ascension"]),
             "self_play_seed": config.get("base_self_play_seed", config["self_play_seed"]),

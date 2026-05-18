@@ -16,7 +16,7 @@ def request_json(method, path, body=None, timeout=20):
     return response.json()
 
 
-def configure(seed, mode, canary_overrides=None):
+def configure(seed, mode, canary_overrides=None, deterministic_eval=False):
     scorer_cfg = {"mode": mode}
     if canary_overrides:
         scorer_cfg.update(canary_overrides)
@@ -38,6 +38,11 @@ def configure(seed, mode, canary_overrides=None):
         "self_play_max_run_minutes": 75,
         "self_play_stall_seconds": 120,
         "option_card_scorer": scorer_cfg,
+        "evaluation_deterministic": bool(deterministic_eval),
+        "exploration_enabled": not bool(deterministic_eval),
+        "combat_exploration_epsilon": 0.0 if deterministic_eval else 0.35,
+        "macro_exploration_epsilon": 0.0 if deterministic_eval else 0.25,
+        "exploration_temperature": 0.1 if deterministic_eval else 1.35,
     })
 
 
@@ -65,10 +70,10 @@ def wait_until_finished(run_id, timeout_sec=5400):
     raise TimeoutError(f"run did not finish: {run_id}")
 
 
-def run_seed(seed, mode, canary_overrides=None):
+def run_seed(seed, mode, canary_overrides=None, deterministic_eval=False):
     existing_ids = {run.get("run_id") for run in latest_runs(limit=300)}
     request_json("POST", "/api/self-play/stop", {})
-    configure(seed, mode, canary_overrides=canary_overrides)
+    configure(seed, mode, canary_overrides=canary_overrides, deterministic_eval=deterministic_eval)
     request_json("POST", "/api/ai/start", {})
     request_json("POST", "/api/self-play/start", {})
     run_id = wait_for_new_run(seed, existing_ids)
@@ -85,6 +90,7 @@ def main():
     parser.add_argument("--allow-skip-when-deck-size-gte", type=int)
     parser.add_argument("--allow-skip-when-best-card-score-lte", type=float)
     parser.add_argument("--max-active-ratio-per-run", type=float)
+    parser.add_argument("--deterministic-eval", action="store_true")
     args = parser.parse_args()
     overrides = {
         key: value
@@ -99,7 +105,7 @@ def main():
     }
     results = []
     for seed in [item.strip() for item in args.seeds.split(",") if item.strip()]:
-        run_id = run_seed(seed, args.mode, canary_overrides=overrides)
+        run_id = run_seed(seed, args.mode, canary_overrides=overrides, deterministic_eval=args.deterministic_eval)
         results.append({"seed": seed, "run_id": run_id, "mode": args.mode})
         print(json.dumps(results[-1], ensure_ascii=False))
     print(json.dumps({"mode": args.mode, "results": results}, ensure_ascii=False, indent=2))

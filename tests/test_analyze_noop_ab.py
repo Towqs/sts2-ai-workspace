@@ -31,9 +31,11 @@ class AnalyzeNoopABTests(unittest.TestCase):
         self.assertEqual(divergence["baseline_payload"]["option_index"], 0)
         self.assertEqual(divergence["noop_payload"]["option_index"], 1)
 
+    @patch("analyze_noop_ab.trace_hash")
     @patch("analyze_noop_ab.first_trace_divergence")
-    def test_attach_trace_divergences_counts_rows(self, first_trace_mock):
+    def test_attach_trace_divergences_counts_rows(self, first_trace_mock, trace_hash_mock):
         first_trace_mock.side_effect = [{}, {"index": 3}]
+        trace_hash_mock.side_effect = ["a", "a", "b", "c"]
         summary = {
             "per_seed": [
                 {"baseline_run_id": "b1", "active_run_id": "n1"},
@@ -45,6 +47,8 @@ class AnalyzeNoopABTests(unittest.TestCase):
 
         self.assertEqual(result["trace_first_divergence_count"], 1)
         self.assertEqual(result["trace_first_divergence"], {"index": 3})
+        self.assertTrue(result["per_seed"][0]["trace_hash_match"])
+        self.assertFalse(result["per_seed"][1]["trace_hash_match"])
 
 
 if __name__ == "__main__":

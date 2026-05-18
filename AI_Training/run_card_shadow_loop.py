@@ -76,13 +76,14 @@ def configure_panel(panel_url, args):
         "self_play_train_every_admitted_runs": args.train_every,
         "self_play_max_run_minutes": args.max_run_minutes,
         "self_play_stall_seconds": args.stall_seconds,
-        "exploration_enabled": True,
+        "exploration_enabled": not bool(args.deterministic_eval),
         "exploration_mode": "aggressive",
         "self_play_constraint_mode": args.constraint_mode,
         "combat_exploration_epsilon": args.combat_epsilon,
         "macro_exploration_epsilon": args.macro_epsilon,
         "exploration_top_k": args.exploration_top_k,
         "exploration_temperature": args.exploration_temperature,
+        "evaluation_deterministic": bool(args.deterministic_eval),
         "option_card_scorer": {"mode": args.card_scorer_mode},
     }
     return request_json("POST", f"{panel_url}/api/control", patch, timeout=15)
@@ -221,7 +222,7 @@ def main():
     parser.add_argument(
         "--card-scorer-mode",
         default="shadow",
-        choices=["off", "shadow", "active", "active_canary"],
+        choices=["off", "shadow", "active", "active_canary", "active_canary_noop"],
         help="Card reward scorer mode. Default stays shadow; use active_canary for guarded takeover tests.",
     )
     parser.add_argument("--panel-url", default=DEFAULT_PANEL_URL)
@@ -236,6 +237,7 @@ def main():
     parser.add_argument("--macro-epsilon", type=float, default=0.6)
     parser.add_argument("--exploration-top-k", type=int, default=5)
     parser.add_argument("--exploration-temperature", type=float, default=1.4)
+    parser.add_argument("--deterministic-eval", action="store_true")
     parser.add_argument("--keep-ai-running", action="store_true")
     parser.add_argument("--stop-on-exit", action="store_true", help="Also stop self-play/AI if the loop times out or is interrupted.")
     parser.add_argument("--no-report", action="store_true")

@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -104,6 +105,12 @@ def trace_for_run(run_id):
     return rows
 
 
+def trace_hash(run_id):
+    signatures = [action_signature(row) for row in trace_for_run(run_id)]
+    encoded = json.dumps(signatures, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def first_trace_divergence(baseline_run_id, noop_run_id):
     baseline_rows = trace_for_run(baseline_run_id)
     noop_rows = trace_for_run(noop_run_id)
@@ -148,6 +155,9 @@ def attach_trace_divergences(summary):
             row.get("baseline_run_id"),
             row.get("active_run_id"),
         )
+        row["baseline_trace_hash"] = trace_hash(row.get("baseline_run_id"))
+        row["noop_trace_hash"] = trace_hash(row.get("active_run_id"))
+        row["trace_hash_match"] = row["baseline_trace_hash"] == row["noop_trace_hash"]
     summary["trace_first_divergence_count"] = sum(
         1 for row in per_seed if row.get("trace_first_divergence")
     )

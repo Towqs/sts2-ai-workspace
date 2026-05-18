@@ -204,6 +204,7 @@ DEFAULT_CONTROL = {
     "macro_exploration_epsilon": 0.25,
     "exploration_top_k": 5,
     "exploration_temperature": 1.35,
+    "evaluation_deterministic": False,
     "self_play_character": "IRONCLAD",
     "self_play_ascension": 0,
     "self_play_seed": "",
@@ -376,6 +377,8 @@ def update_control(patch):
                     data[key] = max(0.1, min(float(patch[key]), 5.0))
                 except (TypeError, ValueError):
                     data[key] = DEFAULT_CONTROL[key]
+            elif key == "evaluation_deterministic":
+                data[key] = bool(patch[key])
             elif key == "self_play_ascension":
                 data[key] = clamp_int(patch[key], DEFAULT_CONTROL[key], 0, 20)
             elif key == "self_play_target_runs":

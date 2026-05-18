@@ -384,6 +384,17 @@ trace_first_divergence_count = 0 on deterministic evaluation runs
 
 The no-op report compares full AI action traces, not only card reward rows. If the first divergence is outside `card_reward`, inspect that screen before attributing any outcome delta to the card scorer.
 
+For deterministic evaluation runs, enable:
+
+```powershell
+.\.venv\Scripts\python.exe .\AI_Training\run_card_ab_batch.py `
+  --mode shadow `
+  --seeds 111,444,666 `
+  --deterministic-eval
+```
+
+`evaluation_deterministic` disables exploration sampling, zeros combat/macro epsilon, seeds Python/NumPy/Torch once per run, and uses stable tie-breaks for ranked combat/map choices. A deterministic self-check should compare the same baseline configuration against itself before testing `active_canary_noop`.
+
 Next shadow validation targets:
 
 ```text

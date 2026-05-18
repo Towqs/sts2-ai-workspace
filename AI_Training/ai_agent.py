@@ -58,6 +58,7 @@ CARD_CANARY_COUNTS = {}
 CARD_SHADOW_SEEN_SIGNATURES = set()
 SKIPPED_CARD_REWARD_KEYS = set()
 PENDING_CARD_REWARD_KEYS = {}
+SEEDED_EVAL_RUNS = set()
 
 DEFAULT_CONTROL = {
     "ai_enabled": True,
@@ -78,6 +79,7 @@ DEFAULT_CONTROL = {
     "macro_exploration_epsilon": 0.25,
     "exploration_top_k": 5,
     "exploration_temperature": 1.35,
+    "evaluation_deterministic": False,
     "policy_mode": "current_rl",
     "ppo_seed_mode": "fixed",
     "ppo_fixed_seed": "101",
@@ -1224,7 +1226,7 @@ def score_combat_candidates(candidate_agent, state_vec, candidates, state=None, 
             "confidence": float(prob),
             "marker": marker,
         })
-    ranked.sort(key=lambda item: item["score"], reverse=True)
+    ranked.sort(key=lambda item: (-item["score"], action_payload_key(item["candidate"].payload)))
     chosen = ranked[0] if ranked else None
     decision_source = f"candidate_scorer_{constraint_mode}"
     if chosen and exploration and exploration.get("enabled"):
@@ -3596,7 +3598,7 @@ def choose_event_option_rule_action(state, exploration=None):
             "reasons": reasons,
         })
 
-    scored.sort(key=lambda item: item["score"], reverse=True)
+    scored.sort(key=lambda item: (-item["score"], str(item.get("type") or ""), safe_int(item.get("index"), 0)))
     best = scored[0]
     if exploration and exploration.get("enabled"):
         selected, _, selected_rank = sample_ranked_entry(
@@ -4969,6 +4971,7 @@ def choose_card_to_play(sorted_indices, id_to_action, hand_cards, energy, explor
 
 
 def load_exploration_config(control):
+    deterministic = bool(control.get("evaluation_deterministic", False))
     enabled = bool(control.get("exploration_enabled", False))
     mode = str(control.get("exploration_mode") or "aggressive").lower()
     if mode not in ("aggressive", "off"):
@@ -4993,14 +4996,31 @@ def load_exploration_config(control):
     except (TypeError, ValueError):
         temperature = 1.35
     return {
-        "enabled": enabled and mode != "off",
+        "enabled": enabled and mode != "off" and not deterministic,
         "mode": mode,
         "constraint_mode": constraint_mode,
-        "combat_epsilon": combat_epsilon,
-        "macro_epsilon": macro_epsilon,
+        "combat_epsilon": 0.0 if deterministic else combat_epsilon,
+        "macro_epsilon": 0.0 if deterministic else macro_epsilon,
         "top_k": top_k,
-        "temperature": temperature,
+        "temperature": 0.1 if deterministic else temperature,
+        "deterministic": deterministic,
     }
+
+
+def seed_eval_rng_once(run_id, seed, deterministic=False):
+    key = str(run_id or "")
+    if not deterministic or not key or key in SEEDED_EVAL_RUNS:
+        return
+    try:
+        value = int(str(seed or "0"))
+    except (TypeError, ValueError):
+        value = 0
+    random.seed(value)
+    np.random.seed(value)
+    torch.manual_seed(value)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(value)
+    SEEDED_EVAL_RUNS.add(key)
 
 
 def sample_ranked_entry(ranked, epsilon, top_k, temperature, score_key="score"):
@@ -5258,6 +5278,7 @@ def run_agent():
         state["_ai_session_id"] = session_id
         state["_active_run_seed"] = run_identity["seed"]
         exploration = load_exploration_config(control)
+        seed_eval_rng_once(session_id, run_identity["seed"], exploration.get("deterministic"))
         current_policy_mode = normalize_policy_mode(control.get("policy_mode"))
         if not control.get("ai_enabled", True):
             if last_data_source != "human":
