@@ -825,7 +825,7 @@ class SelfPlayManager:
                             last_message=f"Act1 clear reached by {run_id}; PPO checkpoint updated, continuing self-play.",
                         )
                         continue
-                    if score.get("admitted") and admitted_runs % training_interval != 0:
+                    if score.get("admitted") and admitted_runs % training_interval == 0:
                         self._trigger_training()
                     self._set_status(
                         running=True,

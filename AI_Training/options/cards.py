@@ -178,7 +178,7 @@ def normalize_card_scorer_mode(value):
     if isinstance(value, dict):
         value = value.get("mode")
     text = str(value or "shadow").strip().lower()
-    return text if text in ("off", "shadow", "active", "active_canary") else "shadow"
+    return text if text in ("off", "shadow", "active", "active_canary", "active_canary_noop") else "shadow"
 
 
 def enabled_templates(config=None):

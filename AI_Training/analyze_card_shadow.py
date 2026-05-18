@@ -160,6 +160,7 @@ def summarize_records(records, scope=None):
     reward_term_inf_count = 0
     agreement_count = 0
     skip_recommended_count = 0
+    executed_skip_count = 0
     old_skip_count = 0
     template_locked_count = 0
     candidate_count_anomalies = 0
@@ -191,6 +192,8 @@ def summarize_records(records, scope=None):
             agreement_count += 1
         if scorer_label == "skip_reward" or bool(record.get("skip_recommended")):
             skip_recommended_count += 1
+        if bool(record.get("executed_skip")) or bool(record.get("actual_skip")):
+            executed_skip_count += 1
         if old_label == "skip_reward" or bool(record.get("actual_skip")):
             old_skip_count += 1
 
@@ -308,6 +311,7 @@ def summarize_records(records, scope=None):
         "scorer_disagreed_with_old_policy": disagreement_count,
         "scorer_disagreed_with_old_policy_rate": round4(1.0 - agreement_rate if total else 0.0),
         "scorer_recommended_skip_rate": round4(skip_recommended_count / total if total else 0.0),
+        "executed_skip_rate": round4(executed_skip_count / total if total else 0.0),
         "old_policy_skip_rate": round4(old_skip_count / total if total else 0.0),
         "avg_skip_score": round4(mean(skip_scores)),
         "avg_best_card_score": round4(mean(best_card_scores)),

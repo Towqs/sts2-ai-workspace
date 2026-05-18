@@ -37,13 +37,15 @@ def shadow_files():
     return sorted(SHADOW_DIR.glob("card_scorer_*.jsonl"))
 
 
-def count_shadow_events_since(start_ms):
+def count_shadow_events_since(start_ms, seed=""):
     total = 0
     latest_ts = 0
     files = shadow_files()
     for path in files:
         for record in iter_jsonl(path):
             if record.get("type") != "card_scorer_shadow":
+                continue
+            if seed and str(record.get("seed") or "") != str(seed):
                 continue
             try:
                 timestamp = float(record.get("timestamp") or 0)
@@ -81,7 +83,7 @@ def configure_panel(panel_url, args):
         "macro_exploration_epsilon": args.macro_epsilon,
         "exploration_top_k": args.exploration_top_k,
         "exploration_temperature": args.exploration_temperature,
-        "option_card_scorer": {"mode": "shadow"},
+        "option_card_scorer": {"mode": args.card_scorer_mode},
     }
     return request_json("POST", f"{panel_url}/api/control", patch, timeout=15)
 
@@ -151,6 +153,9 @@ def maybe_restart_self_play(panel_url, started_once):
 def run_loop(args):
     panel_url = args.panel_url.rstrip("/")
     start_ms = int(time.time() * 1000)
+    # A fixed-seed collection run must start from a fresh self-play session;
+    # otherwise a previous loop can leak its current run into the next seed.
+    stop_collection(panel_url, keep_ai_running=True)
     configure_panel(panel_url, args)
     start_result = start_or_keep_running(panel_url)
     print(json.dumps({
@@ -168,7 +173,7 @@ def run_loop(args):
     final_files = []
     try:
         while time.time() < deadline:
-            count, latest_ts, files = count_shadow_events_since(start_ms)
+            count, latest_ts, files = count_shadow_events_since(start_ms, str(args.seed or "").strip())
             final_count = count
             final_files = files
             if count != last_count or args.verbose:
@@ -213,6 +218,12 @@ def main():
     parser.add_argument("--seed", default="", help="Fixed seed. Leave empty for random runs.")
     parser.add_argument("--character", default="IRONCLAD")
     parser.add_argument("--policy-mode", default="current_rl", choices=["current_rl", "ppo_experiment", "ppo_best"])
+    parser.add_argument(
+        "--card-scorer-mode",
+        default="shadow",
+        choices=["off", "shadow", "active", "active_canary"],
+        help="Card reward scorer mode. Default stays shadow; use active_canary for guarded takeover tests.",
+    )
     parser.add_argument("--panel-url", default=DEFAULT_PANEL_URL)
     parser.add_argument("--constraint-mode", default="explore", choices=["guarded", "explore", "free"])
     parser.add_argument("--train-every", type=int, default=999, help="Large default avoids training during shadow collection.")

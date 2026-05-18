@@ -299,6 +299,48 @@ active_canary:
   max_card_index: 2
 ```
 
+## Active Canary A/B Check
+
+Before widening canary traffic, compare the same fixed-seed set under baseline/shadow and `active_canary`.
+
+Recommended first pass:
+
+```text
+baseline seeds: 101, 202, 303, 404, 505
+canary seeds:   101, 202, 303, 404, 505
+```
+
+After both arms finish, collect the run ids and generate a compact outcome report:
+
+```powershell
+.\.venv\Scripts\python.exe .\AI_Training\analyze_card_ab.py `
+  --baseline-run-ids b1,b2,b3,b4,b5 `
+  --canary-run-ids c1,c2,c3,c4,c5 `
+  --report `
+  --report-name card_ab_report_2026-05-17.md
+```
+
+The report compares:
+
+```text
+average_floor
+act1_clear_rate
+avg_deck_size
+skip_rate
+illegal_action_rate
+average_boss_damage
+takeover_rate
+```
+
+Widen only after `active_canary` is not worse than baseline on floor / act1 clear / illegal actions. If that holds, raise:
+
+```yaml
+active_canary:
+  max_active_ratio_per_run: 0.50
+```
+
+Canary ratio control is per run and counts each unique card reward screen once. Repeated polling of the same screen must not spend additional canary budget.
+
 Changes in this phase:
 
 - Low-confidence scorer disagreements fall back to the old policy in the effective shadow recommendation, while `raw_scorer_action` is still recorded.
@@ -314,6 +356,33 @@ Use `--new-logic-only` for the promotion report:
 ```powershell
 .\.venv\Scripts\python.exe .\AI_Training\analyze_card_shadow.py --date 2026-05-14 --new-logic-only --report
 ```
+
+Run a guarded active-canary batch with the same loop tool:
+
+```powershell
+.\.venv\Scripts\python.exe .\AI_Training\run_card_shadow_loop.py --target-events 30 --seed 101 --card-scorer-mode active_canary
+```
+
+Before judging canary outcomes, run a clean no-op A/B:
+
+```powershell
+.\.venv\Scripts\python.exe .\AI_Training\analyze_noop_ab.py `
+  --baseline-run-ids <baseline_ids> `
+  --noop-run-ids <noop_ids> `
+  --report `
+  --report-name card_ab_noop_report_YYYY-MM-DD.md
+```
+
+No-op A/B must satisfy:
+
+```text
+takeover_count = 0
+runs_with_takeover = 0
+executed_action_match_rate = 1.0
+trace_first_divergence_count = 0 on deterministic evaluation runs
+```
+
+The no-op report compares full AI action traces, not only card reward rows. If the first divergence is outside `card_reward`, inspect that screen before attributing any outcome delta to the card scorer.
 
 Next shadow validation targets:
 

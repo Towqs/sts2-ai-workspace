@@ -14,6 +14,13 @@ from options.cards import (
     normalize_card_scorer_mode,
     score_card,
 )
+from ai_agent import (
+    CARD_CANARY_COUNTS,
+    SKIPPED_CARD_REWARD_KEYS,
+    canary_counter_for_card_reward,
+    card_reward_item_key,
+    choose_reward_rule_action,
+)
 
 
 def make_large_deck(size=30):
@@ -24,6 +31,10 @@ def make_large_deck(size=30):
 
 
 class CardScorerTests(unittest.TestCase):
+    def tearDown(self):
+        CARD_CANARY_COUNTS.clear()
+        SKIPPED_CARD_REWARD_KEYS.clear()
+
     def test_default_templates_enable_three_and_disable_self_damage(self):
         config = load_template_config()
         enabled = set(enabled_templates(config))
@@ -36,6 +47,7 @@ class CardScorerTests(unittest.TestCase):
         self.assertEqual(config["active_canary"]["max_active_ratio_per_run"], 0.35)
         self.assertEqual(config["active_canary"]["allow_skip_when_best_card_score_lte"], 0.5)
         self.assertEqual(normalize_card_scorer_mode("active_canary"), "active_canary")
+        self.assertEqual(normalize_card_scorer_mode("active_canary_noop"), "active_canary_noop")
 
     def test_card_reward_options_include_cards_and_skip(self):
         state = {
@@ -147,6 +159,65 @@ class CardScorerTests(unittest.TestCase):
         payload = result.to_dict()
         self.assertGreaterEqual(payload["confidence_gap"], 0.0)
         self.assertTrue(payload["template_lock"]["locked"])
+
+    def test_canary_counter_counts_unique_card_reward_screens_per_run(self):
+        base_state = {
+            "_ai_session_id": "run-a",
+            "run": {"act": 1, "floor": 5},
+            "card_reward": {
+                "cards": [
+                    {"index": 0, "id": "TWIN_STRIKE"},
+                    {"index": 1, "id": "SHRUG_IT_OFF"},
+                ]
+            },
+        }
+        _, first, first_new = canary_counter_for_card_reward(base_state)
+        _, duplicate, duplicate_new = canary_counter_for_card_reward(base_state)
+        changed_screen = {
+            **base_state,
+            "run": {"act": 1, "floor": 6},
+        }
+        _, second_screen, second_new = canary_counter_for_card_reward(changed_screen)
+        next_run = {
+            **base_state,
+            "_ai_session_id": "run-b",
+        }
+        _, next_counter, next_new = canary_counter_for_card_reward(next_run)
+
+        self.assertTrue(first_new)
+        self.assertFalse(duplicate_new)
+        self.assertTrue(second_new)
+        self.assertTrue(next_new)
+        self.assertEqual(first["seen"], 2)
+        self.assertIs(first, duplicate)
+        self.assertIs(first, second_screen)
+        self.assertEqual(next_counter["seen"], 1)
+
+    def test_skipped_card_reward_is_not_claimed_again(self):
+        state = {
+            "_ai_session_id": "run-reward",
+            "state_type": "rewards",
+            "run": {"act": 2, "floor": 21},
+            "rewards": {
+                "can_proceed": True,
+                "items": [
+                    {"index": 0, "type": "potion"},
+                    {"index": 1, "type": "card"},
+                    {"index": 2, "type": "card"},
+                ],
+            },
+        }
+        SKIPPED_CARD_REWARD_KEYS.add(card_reward_item_key(state, state["rewards"]["items"][2], 2))
+        payload, info = choose_reward_rule_action(state, "rewards")
+        self.assertEqual(payload, {"action": "claim_reward", "index": 0})
+        self.assertNotEqual(info["chosen_action"], "claim_reward:index_2:card")
+
+        SKIPPED_CARD_REWARD_KEYS.add(card_reward_item_key(state, state["rewards"]["items"][1], 1))
+        state["rewards"]["items"] = state["rewards"]["items"][1:]
+        payload, info = choose_reward_rule_action(state, "rewards")
+        self.assertEqual(payload, {"action": "proceed"})
+        self.assertEqual(info["chosen_action"], "proceed")
+
 
 
 if __name__ == "__main__":

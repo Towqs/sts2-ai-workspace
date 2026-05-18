@@ -52,8 +52,12 @@ AI_LOGIC_PATH = os.path.join(os.path.dirname(__file__), "ai_logic_state.json")
 AI_LOG_DIR = os.path.join(WORKSPACE_DIR, "RL_Datasets", "AI_Combat")
 PPO_LOG_DIR = os.path.join(WORKSPACE_DIR, "RL_Datasets", "PPO")
 OPTION_SHADOW_LOG_DIR = os.path.join(WORKSPACE_DIR, "RL_Datasets", "OptionShadow")
+ACTIVE_RUN_SESSION_PATH = os.path.join(WORKSPACE_DIR, "RL_Datasets", "active_run_session.json")
 CARD_TEMPLATE_LOCKS = {}
 CARD_CANARY_COUNTS = {}
+CARD_SHADOW_SEEN_SIGNATURES = set()
+SKIPPED_CARD_REWARD_KEYS = set()
+PENDING_CARD_REWARD_KEYS = {}
 
 DEFAULT_CONTROL = {
     "ai_enabled": True,
@@ -1522,17 +1526,37 @@ def reward_item_claim_payload(state, item, fallback_index, state_type=None):
     return {"action": "claim_reward", "index": int(item.get("index", fallback_index))}, "available"
 
 
+def card_reward_item_key(state, item, fallback_index):
+    state = state if isinstance(state, dict) else {}
+    run = state.get("run") if isinstance(state.get("run"), dict) else {}
+    return (
+        str(state.get("_ai_session_id") or "global"),
+        safe_int(run.get("act"), 0),
+        safe_int(run.get("floor"), 0),
+        safe_int(item.get("index"), fallback_index),
+    )
+
+
 def choose_reward_rule_action(state, state_type):
     items = list(get_items_for_state(state, state_type))
     priority = {"relic": 0, "gold": 1, "potion": 2, "card": 3, "special_card": 3}
     ranked = sorted(
         enumerate(items),
-        key=lambda row: (priority.get(reward_item_type(row[1]), 4), safe_int(row[1].get("index"), row[0])),
+        key=lambda row: (priority.get(reward_item_type(row[1]), 4), -safe_int(row[1].get("index"), row[0])),
     )
     top_actions = []
     for fallback_index, item in ranked:
-        payload, status = reward_item_claim_payload(state, item, fallback_index, state_type)
         item_type = reward_item_type(item) or "item"
+        if item_type in ("card", "special_card"):
+            skipped_key = card_reward_item_key(state, item, fallback_index)
+            if skipped_key in SKIPPED_CARD_REWARD_KEYS:
+                top_actions.append({
+                    "action": f"claim_reward:index_{safe_int(item.get('index'), fallback_index)}:{item_type}",
+                    "confidence": 0.0,
+                    "marker": "skipped_card_reward_already",
+                })
+                continue
+        payload, status = reward_item_claim_payload(state, item, fallback_index, state_type)
         label_index = safe_int(item.get("index"), fallback_index)
         marker = status
         top_actions.append({
@@ -1872,6 +1896,19 @@ def safe_int(value, default=0):
         return default
 
 
+def active_run_identity(fallback_session_id=""):
+    try:
+        with open(ACTIVE_RUN_SESSION_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        data = {}
+    if not isinstance(data, dict) or data.get("ended"):
+        return {"run_id": fallback_session_id, "seed": ""}
+    run_id = str(data.get("run_id") or fallback_session_id or "")
+    seed = str(data.get("seed") or "")
+    return {"run_id": run_id, "seed": seed}
+
+
 def card_blob(card):
     parts = []
     for key in ("id", "name", "type", "description", "target_type", "rarity"):
@@ -2013,6 +2050,23 @@ def card_reward_signature_for_template_lock(state):
     }, sort_keys=True, ensure_ascii=False)
 
 
+def canary_counter_for_card_reward(state):
+    state = state if isinstance(state, dict) else {}
+    run_key = str(state.get("_ai_session_id") or "global")
+    signature = card_reward_signature_for_template_lock(state)
+    counter = CARD_CANARY_COUNTS.setdefault(run_key, {
+        "seen": 0,
+        "active": 0,
+        "seen_signatures": set(),
+    })
+    counter.setdefault("seen_signatures", set())
+    is_new_screen = signature not in counter["seen_signatures"]
+    if is_new_screen:
+        counter["seen_signatures"].add(signature)
+        counter["seen"] = safe_int(counter.get("seen"), 0) + 1
+    return run_key, counter, is_new_screen
+
+
 def locked_template_for_card_reward(state, session_id=""):
     config = load_template_config()
     deck_summary = build_deck_summary(state)
@@ -2131,7 +2185,7 @@ def card_scorer_info_payload(mode, result, error=""):
 
 def active_card_scorer_choice(state, card_baseline_weight=1.0):
     requested_mode = option_card_scorer_mode()
-    mode = "active_canary" if requested_mode == "active_canary" else "active"
+    mode = "active_canary" if requested_mode in ("active_canary", "active_canary_noop") else "active"
     mode, result, error = build_shadow_card_result(state, mode=mode)
     if not result or not result.selected:
         return None, {
@@ -2149,23 +2203,45 @@ def active_card_scorer_choice(state, card_baseline_weight=1.0):
         }
     selected = result.selected
     fallback_reason = ""
+    baseline_action = None
+    baseline_payload = None
+    baseline_card = {}
+    action_source = "scorer_takeover"
     if mode == "active_canary":
         entries, profile = card_reward_baseline_entries(state)
         entries.sort(key=lambda item: item["score"], reverse=True)
         old = entries[0] if entries else None
-        canary_cfg = (load_template_config().get("active_canary") or {})
+        if old:
+            baseline_action = old.get("label")
+            baseline_payload = old.get("payload")
+            baseline_card = old.get("card") or {}
+        canary_cfg = dict(load_template_config().get("active_canary") or {})
+        control_scorer_cfg = (load_control().get("option_card_scorer") or {})
+        if isinstance(control_scorer_cfg, dict):
+            for key in (
+                "only_when_confidence_gap_gte",
+                "fallback_to_old_when_gap_lt",
+                "allow_skip_when_deck_size_gte",
+                "allow_skip_when_best_card_score_lte",
+                "max_active_ratio_per_run",
+                "max_card_index",
+            ):
+                if key in control_scorer_cfg:
+                    canary_cfg[key] = control_scorer_cfg[key]
         min_gap = safe_num(canary_cfg.get("only_when_confidence_gap_gte"), 1.0)
         fallback_gap = safe_num(canary_cfg.get("fallback_to_old_when_gap_lt"), 0.3)
         allow_skip_deck = safe_int(canary_cfg.get("allow_skip_when_deck_size_gte"), 22)
         allow_skip_best = safe_num(canary_cfg.get("allow_skip_when_best_card_score_lte"), 0.5)
         max_active_ratio = max(0.0, min(safe_num(canary_cfg.get("max_active_ratio_per_run"), 0.35), 1.0))
+        if requested_mode == "active_canary_noop":
+            min_gap = 999999.0
+            fallback_gap = 999999.0
+            max_active_ratio = 0.0
         max_card_index = safe_int(canary_cfg.get("max_card_index"), 2)
         deck_size = safe_int((result.deck_summary or {}).get("deck_size"), 0)
         selected_index = safe_int(getattr(selected, "index", -1), -1)
-        canary_key = str((state or {}).get("_ai_session_id") or "global")
-        canary_counts = CARD_CANARY_COUNTS.setdefault(canary_key, {"seen": 0, "active": 0})
-        canary_counts["seen"] = safe_int(canary_counts.get("seen"), 0) + 1
-        allowed_active = max(1, int(math.floor(canary_counts["seen"] * max_active_ratio)))
+        canary_key, canary_counts, is_new_canary_screen = canary_counter_for_card_reward(state)
+        allowed_active = 0 if max_active_ratio <= 0 else max(1, int(math.floor(canary_counts["seen"] * max_active_ratio)))
         if old:
             if result.confidence_gap < fallback_gap:
                 fallback_reason = f"canary_low_gap<{fallback_gap:g}"
@@ -2183,6 +2259,7 @@ def active_card_scorer_choice(state, card_baseline_weight=1.0):
             elif safe_int(canary_counts.get("active"), 0) >= allowed_active:
                 fallback_reason = f"canary_active_ratio_limit({allowed_active}/{canary_counts['seen']})"
             if fallback_reason:
+                action_source = fallback_reason
                 selected = type(result.selected)(
                     label=old["label"],
                     payload=old["payload"],
@@ -2193,7 +2270,23 @@ def active_card_scorer_choice(state, card_baseline_weight=1.0):
                     index=safe_int((old.get("payload") or {}).get("card_index"), -1),
                 )
             else:
-                canary_counts["active"] = safe_int(canary_counts.get("active"), 0) + 1
+                if not is_new_canary_screen:
+                    fallback_reason = "canary_duplicate_screen"
+                    action_source = fallback_reason
+                    selected = type(result.selected)(
+                        label=old["label"],
+                        payload=old["payload"],
+                        kind="card_reward",
+                        score=old["score"],
+                        reasons=list(old.get("reasons") or []) + [fallback_reason],
+                        metadata={"card": old.get("card") or {}, "score_breakdown": {}, "canary_fallback": fallback_reason},
+                        index=safe_int((old.get("payload") or {}).get("card_index"), -1),
+                    )
+                else:
+                    canary_counts["active"] = safe_int(canary_counts.get("active"), 0) + 1
+                    action_source = "scorer_takeover"
+        elif old:
+            action_source = "old_policy"
     top_actions = card_result_top_actions(result)
     return selected.payload, {
         "top_actions": top_actions,
@@ -2209,6 +2302,12 @@ def active_card_scorer_choice(state, card_baseline_weight=1.0):
             "template_id": result.template_id,
             "archetype_consistency": result.archetype_consistency,
             "canary_fallback_reason": fallback_reason,
+            "baseline_action": baseline_action,
+            "baseline_payload": baseline_payload,
+            "baseline_card": baseline_card,
+            "canary_takeover": bool(mode == "active_canary" and baseline_payload and selected.payload != baseline_payload),
+            "final_executed_action": selected.label,
+            "action_source": action_source if baseline_payload else "scorer_takeover",
         },
         "card_scorer": card_scorer_info_payload(mode, result, error),
         "archetype_consistency": result.archetype_consistency,
@@ -4572,9 +4671,17 @@ def append_card_scorer_shadow_log(session_id, state, actual_payload, macro_info,
     scorer = (macro_info or {}).get("card_scorer")
     if not isinstance(scorer, dict) or scorer.get("mode") == "off":
         return
+    shadow_screen_key = json.dumps({
+        "session_id": session_id,
+        "signature": macro_state_signature(state),
+    }, sort_keys=True, ensure_ascii=False)
+    if shadow_screen_key in CARD_SHADOW_SEEN_SIGNATURES:
+        return
+    CARD_SHADOW_SEEN_SIGNATURES.add(shadow_screen_key)
     options = scorer.get("options") or []
     selected = scorer.get("selected") or {}
-    old_label = (macro_info or {}).get("chosen_action")
+    reward_baseline = (macro_info or {}).get("reward_baseline") if isinstance((macro_info or {}).get("reward_baseline"), dict) else {}
+    old_label = reward_baseline.get("baseline_action") or (macro_info or {}).get("chosen_action")
     if not old_label:
         if (actual_payload or {}).get("action") == "skip_card_reward":
             old_label = "skip_reward"
@@ -4651,7 +4758,7 @@ def append_card_scorer_shadow_log(session_id, state, actual_payload, macro_info,
         "timestamp": int(time.time() * 1000),
         "run_id": session_id,
         "episode_id": session_id,
-        "seed": str((state or {}).get("seed") or run.get("seed") or ""),
+        "seed": str((state or {}).get("_active_run_seed") or (state or {}).get("seed") or run.get("seed") or ""),
         "act": safe_int(run.get("act"), 0),
         "floor": safe_int(run.get("floor"), 0),
         "screen_type": "card_reward",
@@ -4672,6 +4779,12 @@ def append_card_scorer_shadow_log(session_id, state, actual_payload, macro_info,
         "legacy_chosen_action": old_label,
         "old_policy_action": old_label,
         "old_policy_card": old_card,
+        "baseline_payload": reward_baseline.get("baseline_payload"),
+        "canary_fallback_reason": reward_baseline.get("canary_fallback_reason") or "",
+        "canary_takeover": bool(reward_baseline.get("canary_takeover")),
+        "final_executed_action": reward_baseline.get("final_executed_action") or old_label,
+        "action_source": reward_baseline.get("action_source") or ("old_policy" if old_label else ""),
+        "takeover_reason": reward_baseline.get("action_source") if reward_baseline.get("canary_takeover") else "",
         "raw_scorer_action": raw_scorer_label,
         "raw_scorer_card": raw_scorer_card,
         "effective_fallback_reason": effective_fallback_reason,
@@ -4691,6 +4804,8 @@ def append_card_scorer_shadow_log(session_id, state, actual_payload, macro_info,
         "second_best_card_score": skip_diagnostics.get("second_best_card_score"),
         "max_archetype_fit": skip_diagnostics.get("max_archetype_fit"),
         "skip_recommended": scorer_label == "skip_reward",
+        "scorer_recommended_skip": scorer_label == "skip_reward",
+        "executed_skip": (actual_payload or {}).get("action") == "skip_card_reward",
         "skip_available": any(
             (option or {}).get("label") == "skip_reward"
             for option in options
@@ -5113,7 +5228,7 @@ def run_agent():
     macro_policy_name = "macro_mixed"
     macro_model_version = (macro_agent or {}).get("model_version", "rules")
     ppo_model_version = (ppo_agent or {}).get("model_version", "")
-    session_id = f"ai_{datetime.now():%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:8]}"
+    agent_session_id = f"ai_{datetime.now():%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:8]}"
     
     print(Fore.GREEN + Style.BRIGHT + "\n====== STS2 AI Control System v2 ======")
     print(Fore.WHITE + "  Enter any combat encounter, AI will auto-play when it's your turn.")
@@ -5138,6 +5253,10 @@ def run_agent():
             continue
 
         control = load_control()
+        run_identity = active_run_identity(agent_session_id)
+        session_id = run_identity["run_id"] or agent_session_id
+        state["_ai_session_id"] = session_id
+        state["_active_run_seed"] = run_identity["seed"]
         exploration = load_exploration_config(control)
         current_policy_mode = normalize_policy_mode(control.get("policy_mode"))
         if not control.get("ai_enabled", True):
@@ -5189,7 +5308,6 @@ def run_agent():
             if control.get("macro_enabled", False) and state_type in ("map", "rewards", "card_reward", "card_select", "hand_select", "bundle_select", "event", "crystal_sphere", "rest_site", "shop", "fake_merchant", "treasure"):
                 allow_shop = bool(control.get("macro_shop_enabled", False) or constraint_mode in ("explore", "free"))
                 card_baseline_weight = safe_num(control.get("macro_card_reward_weight"), 0.35)
-                state["_ai_session_id"] = session_id
                 card_select_key = None
                 if is_selection_state_type(state_type):
                     card_select_key = selection_memory_signature(state)
@@ -5263,7 +5381,7 @@ def run_agent():
                 }, sort_keys=True, ensure_ascii=False)
                 snapshot_policy_name = current_policy_mode if current_policy_mode in ("ppo_experiment", "ppo_best") and ppo_agent and ppo_agent.get("trained") else macro_policy_name
                 snapshot_model_version = ppo_model_version if current_policy_mode in ("ppo_experiment", "ppo_best") and ppo_agent and ppo_agent.get("trained") else macro_model_version
-                if state_type == "card_reward":
+                if state_type == "card_reward" and decision_key != last_macro_decision_key:
                     append_card_scorer_shadow_log(
                         session_id,
                         state,
@@ -5308,6 +5426,18 @@ def run_agent():
                     active_macro_version = ppo_model_version if current_policy_mode in ("ppo_experiment", "ppo_best") and ppo_agent and ppo_agent.get("trained") else macro_model_version
                     payload = payload_with_policy(payload, active_macro_policy, active_macro_version)
                     success = send_action(payload)
+                    if success and state_type == "rewards" and raw_payload.get("action") == "claim_reward":
+                        claimed_index = safe_int(raw_payload.get("index"), -1)
+                        for fallback_index, item in enumerate(get_items_for_state(state, state_type)):
+                            if safe_int(item.get("index"), fallback_index) != claimed_index:
+                                continue
+                            if reward_item_type(item) in ("card", "special_card"):
+                                PENDING_CARD_REWARD_KEYS[session_id] = card_reward_item_key(state, item, fallback_index)
+                            break
+                    if success and state_type == "card_reward":
+                        pending_key = PENDING_CARD_REWARD_KEYS.pop(session_id, None)
+                        if raw_payload.get("action") == "skip_card_reward" and pending_key:
+                            SKIPPED_CARD_REWARD_KEYS.add(pending_key)
                     if is_selection_state_type(state_type) and card_select_key and success:
                         action_name = raw_payload.get("action")
                         if action_name in ("select_card", "combat_select_card"):

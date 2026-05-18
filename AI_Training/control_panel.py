@@ -322,7 +322,32 @@ def update_control(patch):
             elif key == "option_card_scorer":
                 setting = patch[key] if isinstance(patch[key], dict) else {"mode": patch[key]}
                 mode = str(setting.get("mode") or "shadow").strip().lower()
-                data[key] = {"mode": mode if mode in ("off", "shadow", "active", "active_canary") else "shadow"}
+                scorer_cfg = {"mode": mode if mode in ("off", "shadow", "active", "active_canary", "active_canary_noop") else "shadow"}
+                float_limits = {
+                    "only_when_confidence_gap_gte": (0.0, 9999.0),
+                    "fallback_to_old_when_gap_lt": (0.0, 9999.0),
+                    "allow_skip_when_best_card_score_lte": (-9999.0, 9999.0),
+                    "max_active_ratio_per_run": (0.0, 1.0),
+                }
+                int_limits = {
+                    "allow_skip_when_deck_size_gte": (0, 999),
+                    "max_card_index": (0, 99),
+                }
+                for field, (lo, hi) in float_limits.items():
+                    if field not in setting:
+                        continue
+                    try:
+                        scorer_cfg[field] = max(lo, min(float(setting[field]), hi))
+                    except (TypeError, ValueError):
+                        pass
+                for field, (lo, hi) in int_limits.items():
+                    if field not in setting:
+                        continue
+                    try:
+                        scorer_cfg[field] = max(lo, min(int(setting[field]), hi))
+                    except (TypeError, ValueError):
+                        pass
+                data[key] = scorer_cfg
             elif key == "active_model_id":
                 data[key] = str(patch[key] or "local")
             elif key == "macro_card_reward_weight":
@@ -356,7 +381,7 @@ def update_control(patch):
             elif key == "self_play_target_runs":
                 data[key] = clamp_int(patch[key], DEFAULT_CONTROL[key], 0, 500)
             elif key == "self_play_train_every_admitted_runs":
-                data[key] = clamp_int(patch[key], DEFAULT_CONTROL[key], 1, 100)
+                data[key] = clamp_int(patch[key], DEFAULT_CONTROL[key], 1, 999)
             elif key == "self_play_max_run_minutes":
                 data[key] = clamp_int(patch[key], DEFAULT_CONTROL[key], 5, 240)
             elif key == "self_play_stall_seconds":
@@ -4252,7 +4277,7 @@ INDEX_HTML = r"""<!doctype html>
         </div>
         <div class="field">
           <span>入训批次</span>
-          <input id="self_play_train_every_admitted_runs" type="number" min="1" max="100" step="1" onchange="saveSelfPlayConfig()">
+          <input id="self_play_train_every_admitted_runs" type="number" min="1" max="999" step="1" onchange="saveSelfPlayConfig()">
         </div>
         <div class="field">
           <span>单局超时(分钟)</span>
