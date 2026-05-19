@@ -20,7 +20,7 @@ from combat_actions import (
     public_candidate_catalog,
 )
 from data_pipeline import StateEncoder
-from deck_summary import build_deck_summary
+from deck_summary import build_deck_summary, classify_card
 from train_candidate_bc import CandidateBCScorer
 from macro_data_pipeline import Vocab as MacroVocab, encode_record as encode_macro_record
 from train_macro_bc import MacroBCModel
@@ -2185,6 +2185,50 @@ def card_scorer_info_payload(mode, result, error=""):
     return payload
 
 
+def active_canary_early_act_guard_reason(state, result, selected, canary_cfg):
+    if str(canary_cfg.get("early_act_guard_enabled", True)).lower() in ("0", "false", "no", "off"):
+        return ""
+    if not result or not selected:
+        return ""
+    if str(getattr(result, "template_id", "") or "") != "barricade_block":
+        return ""
+    if getattr(selected, "label", "") == "skip_reward":
+        return ""
+
+    run = (state or {}).get("run") or {}
+    act = safe_int(run.get("act"), 1)
+    floor = safe_int(run.get("floor"), 0)
+    deck_summary = getattr(result, "deck_summary", None) or {}
+    deck_size = safe_int(deck_summary.get("deck_size"), 0)
+    guard_act = safe_int(canary_cfg.get("early_act_guard_act"), 1)
+    max_floor = safe_int(canary_cfg.get("early_act_guard_max_floor"), 5)
+    max_deck_size = safe_int(canary_cfg.get("early_act_guard_max_deck_size"), 16)
+    if act != guard_act or floor > max_floor or deck_size >= max_deck_size:
+        return ""
+
+    card = ((getattr(selected, "metadata", None) or {}).get("card") or {})
+    tags = classify_card(card)
+    card_id = str(tags.get("card_id") or "").upper()
+    defensive_takeover = bool(
+        tags.get("block")
+        or tags.get("block_payoff")
+        or card_id in {"BODY_SLAM", "ENTRENCH", "BARRICADE", "JUGGERNAUT"}
+    )
+    if not defensive_takeover:
+        return ""
+
+    guard_gap = safe_num(canary_cfg.get("early_act_guard_barricade_gap"), 1.5)
+    if safe_num(getattr(result, "confidence_gap", 0.0), 0.0) >= guard_gap:
+        return ""
+    damage_density = safe_num(deck_summary.get("damage_density"), 0.0)
+    min_damage_density = safe_num(canary_cfg.get("early_act_guard_min_damage_density"), 0.22)
+    return (
+        f"canary_early_barricade_guard("
+        f"floor<={max_floor},deck<{max_deck_size},gap<{guard_gap:g},"
+        f"damage={damage_density:.2f}/{min_damage_density:.2f})"
+    )
+
+
 def active_card_scorer_choice(state, card_baseline_weight=1.0):
     requested_mode = option_card_scorer_mode()
     mode = "active_canary" if requested_mode in ("active_canary", "active_canary_noop") else "active"
@@ -2227,6 +2271,12 @@ def active_card_scorer_choice(state, card_baseline_weight=1.0):
                 "allow_skip_when_best_card_score_lte",
                 "max_active_ratio_per_run",
                 "max_card_index",
+                "early_act_guard_enabled",
+                "early_act_guard_act",
+                "early_act_guard_max_floor",
+                "early_act_guard_max_deck_size",
+                "early_act_guard_barricade_gap",
+                "early_act_guard_min_damage_density",
             ):
                 if key in control_scorer_cfg:
                     canary_cfg[key] = control_scorer_cfg[key]
@@ -2258,7 +2308,9 @@ def active_card_scorer_choice(state, card_baseline_weight=1.0):
                 fallback_reason = f"canary_skip_guard(deck<{allow_skip_deck},best>{allow_skip_best:g})"
             elif selected.label.startswith("choose_card:index_") and selected_index > max_card_index:
                 fallback_reason = f"canary_extra_card_index>{max_card_index}"
-            elif safe_int(canary_counts.get("active"), 0) >= allowed_active:
+            else:
+                fallback_reason = active_canary_early_act_guard_reason(state, result, selected, canary_cfg)
+            if not fallback_reason and safe_int(canary_counts.get("active"), 0) >= allowed_active:
                 fallback_reason = f"canary_active_ratio_limit({allowed_active}/{canary_counts['seen']})"
             if fallback_reason:
                 action_source = fallback_reason

@@ -23,8 +23,8 @@ class AnalyzeCardABTests(unittest.TestCase):
         card_rows_mock.return_value = [
             {"type": "card_scorer_shadow", "run_id": "b1", "recommended_action": "choose_card:index_0", "legacy_chosen_action": "choose_card:index_0", "deck_summary": {"deck_size": 14}},
             {"type": "card_scorer_shadow", "run_id": "b2", "recommended_action": "choose_card:index_1", "legacy_chosen_action": "choose_card:index_1", "deck_summary": {"deck_size": 16}},
-            {"type": "card_scorer_shadow", "run_id": "c1", "seed": "101", "floor": 9, "template_id": "barricade_block", "recommended_action": "skip_reward", "legacy_chosen_action": "choose_card:index_0", "old_policy_action": "choose_card:index_0", "old_policy_card": {"name": "Old"}, "scorer_card": {"name": "Skip"}, "confidence_gap": 1.2, "deck_summary": {"deck_size": 18}, "canary_takeover": True, "executed_skip": True},
-            {"type": "card_scorer_shadow", "run_id": "c2", "recommended_action": "choose_card:index_2", "legacy_chosen_action": "choose_card:index_2", "deck_summary": {"deck_size": 20}, "canary_takeover": False},
+            {"type": "card_scorer_shadow", "run_id": "c1", "seed": "101", "floor": 9, "screen_type": "card_reward", "template_id": "barricade_block", "recommended_action": "skip_reward", "legacy_chosen_action": "choose_card:index_0", "old_policy_action": "choose_card:index_0", "final_executed_action": "skip_reward", "old_policy_card": {"name": "Old"}, "scorer_card": {"name": "Skip"}, "confidence_gap": 1.2, "deck_summary": {"deck_size": 18}, "canary_takeover": True, "executed_skip": True},
+            {"type": "card_scorer_shadow", "run_id": "c2", "recommended_action": "choose_card:index_2", "legacy_chosen_action": "choose_card:index_2", "old_policy_action": "choose_card:index_2", "final_executed_action": "choose_card:index_2", "deck_summary": {"deck_size": 20}, "canary_takeover": False},
         ]
 
         summary = compare_arms(["b1", "b2"], ["c1", "c2"])
@@ -41,6 +41,7 @@ class AnalyzeCardABTests(unittest.TestCase):
         self.assertEqual(summary["per_seed"][0]["takeover_count"], 1)
         self.assertEqual(summary["per_seed"][0]["skip_takeover_count"], 1)
         self.assertEqual(summary["per_seed"][0]["pick_takeover_count"], 0)
+        self.assertEqual(summary["final_action_first_divergence_count"], 1)
         self.assertEqual(summary["takeover_examples"][0]["old_card_name"], "Old")
 
 

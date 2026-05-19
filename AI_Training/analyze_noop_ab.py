@@ -161,6 +161,7 @@ def attach_trace_divergences(summary):
     summary["trace_first_divergence_count"] = sum(
         1 for row in per_seed if row.get("trace_first_divergence")
     )
+    summary["full_trace_first_divergence_count"] = summary["trace_first_divergence_count"]
     summary["trace_first_divergence"] = next(
         (row["trace_first_divergence"] for row in per_seed if row.get("trace_first_divergence")),
         {},
@@ -175,7 +176,9 @@ def render_noop_markdown(summary):
         "",
         "## No-op Integrity",
         "",
+        f"- final_action_first_divergence_count: `{summary.get('final_action_first_divergence_count', 0)}`",
         f"- trace_first_divergence_count: `{summary.get('trace_first_divergence_count', 0)}`",
+        f"- full_trace_first_divergence_count: `{summary.get('full_trace_first_divergence_count', 0)}`",
         f"- trace_first_divergence: `{summary.get('trace_first_divergence') or {}}`",
         "",
         "| Seed | Baseline Run | Noop Run | Trace First Divergence |",

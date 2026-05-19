@@ -221,6 +221,7 @@ def compare_arms(baseline_ids, canary_ids):
         ),
         {},
     )
+    final_action_first_divergence_count = sum(1 for row in per_seed if row.get("first_divergence_floor"))
     return {
         "baseline": baseline,
         "active_canary": canary,
@@ -229,6 +230,7 @@ def compare_arms(baseline_ids, canary_ids):
         "takeover_examples": takeover_audit_rows(canary_ids),
         "paired_seed_count": len(per_seed),
         "executed_action_match_rate": round4(mean([row["executed_action_match_rate"] for row in comparable])),
+        "final_action_first_divergence_count": final_action_first_divergence_count,
         "first_divergence": first_divergence,
     }
 
@@ -274,6 +276,7 @@ def render_markdown(summary):
         f"- old_skip_rate: `{canary['old_skip_rate']}`",
         f"- paired_seed_count: `{summary.get('paired_seed_count', 0)}`",
         f"- executed_action_match_rate: `{summary.get('executed_action_match_rate', 0)}`",
+        f"- final_action_first_divergence_count: `{summary.get('final_action_first_divergence_count', 0)}`",
         f"- first_divergence: `{summary.get('first_divergence') or {}}`",
         "",
         "## Per-Seed Outcomes",

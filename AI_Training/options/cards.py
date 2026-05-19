@@ -26,6 +26,12 @@ DEFAULT_TEMPLATE_CONFIG = {
         "allow_skip_when_best_card_score_lte": 0.5,
         "max_active_ratio_per_run": 0.35,
         "max_card_index": 2,
+        "early_act_guard_enabled": True,
+        "early_act_guard_act": 1,
+        "early_act_guard_max_floor": 5,
+        "early_act_guard_max_deck_size": 16,
+        "early_act_guard_barricade_gap": 1.5,
+        "early_act_guard_min_damage_density": 0.22,
     },
     "template_selection": {
         "mode": "locked_after_warmup",

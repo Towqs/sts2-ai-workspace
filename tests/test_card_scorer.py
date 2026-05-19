@@ -1,5 +1,6 @@
 import sys
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 
 
@@ -17,6 +18,7 @@ from options.cards import (
 from ai_agent import (
     CARD_CANARY_COUNTS,
     SKIPPED_CARD_REWARD_KEYS,
+    active_canary_early_act_guard_reason,
     canary_counter_for_card_reward,
     card_reward_item_key,
     choose_reward_rule_action,
@@ -46,6 +48,8 @@ class CardScorerTests(unittest.TestCase):
         self.assertEqual(config["template_selection"]["min_consistency_target"], 0.65)
         self.assertEqual(config["active_canary"]["max_active_ratio_per_run"], 0.35)
         self.assertEqual(config["active_canary"]["allow_skip_when_best_card_score_lte"], 0.5)
+        self.assertTrue(config["active_canary"]["early_act_guard_enabled"])
+        self.assertEqual(config["active_canary"]["early_act_guard_barricade_gap"], 1.5)
         self.assertEqual(normalize_card_scorer_mode("active_canary"), "active_canary")
         self.assertEqual(normalize_card_scorer_mode("active_canary_noop"), "active_canary_noop")
 
@@ -192,6 +196,44 @@ class CardScorerTests(unittest.TestCase):
         self.assertIs(first, duplicate)
         self.assertIs(first, second_screen)
         self.assertEqual(next_counter["seen"], 1)
+
+    def test_early_act_guard_blocks_low_gap_barricade_defense_takeover(self):
+        state = {"run": {"act": 1, "floor": 2}}
+        result = SimpleNamespace(
+            template_id="barricade_block",
+            confidence_gap=1.1,
+            deck_summary={"deck_size": 12, "damage_density": 0.2},
+        )
+        selected = SimpleNamespace(
+            label="choose_card:index_1",
+            metadata={"card": {"id": "TRUE_GRIT", "name": "True Grit", "type": "Skill", "description": "Gain Block. Exhaust a card."}},
+        )
+        reason = active_canary_early_act_guard_reason(state, result, selected, load_template_config()["active_canary"])
+        self.assertIn("canary_early_barricade_guard", reason)
+
+    def test_early_act_guard_does_not_block_high_gap_or_attack_takeover(self):
+        state = {"run": {"act": 1, "floor": 2}}
+        cfg = load_template_config()["active_canary"]
+        high_gap = SimpleNamespace(
+            template_id="barricade_block",
+            confidence_gap=1.6,
+            deck_summary={"deck_size": 12, "damage_density": 0.2},
+        )
+        defense = SimpleNamespace(
+            label="choose_card:index_1",
+            metadata={"card": {"id": "TRUE_GRIT", "type": "Skill", "description": "Gain Block. Exhaust a card."}},
+        )
+        attack_result = SimpleNamespace(
+            template_id="barricade_block",
+            confidence_gap=1.1,
+            deck_summary={"deck_size": 12, "damage_density": 0.2},
+        )
+        attack = SimpleNamespace(
+            label="choose_card:index_0",
+            metadata={"card": {"id": "TWIN_STRIKE", "type": "Attack", "description": "Deal damage twice."}},
+        )
+        self.assertEqual(active_canary_early_act_guard_reason(state, high_gap, defense, cfg), "")
+        self.assertEqual(active_canary_early_act_guard_reason(state, attack_result, attack, cfg), "")
 
     def test_skipped_card_reward_is_not_claimed_again(self):
         state = {
