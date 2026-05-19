@@ -197,18 +197,18 @@ public static partial class McpMod
         if (!string.IsNullOrWhiteSpace(seed))
         {
             var opened = TryClickMenuStartButton(root);
+            var seededAfterClick = TryStartCharacterSelectWithSeedAfterOpen(root, seed);
+            if (seededAfterClick != null)
+                return seededAfterClick;
             if (opened != null)
-            {
-                opened["message"] = $"{opened["message"]}; opened character select before applying seed {seed}";
-                return opened;
-            }
+                return Error($"Opened character select but could not apply seed {seed}");
 
             opened = TryInvokeMenuStartMethod(root);
+            var seededAfterInvoke = TryStartCharacterSelectWithSeedAfterOpen(root, seed);
+            if (seededAfterInvoke != null)
+                return seededAfterInvoke;
             if (opened != null)
-            {
-                opened["message"] = $"{opened["message"]}; opened character select before applying seed {seed}";
-                return opened;
-            }
+                return Error($"Opened character select via menu method but could not apply seed {seed}");
 
             return Error("start_new_run with seed could not reach the character select screen");
         }
@@ -439,6 +439,18 @@ public static partial class McpMod
             };
         }
 
+        return null;
+    }
+
+    private static Dictionary<string, object?>? TryStartCharacterSelectWithSeedAfterOpen(Node root, string seed)
+    {
+        for (var attempt = 0; attempt < 10; attempt++)
+        {
+            var seeded = TryStartCharacterSelectWithSeed(root, seed);
+            if (seeded != null)
+                return seeded;
+            OS.DelayMsec(120);
+        }
         return null;
     }
 
