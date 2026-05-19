@@ -542,7 +542,52 @@ class SelfPlayManager:
             try:
                 state = self._game_get(timeout=4)
                 state_type = str(state.get("state_type") or "").lower()
-                if state_type in ("card_select", "hand_select"):
+                if state_type == "card_reward":
+                    try:
+                        self._set_status(
+                            last_message=f"Clearing card reward before menu recovery: {reason}",
+                            current_state="recovering",
+                            current_state_type=state_type,
+                        )
+                        self._game_post({"action": "skip_card_reward"}, timeout=6)
+                        time.sleep(0.8)
+                        continue
+                    except Exception:
+                        pass
+                elif state_type in ("rewards", "treasure"):
+                    screen = state.get(state_type) or {}
+                    try:
+                        if screen.get("can_proceed"):
+                            action = {"action": "proceed"}
+                        else:
+                            items = screen.get("items") or screen.get("rewards") or []
+                            index = 0
+                            if items:
+                                index = safe_int((items[0] or {}).get("index"), 0)
+                            action = {"action": "claim_reward", "index": index}
+                        self._set_status(
+                            last_message=f"Clearing reward screen before menu recovery: {reason}",
+                            current_state="recovering",
+                            current_state_type=state_type,
+                        )
+                        self._game_post(action, timeout=6)
+                        time.sleep(0.8)
+                        continue
+                    except Exception:
+                        pass
+                elif state_type == "crystal_sphere":
+                    try:
+                        self._set_status(
+                            last_message=f"Clearing crystal sphere before menu recovery: {reason}",
+                            current_state="recovering",
+                            current_state_type=state_type,
+                        )
+                        self._game_post({"action": "crystal_sphere_proceed"}, timeout=6)
+                        time.sleep(0.8)
+                        continue
+                    except Exception:
+                        pass
+                elif state_type in ("card_select", "hand_select"):
                     screen = state.get("card_select") or state.get("hand_select") or {}
                     actions = []
                     if screen.get("can_confirm"):
